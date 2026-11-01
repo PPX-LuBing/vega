@@ -158,7 +158,7 @@ func parseQueryStatsResponse(data []byte) (map[string]int64, error) {
 			return out, err
 		}
 		if length > uint64(len(data)-pos) {
-			return out, fmt.Errorf("Stat 越界")
+			return out, fmt.Errorf("stat 越界")
 		}
 		name, value, err := parseStat(data[pos : pos+int(length)])
 		if err != nil {

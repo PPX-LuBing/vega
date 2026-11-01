@@ -336,37 +336,3 @@ func echoThrough(t *testing.T, ln net.Listener, key string, morph bool, echo str
 	return string(buf) == "ping"
 }
 
-// newTestVector 建一个 Vector 客户端，返回「开一条 flow」的闭包。
-func newTestVector(key string, ln net.Listener, targetAddr string) (func() (net.Conn, error), error) {
-	client, err := vector.New(vector.Config{
-		SharedKey:  key,
-		Morph:      true,
-		PortalAddr: ln.Addr().String(),
-		TLS:        &tls.Config{InsecureSkipVerify: true, ServerName: "nowhere"},
-		DialTCP: func(ctx context.Context, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", addr)
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	target, err := wire.NewIPTarget(netip.MustParseAddr("127.0.0.1"), mustPortFrom(targetAddr))
-	if err != nil {
-		return nil, err
-	}
-	return func() (net.Conn, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return client.OpenTCP(ctx, target)
-	}, nil
-}
-
-func mustPortFrom(addr string) uint16 {
-	_, portText, _ := net.SplitHostPort(addr)
-	var port int
-	for _, ch := range portText {
-		port = port*10 + int(ch-'0')
-	}
-	return uint16(port)
-}

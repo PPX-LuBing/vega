@@ -89,4 +89,3 @@ func TestValidateTLS(t *testing.T) {
 	}
 }
 
-func ptrBool(v bool) *bool { return &v }

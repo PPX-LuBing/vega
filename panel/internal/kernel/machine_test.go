@@ -418,3 +418,37 @@ func TestAPIAddressesComeFromPaths(t *testing.T) {
 		t.Errorf("clash_api 地址错误（可能被硬编码了）: %v", clash)
 	}
 }
+
+// 内核重启会清零内存里的流量计数，所以 ApplyAll 必须先采集再下发。
+//
+// 采集失败不阻断下发（用户可能正在修故障，下发是显式意图），但必须挂在
+// 结果上如实报出——否则这段用量会无声无息地丢掉。
+func TestApplyAllCollectsBeforeRestart(t *testing.T) {
+	st := testStore(t)
+	if err := st.SaveNode(store.Node{Tag: "nw", Proto: store.ProtoNowhere, Port: 8443, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveUser(store.User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Grant("nw", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths()
+	paths.Bin = fakeCommand(t, "kernel", "exit 0")
+	paths.Config = filepath.Join(t.TempDir(), "config.json")
+	fakeCommand(t, "systemctl", "exit 0")
+
+	// 采集必然失败
+	paths.StatsBin = fakeCommand(t, "sb-stats", "exit 1")
+	results := ApplyAll(context.Background(), st, paths)
+	if len(results) != 1 {
+		t.Fatalf("期望 1 台机器: %+v", results)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("采集失败不该阻断下发: %v", results[0].Err)
+	}
+	if results[0].CollectErr == nil {
+		t.Fatal("采集失败必须通过 CollectErr 报出，否则重启丢掉的用量不可见")
+	}
+}

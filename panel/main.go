@@ -79,6 +79,9 @@ func run(args []string) error {
 				continue
 			}
 			fmt.Printf("  ✓ %-12s %d 个入站\n", r.Machine, r.Nodes)
+			if r.CollectErr != nil {
+				fmt.Printf("    ⚠ 重启前采集失败，这段用量已丢失: %v\n", r.CollectErr)
+			}
 		}
 		if failed > 0 {
 			return fmt.Errorf("%d/%d 台机器下发失败", failed, len(results))
@@ -258,7 +261,7 @@ func runMachine(dbPath string, args []string) error {
 	}
 	defer st.Close()
 	if len(args) == 0 {
-		return fmt.Errorf("用法: machine add|list|del ...")
+		return fmt.Errorf("用法: machine add|list|del")
 	}
 
 	switch args[0] {
@@ -350,7 +353,7 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 	}
 	defer st.Close()
 	if len(args) == 0 {
-		return fmt.Errorf("用法: node add|list|del ...")
+		return fmt.Errorf("用法: node add|list|del")
 	}
 
 	switch args[0] {
@@ -391,7 +394,7 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 			return err
 		}
 		if fs.NArg() < 1 {
-			return fmt.Errorf("用法: node add <tag> --proto ... --port ...")
+			return fmt.Errorf("用法: node add <tag> --proto --port")
 		}
 		tag := fs.Arg(0)
 		node := store.Node{
@@ -449,7 +452,7 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 	}
 	defer st.Close()
 	if len(args) == 0 {
-		return fmt.Errorf("用法: user add|list|del|grant|revoke|reset ...")
+		return fmt.Errorf("用法: user add|list|del|grant|revoke|reset")
 	}
 
 	switch args[0] {

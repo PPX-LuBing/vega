@@ -171,6 +171,9 @@ type PushResult struct {
 	Machine string
 	Nodes   int
 	Err     error
+	// CollectErr 记录下发前那次采集的结果。非 nil 表示这台机器重启时
+	// 丢掉了最后一次采集之后的用量——不阻断下发，但必须让损失可见。
+	CollectErr error
 }
 
 // PushToMachine 把配置推到远端机器：上传 → 校验 → 替换 → 重启。
@@ -364,14 +367,25 @@ func ApplyAll(ctx context.Context, st *store.Store, localPaths Paths) []PushResu
 	if err != nil {
 		return []PushResult{{Machine: "?", Err: err}}
 	}
+	// 内核重启会清零内存里的流量计数，所以下发前先采集，把待结算的
+	// 用量落库。采集失败不阻断下发（用户是显式要下发配置的，可能正
+	// 在修故障），但挂在对应机器的结果上如实报出，不让损失无声无息。
+	collectErr := make(map[string]error)
+	for _, r := range CollectAll(ctx, st, localPaths) {
+		if r.Err != nil {
+			collectErr[r.Machine] = r.Err
+		}
+	}
 	results := make([]PushResult, 0, len(machines))
 	for _, m := range machines {
 		config, err := BuildConfigFor(st, MachinePaths(m), m.Name)
 		if err != nil {
-			results = append(results, PushResult{Machine: m.Name, Err: err})
+			results = append(results, PushResult{Machine: m.Name, Err: err, CollectErr: collectErr[m.Name]})
 			continue
 		}
-		results = append(results, PushToMachine(ctx, m, config))
+		pushed := PushToMachine(ctx, m, config)
+		pushed.CollectErr = collectErr[m.Name]
+		results = append(results, pushed)
 	}
 	return results
 }

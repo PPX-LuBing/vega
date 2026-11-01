@@ -366,10 +366,13 @@ func (m *Model) apply() (tea.Model, tea.Cmd) {
 			}
 			okCount++
 			nodeTotal += r.Nodes
+			if r.CollectErr != nil {
+				failures = append(failures, fmt.Sprintf("%s 重启前采集失败（这段用量已丢失）: %v", r.Machine, r.CollectErr))
+			}
 		}
 		text := fmt.Sprintf("下发 %d/%d 台成功（%d 个入站）", okCount, len(results), nodeTotal)
 		if len(failures) > 0 {
-			text += "；失败：" + strings.Join(failures, "；")
+			text += "；" + strings.Join(failures, "；")
 		}
 		return actionMsg{text: text, err: len(failures) > 0}
 	})
