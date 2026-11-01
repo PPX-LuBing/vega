@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -282,7 +283,7 @@ func PushToMachine(ctx context.Context, m store.Machine, config map[string]any) 
 	}
 
 	script := fmt.Sprintf(`set -e
-tmp=%s; cfg=%s; backup=%s; lock=%s
+tmp=%s; cfg=%s; backup=%s; lock=%s; svc=%s
 exec 9>"$lock"
 flock -n 9
 trap 'rm -f "$tmp"' EXIT
@@ -292,12 +293,33 @@ chmod 600 "$tmp"
 had_old=0
 if [ -f "$cfg" ]; then cp -p "$cfg" "$backup"; had_old=1; fi
 mv "$tmp" "$cfg"
-if ! systemctl restart %s; then
-  if [ "$had_old" = 1 ]; then mv "$backup" "$cfg"; systemctl restart %s; else rm -f "$cfg"; fi
+
+# 只看 systemctl restart 的退出码不够：Type=simple 下进程 fork 出来就算
+# 成功，哪怕它立刻因端口冲突退出。所以要观察一小段时间，要求状态是
+# active、有主进程、且重启计数不再增长。
+alive() {
+  sleep 1.2
+  a=$(systemctl show -p ActiveState -p MainPID -p NRestarts "$svc")
+  sleep 1.5
+  b=$(systemctl show -p ActiveState -p MainPID -p NRestarts "$svc")
+  act=$(printf '%%s\n' "$b" | sed -n 's/^ActiveState=//p')
+  pid=$(printf '%%s\n' "$b" | sed -n 's/^MainPID=//p')
+  r1=$(printf '%%s\n' "$a" | sed -n 's/^NRestarts=//p')
+  r2=$(printf '%%s\n' "$b" | sed -n 's/^NRestarts=//p')
+  [ "$act" = active ] && [ "$pid" != 0 ] && [ "$r1" = "$r2" ]
+}
+
+if ! systemctl restart "$svc" || ! alive; then
+  if [ "$had_old" = 1 ]; then
+    mv "$backup" "$cfg"
+    systemctl restart "$svc" || true
+  else
+    rm -f "$cfg"
+  fi
   exit 1
 fi
 rm -f "$backup"`, shellQuote(remote), shellQuote(m.ConfigPath), shellQuote(remote+".previous"), shellQuote(m.ConfigPath+".lock"),
-		shellQuote(m.KernelPath), shellQuote(m.Service), shellQuote(m.Service))
+		shellQuote(m.Service), shellQuote(m.KernelPath))
 	if err = runSSH(ctx, m, "ssh", m.SSHUser+"@"+m.Host, script); err != nil {
 		// 校验失败就清理上传的临时文件。
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -339,6 +361,22 @@ func runSSH(ctx context.Context, m store.Machine, tool string, args ...string) e
 	return nil
 }
 
+// 重启后观察服务的两个窗口。做成变量是为了让测试不必真等 2.7 秒。
+var (
+	serviceAliveFirstWait  = 1200 * time.Millisecond
+	serviceAliveSecondWait = 1500 * time.Millisecond
+)
+
+// restartLocalContext 重启服务，并确认它真的活着。
+//
+// **不能只看 `systemctl restart` 的退出码。** 单元是 Type=simple 时，
+// 进程 fork 出来就算「启动成功」，哪怕它下一毫秒就因为端口冲突退出。
+// 实测：内核 bind 失败时 systemctl 依然返回 0，而服务卡在 activating、
+// MainPID=0、NRestarts 一路涨。只信退出码就会把「服务已死」报成
+// 「下发成功」，也就永远不会触发回滚。
+//
+// 所以重启后要观察一小段时间，要求：状态是 active、有主进程、且重启
+// 计数不再增长（在反复重启说明它在崩溃循环里）。
 func restartLocalContext(ctx context.Context, service string) error {
 	if service == "" {
 		service = "sbx"
@@ -350,6 +388,66 @@ func restartLocalContext(ctx context.Context, service string) error {
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("重启 %s 失败: %w: %s", service, err, strings.TrimSpace(out.String()))
+	}
+	return waitServiceAlive(ctx, service)
+}
+
+// serviceState 是判断服务是否真的活着的三个关键属性。
+type serviceState struct {
+	active   string
+	mainPID  int
+	restarts int
+}
+
+// readServiceState 读一次服务状态。
+//
+// 按 key=value 解析而不是按行号：systemctl show 的输出顺序**不保证**
+// 与 -p 的请求顺序一致（实测请求 ActiveState/MainPID/NRestarts，
+// 返回的是 MainPID/NRestarts/ActiveState）。
+func readServiceState(ctx context.Context, service string) (serviceState, error) {
+	cmd := exec.CommandContext(ctx, "systemctl", "show",
+		"-p", "ActiveState", "-p", "MainPID", "-p", "NRestarts", service)
+	output, err := cmd.Output()
+	if err != nil {
+		return serviceState{}, err
+	}
+	var state serviceState
+	for _, line := range strings.Split(string(output), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		switch key {
+		case "ActiveState":
+			state.active = value
+		case "MainPID":
+			state.mainPID, _ = strconv.Atoi(value)
+		case "NRestarts":
+			state.restarts, _ = strconv.Atoi(value)
+		}
+	}
+	return state, nil
+}
+
+// waitServiceAlive 隔一小段时间读两次状态，确认服务是稳定活着的。
+func waitServiceAlive(ctx context.Context, service string) error {
+	time.Sleep(serviceAliveFirstWait)
+	first, err := readServiceState(ctx, service)
+	if err != nil {
+		return fmt.Errorf("查 %s 状态失败: %w", service, err)
+	}
+	time.Sleep(serviceAliveSecondWait)
+	second, err := readServiceState(ctx, service)
+	if err != nil {
+		return fmt.Errorf("查 %s 状态失败: %w", service, err)
+	}
+	if second.active != "active" || second.mainPID == 0 {
+		return fmt.Errorf("%s 重启后没起来（state=%s pid=%d）", service, second.active, second.mainPID)
+	}
+	if second.restarts != first.restarts {
+		return fmt.Errorf("%s 重启后在反复重启（NRestarts %d→%d），多半是配置起不来",
+			service, first.restarts, second.restarts)
 	}
 	return nil
 }

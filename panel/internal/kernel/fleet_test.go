@@ -79,7 +79,7 @@ func TestObserveAllReadsLocalAndRemoteSnapshots(t *testing.T) {
 		fmt.Fprint(w, `{"uploadTotal":10,"connections":[{"metadata":{"host":"local.test"}}]}`)
 	}))
 	defer server.Close()
-	fakeCommand(t, "systemctl", "echo active")
+	fakeSystemctl(t, "echo active")
 	fakeCommand(t, "ssh", `for arg; do script=$arg; done
 case "$script" in *is-active*) echo active;; */version*) printf '{"version":"remote-version"}';; */connections*) printf '{"downloadTotal":20,"connections":[]}' ;; *) exit 1;; esac`)
 	if err := st.SaveMachine(store.Machine{Name: store.LocalMachine, ClashAddr: strings.TrimPrefix(server.URL, "http://")}); err != nil {
@@ -106,7 +106,7 @@ func TestEnforceRestartsOnlyWhenQuotaOrExpiryChangesConfig(t *testing.T) {
 			t.Setenv("SAMPLE_STATS", sampleStats)
 			log := filepath.Join(dir, "restarts")
 			t.Setenv("RESTART_LOG", log)
-			fakeCommand(t, "systemctl", `echo restart >> "$RESTART_LOG"`)
+			fakeSystemctl(t, `echo restart >> "$RESTART_LOG"`)
 			u := store.User{Name: "alice", Enabled: true, QuotaBytes: 300}
 			if err := st.SaveUser(u); err != nil {
 				t.Fatal(err)
@@ -215,7 +215,7 @@ case "$script" in *-pattern*) printf '%s' "$SAMPLE_STATS";; *) exec sh -c "$scri
 	}
 	log := filepath.Join(dir, "restart.log")
 	t.Setenv("RESTART_LOG", log)
-	fakeCommand(t, "systemctl", `echo restart >> "$RESTART_LOG"`)
+	fakeSystemctl(t, `echo restart >> "$RESTART_LOG"`)
 	results := Enforce(context.Background(), st, paths)
 	if len(results) != 2 {
 		t.Fatalf("%+v", results)

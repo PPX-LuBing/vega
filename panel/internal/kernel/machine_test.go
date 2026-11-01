@@ -42,7 +42,7 @@ func TestPushValidationAndRestartFailurePreserveConfig(t *testing.T) {
 			kernel := fakeCommand(t, "kernel", body)
 			log := filepath.Join(dir, "restart.log")
 			t.Setenv("RESTART_LOG", log)
-			fakeCommand(t, "systemctl", `echo restart >> "$RESTART_LOG"; exit 1`)
+			fakeSystemctl(t, `echo restart >> "$RESTART_LOG"; exit 1`)
 			result := PushToMachine(context.Background(), store.Machine{Name: store.LocalMachine, KernelPath: kernel, ConfigPath: path, Service: "test"}, map[string]any{"inbounds": []any{}})
 			if result.Err == nil {
 				t.Fatal("failure hidden")
@@ -75,7 +75,7 @@ func TestRemotePushValidatesAndRollsBack(t *testing.T) {
 			log := filepath.Join(dir, "restart.log")
 			t.Setenv("RESTART_LOG", log)
 			t.Setenv("RESTART_MODE", mode)
-			fakeCommand(t, "systemctl", `
+			fakeSystemctl(t, `
 echo restart >> "$RESTART_LOG"
 if [ "$RESTART_MODE" = restart-fails ] && [ "$(wc -l < "$RESTART_LOG" | tr -d ' ')" = 1 ]; then exit 1; fi`)
 			fakeCommand(t, "scp", `
@@ -129,7 +129,7 @@ func TestApplyAllKeepsImplicitLocalWithRemoteMachines(t *testing.T) {
 	paths := testPaths()
 	paths.Bin = fakeCommand(t, "kernel", "exit 0")
 	paths.Config = filepath.Join(t.TempDir(), "config.json")
-	fakeCommand(t, "systemctl", "exit 0")
+	fakeSystemctl(t, "exit 0")
 	fakeCommand(t, "scp", "exit 1")
 	results := ApplyAll(context.Background(), st, paths)
 	if len(results) != 2 || results[0].Machine != store.LocalMachine || results[0].Err != nil || results[0].Nodes != 1 {
@@ -437,7 +437,7 @@ func TestApplyAllCollectsBeforeRestart(t *testing.T) {
 	paths := testPaths()
 	paths.Bin = fakeCommand(t, "kernel", "exit 0")
 	paths.Config = filepath.Join(t.TempDir(), "config.json")
-	fakeCommand(t, "systemctl", "exit 0")
+	fakeSystemctl(t, "exit 0")
 
 	// 采集必然失败
 	paths.StatsBin = fakeCommand(t, "sb-stats", "exit 1")
@@ -450,5 +450,74 @@ func TestApplyAllCollectsBeforeRestart(t *testing.T) {
 	}
 	if results[0].CollectErr == nil {
 		t.Fatal("采集失败必须通过 CollectErr 报出，否则重启丢掉的用量不可见")
+	}
+}
+
+// fakeSystemctl 包一层假 systemctl：restartBody 只用于 restart，show 统一
+// 返回「服务健康」。
+//
+// 之所以要管 show：重启后不能只看 systemctl 的退出码，面板会再观察一段
+// 时间确认服务真的活着。假命令不响应 show 的话，所有下发测试都会被判定
+// 成「服务没起来」。
+func fakeSystemctl(t *testing.T, restartBody string) string {
+	t.Helper()
+	shortenServiceWaits(t)
+	return fakeCommand(t, "systemctl", `
+if [ "$1" = show ]; then
+  printf 'ActiveState=active\nMainPID=4242\nNRestarts=0\n'
+  exit 0
+fi
+`+restartBody)
+}
+
+// fakeSystemctlDead 模拟「进程 fork 出来就死」：systemctl restart 依然
+// 返回 0（Type=simple 就是这样），但服务卡在 activating、没有主进程、
+// 重启计数每次查询都在涨。真机上端口冲突就是这个样子。
+func fakeSystemctlDead(t *testing.T) string {
+	t.Helper()
+	shortenServiceWaits(t)
+	counter := filepath.Join(t.TempDir(), "nrestarts")
+	t.Setenv("NRESTARTS_LOG", counter)
+	return fakeCommand(t, "systemctl", `
+if [ "$1" = show ]; then
+  echo x >> "$NRESTARTS_LOG"
+  printf 'ActiveState=activating\nMainPID=0\nNRestarts=%s\n' "$(wc -l < "$NRESTARTS_LOG" | tr -d ' ')"
+  exit 0
+fi
+exit 0`)
+}
+
+// shortenServiceWaits 把重启后的观察窗口缩短，免得每个用例真等 2.7 秒。
+func shortenServiceWaits(t *testing.T) {
+	t.Helper()
+	first, second := serviceAliveFirstWait, serviceAliveSecondWait
+	serviceAliveFirstWait, serviceAliveSecondWait = 5*time.Millisecond, 5*time.Millisecond
+	t.Cleanup(func() { serviceAliveFirstWait, serviceAliveSecondWait = first, second })
+}
+
+// 真机实测出来的：内核因端口冲突起不来时，`systemctl restart` 依然返回 0
+// （Type=simple 的语义就是进程 fork 出来即算成功），而服务卡在 activating、
+// MainPID=0、NRestarts 一路涨。
+//
+// 只信退出码就会把「服务已死」报成「下发成功」，而且永远不会回滚。
+func TestPushRollsBackWhenServiceDiesAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte("known-good"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kernel := fakeCommand(t, "kernel", "exit 0")
+	fakeSystemctlDead(t)
+
+	result := PushToMachine(context.Background(), store.Machine{
+		Name: store.LocalMachine, KernelPath: kernel, ConfigPath: path, Service: "test",
+	}, map[string]any{"inbounds": []any{}})
+
+	if result.Err == nil {
+		t.Fatal("服务重启后没起来必须报错，否则面板会说下发成功而服务是死的")
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "known-good" {
+		t.Fatalf("起不来时必须回滚到旧配置，实际 %q %v", got, err)
 	}
 }
