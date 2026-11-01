@@ -327,3 +327,82 @@ func TestUsableMatchesBuildConfig(t *testing.T) {
 		t.Errorf("配置内容不对: %v", inConfig)
 	}
 }
+
+// 附加配置必须能真的把额外出站和路由规则并进去，且不破坏面板生成的
+// 部分——这是「AI 域名走台湾链路」这类需求不改代码就能落地的唯一口子。
+func TestExtraConfigMergesAdditively(t *testing.T) {
+	st := testStore(t)
+	if err := st.SaveNode(store.Node{Tag: "ss", Proto: store.ProtoShadowsocks, Port: 30002, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveUser(store.User{Name: "hk", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Grant("ss", "hk"); err != nil {
+		t.Fatal(err)
+	}
+	extra := `{
+      "outbounds": [{"type":"shadowsocks","tag":"chain","server":"tw.example.com","server_port":50360,
+                     "method":"2022-blake3-aes-128-gcm","password":"AAAAAAAAAAAAAAAAAAAAAA==:BBBBBBBBBBBBBBBBBBBBBB=="}],
+      "route": {"rules": [{"domain_suffix":["openai.com"],"outbound":"chain"}]}
+    }`
+	if err := st.SetSetting("extra_config", extra); err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths()
+	config, err := BuildConfigFor(st, paths, store.LocalMachine)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 额外出站要并进去，面板自己的 direct 也要还在
+	outbounds, _ := config["outbounds"].([]any)
+	var sawChain, sawDirect bool
+	for _, raw := range outbounds {
+		ob, _ := raw.(map[string]any)
+		switch ob["tag"] {
+		case "chain":
+			sawChain = true
+		case "direct":
+			sawDirect = true
+		}
+	}
+	if !sawChain {
+		t.Fatal("附加出站没并进去")
+	}
+	if !sawDirect {
+		t.Fatal("合并把面板自己的出站覆盖掉了，应当是追加")
+	}
+
+	// 额外路由规则要追加，且不能吃掉面板的管理地址拒绝规则
+	route, _ := config["route"].(map[string]any)
+	rules, _ := route["rules"].([]any)
+	var sawAI, sawReject bool
+	for _, raw := range rules {
+		rule, _ := raw.(map[string]any)
+		if _, ok := rule["domain_suffix"]; ok {
+			sawAI = true
+		}
+		if _, ok := rule["ip_cidr"]; ok {
+			sawReject = true
+		}
+	}
+	if !sawAI {
+		t.Fatal("附加路由规则没并进去")
+	}
+	if !sawReject {
+		t.Fatal("合并把管理地址拒绝规则覆盖掉了")
+	}
+}
+
+// 附加配置写错必须报错，不能静默忽略——否则运维以为链路生效了，
+// 实际流量还在直连。
+func TestExtraConfigRejectsBadJSON(t *testing.T) {
+	st := testStore(t)
+	if err := st.SetSetting("extra_config", "{不是 JSON"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildConfigFor(st, testPaths(), store.LocalMachine); err == nil {
+		t.Fatal("非法 extra_config 应当报错")
+	}
+}

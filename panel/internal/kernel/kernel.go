@@ -169,7 +169,45 @@ func buildConfigFromNodes(st *store.Store, paths Paths, nodes []store.Node) (map
 			"clash_api": map[string]any{"external_controller": orDefaultAddr(paths.ClashAddr, "127.0.0.1:9090")},
 		},
 	}
+
+	// 附加配置：面板的配置生成覆盖不了所有场景——比如「AI 域名走台湾
+	// 链路」这种自定义出站 + 路由规则。留一个口子让运维把额外片段
+	// 并进来，而不是为了一个特殊需求去改代码。
+	//
+	// 合并语义：map 递归合并；数组**追加**（这样额外出站和路由规则是
+	// 加上去，而不是把面板生成的覆盖掉）；其它类型以附加配置为准。
+	if raw := strings.TrimSpace(st.Setting("extra_config", "")); raw != "" {
+		var extra map[string]any
+		if err = json.Unmarshal([]byte(raw), &extra); err != nil {
+			return nil, fmt.Errorf("extra_config 不是合法 JSON: %w", err)
+		}
+		mergeConfig(config, extra)
+	}
 	return config, nil
+}
+
+// mergeConfig 把 extra 深合并进 base。
+func mergeConfig(base, extra map[string]any) {
+	for key, value := range extra {
+		existing, ok := base[key]
+		if !ok {
+			base[key] = value
+			continue
+		}
+		existingMap, okMap := existing.(map[string]any)
+		valueMap, okValueMap := value.(map[string]any)
+		if okMap && okValueMap {
+			mergeConfig(existingMap, valueMap)
+			continue
+		}
+		existingList, okList := existing.([]any)
+		valueList, okValueList := value.([]any)
+		if okList && okValueList {
+			base[key] = append(existingList, valueList...)
+			continue
+		}
+		base[key] = value
+	}
 }
 
 // activeUsers 返回该节点上「应当被写进配置」的用户。
