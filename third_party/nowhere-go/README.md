@@ -1,0 +1,319 @@
+# Nowhere-Go
+
+Go implementation of Nowhere, both **outbound** (client) and **inbound** (server). The default protocol is Nowhere 3 (`nw3`); its upstream pin is [`UPSTREAM.lock`](UPSTREAM.lock). Nowhere 2 (`nw2`) remains available and is pinned in [`UPSTREAM-nw2.lock`](UPSTREAM-nw2.lock).
+
+This is a library, not a standalone proxy. Hosts such as [sing-box](https://github.com/SagerNet/sing-box) or [mihomo](https://github.com/MetaCubeX/mihomo) import it and supply platform pieces: TLS material, dialers, QUIC stacks, and routing.
+
+Protocol behavior follows the official Rust project:
+
+- Spec: [protocol.md](https://github.com/NodePassProject/Nowhere/blob/main/docs/protocol.md)
+- Integration notes: [integrations.md](https://github.com/NodePassProject/Nowhere/blob/main/docs/integrations.md)
+
+```text
+module github.com/ohmycggk/nowhere-go
+go 1.20
+```
+
+License: **GPL-3.0** (same family as upstream Nowhere).
+
+Project policies: [changelog](CHANGELOG.md) · [contributing](CONTRIBUTING.md) ·
+[security](SECURITY.md)
+
+> **Compatibility:** The pinned nw3 baseline is Nowhere 3.2. A 3.2 Vector authenticates its Morph TCP prelude with one lazy identity and counter shared by that Vector. A 3.2 Portal requires that authentication: a tag mismatch, counter 0, a replay, or a counter outside the window is rejected before ClientHello parsing. There is no 3.0 fallback, so a 3.0.x Vector cannot enter a 3.2 Portal. A 3.0.x Portal ignores prelude content, so a 3.2 Vector can still reach it. No URL, Shared Key, or ALPN migration is required. Replay is in-memory, FIFO-bounded, and lost on restart. Morph UDP on the server drops QUIC long headers whose version quinn 0.11.19 does not support; `morph=0` and clients do not. The nw2 stack is unchanged. The default CLI URL is Nowhere 3 (`nw3` only). Nowhere 2 stays available when the URL uses `up`, `down`, `mux`, `next`, or `socks`, and that process speaks `nw2` only. The two versions do not handshake. Optional nw2 `morph=1` sits below TLS/QUIC with no negotiation; the 2.1 Morph wire contract is incompatible with Nowhere 2.0.x peers. nw3 Morph defaults on and uses a different key schedule (`nowhere/nw3/morph`). Dedicated `mux=0` and marked Mux still share one TLS listener via the `0xff` marker on nw2 only; nw3 has no Mux.
+
+---
+
+## What you get
+
+| Side | Packages | Responsibility |
+|---|---|---|
+| Shared wire (nw2) | `nw2/wire` | Credentials, exporter-bound auth, FLOW/setup results, TLS Mux, NOWU fragmentation, typed UoT |
+| Outbound (nw2) | `nw2/carrier/tcptls`, `nw2/carrier/mux`, `nw2/carrier/quic`, `nw2/bundle` | Dedicated TLS pool or Mux shards, injected QUIC dial backend, four-matrix session orchestration |
+| Inbound (nw2) | `nw2/server` | Listen / accept orchestration, auth, flow pairing, NOWU/UoT state, QUIC session loop, upstream handoff |
+
+Hosts keep:
+
+- Concrete QUIC (`quic-go`, `sing-quic`, …) behind injected interfaces
+- Product config schemas, listeners, certificates, and routers
+- Zero reverse dependency: this module never imports mihomo or sing-box
+
+---
+
+## Package map
+
+```text
+nowhere-go/
+├── wire/ morph/ portal/ vector/ egress/   # Nowhere 3, the default stack
+├── qio/ dgram/ flowio/                     # nw3 QUIC injection, datagrams, copy
+├── nw2/
+│   ├── wire/ carrier/ bundle/ server/     # Nowhere 2 stack
+│   └── diagnostic/
+├── testdata/vectors/           # nw2 conformance corpus
+├── cmd/nowhere/                # one binary; URL selects nw3 or nw2
+└── cmd/nowhere-check/          # nw2 and nw3 vector self-check
+```
+
+Prefer importing subpackages. The sections below document the nw2 library, now imported from `nw2/`.
+
+---
+
+## Outbound (client)
+
+Typical path used by mihomo / sing-box outbound adapters:
+
+1. Build `wire.Credentials` from the shared password and use typed `wire.Target` values.
+2. Build an immutable `tcptls.Config` with host dialers.
+3. If either direction is UDP, inject a `carrier.QuicBackend`.
+4. Open flows through `bundle.CarrierBundle`.
+
+```go
+import (
+    "github.com/ohmycggk/nowhere-go/nw2/bundle"
+    "github.com/ohmycggk/nowhere-go/nw2/carrier/tcptls"
+    "github.com/ohmycggk/nowhere-go/nw2/wire"
+)
+
+credentials, err := wire.NewCredentials(password)
+if err != nil {
+    return err
+}
+
+tcp, err := tcptls.NewConfig(tcptls.TCPOptions{
+	Address:   serverAddr,
+	Dialer:    hostTCPDialer,
+	TLSDialer: hostTLSDialer,
+	Observer:  hostObserver,
+})
+if err != nil {
+	return err
+}
+
+up, down := wire.CarrierTLSTCP, wire.CarrierQUIC
+b, err := bundle.NewCarrierBundle(bundle.BundleOptions{
+	TCP:         tcp,
+	QUIC:        hostQuicBackend, // required when Up or Down selects QUIC
+	Credentials: credentials,     // bundle owns nw2 carrier authentication
+	PoolSize:    0,               // required when either direction uses QUIC or Mux=1
+	Up:          up,
+	Down:        down,
+	Mux:         bundle.MuxDisabled, // MuxEnabled originates marked TLS shards
+})
+if err != nil {
+    return err
+}
+defer b.Close()
+
+target, err := wire.NewDomainTarget("example.com", 443)
+if err != nil {
+    return err
+}
+conn, err := b.OpenTCP(ctx, target)
+```
+
+See [`nw2/bundle/example_test.go`](nw2/bundle/example_test.go) for a compile-checked
+`tcp/tcp` constructor example. Host adapters remain responsible for concrete
+dialer, TLS, and QUIC implementations.
+
+Supported `Up`/`Down` pairs: `tcp/tcp`, `udp/udp`, `tcp/udp`, `udp/tcp`. `Up` and `Down` accept `tcp` or `udp` only; each direction always uses the carrier it names, and FlowHeader carries the resolved pair. Every logical TCP or UDP flow starts with a typed FLOW envelope; symmetric flows use `DUPLEX`, while split-carrier flows use `OPEN` plus `ATTACH`. `Mux` defaults to dedicated TLS lanes. `MuxEnabled` writes AuthFrame + `0xff` and multiplexes logical streams; Portal auto-detects both on the same TLS listener. QUIC never uses TLS Mux frames. `udp/udp&mux=1` canonicalizes to `mux=0`.
+
+---
+
+## Inbound (server)
+
+The `server` package is a full inbound implementation: auth, FLOW/setup-result handling, typed UoT, split-carrier pairing, NOWU reassembly, QUIC session replacement, and upstream handoff.
+
+Two integration styles:
+
+### A. Standalone Portal-like process
+
+`server.Server` owns TCP accept + `crypto/tls` handshake, then runs the protocol. Forwarding goes to an `Upstream` — use `NewDialUpstream` for dial-and-copy, or plug in your own router.
+
+```go
+import (
+    "crypto/tls"
+
+    "github.com/ohmycggk/nowhere-go/nw2/server"
+)
+
+cfg, err := server.NewConfig(server.ConfigOptions{
+	Credentials: credentials,
+	Networks:    []server.Network{server.NetworkTCP},
+})
+if err != nil {
+    return err
+}
+
+srv, err := server.NewServer(server.ServerOptions{
+	Config:       cfg,
+	TLS:          tlsConfig,
+	Upstream:     server.NewDialUpstream(nil),
+	Observer:     hostObserver,
+	QUICListener: hostQuicListener, // required only when UDP is enabled
+})
+if err != nil {
+	return err
+}
+return srv.ListenAndServe(ctx, ":443")
+```
+
+`Networks`: `NetworkTCP`, `NetworkUDP`, both, or empty (defaults to both). Unknown and duplicate entries are rejected.
+UDP without `QuicListener` returns `server.ErrQUICNotConfigured`.
+
+### B. Host-owned listener (e.g. sing-box)
+
+Keep your own accept / TLS / QUIC stack. After the carrier is ready, call the protocol handler:
+
+```go
+h, err := server.NewHandler(server.HandlerOptions{
+	Config:   cfg,
+	Upstream: routerUpstream, // adapts host RouteConnection / RoutePacket
+	Observer: hostObserver,
+})
+if err != nil {
+	return err
+}
+err = h.ServeTCP(ctx, rawConn, remoteAddr, hostTLSHandshake, onClose)
+```
+
+QUIC: adapt your connection to `server.QuicConn` / `server.QuicListener`, then call `Handler.ServeQUIC` or `Server.ServeQUIC`.
+
+### Upstream interface
+
+```go
+type Upstream interface {
+    HandleStream(ctx context.Context, conn net.Conn, source net.Addr, target wire.Target, readiness FlowReadiness) error
+    HandlePacket(ctx context.Context, pc net.PacketConn, source net.Addr, target wire.Target, readiness FlowReadiness) error
+}
+```
+
+The Upstream calls `readiness.Ready()` only after the target route is established, or `readiness.Reject(err)` when setup fails. The selected downlink carries the resulting typed setup result.
+
+`server.FlowInfoFromContext(ctx)` exposes the current FLOW metadata to custom
+Upstream implementations without changing the `Upstream` interface.
+`FlowInfo.Hops` is the incoming native forwarding budget.
+
+### Native Portal chaining
+
+Use `server.NewPortalUpstream` when an inbound Portal should forward through
+another Nowhere Portal instead of dialing the target directly. The next-hop
+`CarrierBundle` may use any of the four symmetric or asymmetric carrier
+matrices; downstream setup rejection codes are returned unchanged.
+
+```go
+nextBundle, err := bundle.NewCarrierBundle(nextPortalOptions)
+if err != nil {
+	return err
+}
+portalUpstream, err := server.NewPortalUpstream(nextBundle)
+if err != nil {
+	_ = nextBundle.Close()
+	return err
+}
+srv, err := server.NewServer(server.ServerOptions{
+	Config: cfg, TLS: tlsConfig, Upstream: portalUpstream,
+	QUICListener: hostQuicListener,
+})
+if err != nil {
+	_ = nextBundle.Close()
+	return err
+}
+
+// Shutdown order matters: PortalUpstream borrows, but does not own, the Bundle.
+_ = srv.Close()        // first stop and drain inbound handlers
+_ = nextBundle.Close() // then close next-hop carriers
+```
+
+An incoming HOPS=0 is initialized to 7, values 2..7 are decremented, and an
+attempt to forward HOPS=1 is rejected with `FLOW_LIMIT`. Direct
+`OpenTCP`, `OpenTCPWithPayload`, `OpenUDP`, and `OpenUDPAsync` calls always send
+HOPS=0; only Portal forwarding should normally use `OpenTCPWithHops` or
+`OpenUDPWithHops`.
+
+On success the Upstream owns the wrapped connection lifecycle. Closing the wrapper or invoking the context `CloseHandler` closes every physical carrier and invokes each host callback exactly once. Normal close passes `nil`; terminal failures pass their cause. Callbacks run synchronously after close, must not block, and panics are isolated and reported to the Observer.
+
+For host-owned listeners, call `Handler.BeginDrain()` before stopping transport
+admission, then call `Handler.Shutdown(ctx)` with one absolute deadline. Pending
+and late setup receives `FLOW_LIMIT`; relays that committed `READY` before the
+barrier may finish until the deadline. `Server.Close()` applies the normalized
+five-second default automatically.
+
+### Default server guardrails
+
+- Authentication: 5 seconds with `[0.8, 1.2]` jitter; request idle: 40 seconds
+- Pre-auth admission: 256 global, 32 per source (IPv4 `/32`, IPv6 `/64`)
+- Pending split-carrier flows: 1024 per session; pair timeout: 15 seconds
+- UDP: 256 flows/session, 64 queued packets/flow, 4 MiB queued/session, 120 second idle
+- Authenticated idle TCP halves: 4096; active QUIC sessions: 1024
+- A matching QUIC session ID replaces the previous carrier and cancels its pending/active flows
+
+### Default outbound TCP guardrails
+
+- Warm pool only for `tcp/tcp` (default target 5, max 9); consumed carriers never return
+- Fresh-first replenish: warm prepare starts only after a successful business dial
+- Max concurrent physical dials per outbound: 16
+- Warm-prepare failure backoff: 1s → 30s with jitter
+
+---
+
+## Design boundaries
+
+| In nowhere-go | In the host |
+|---|---|
+| FLOW/NOWU/typed-UoT codecs and session/flow state machines | Listen addresses, certs, ALPN product policy |
+| TLS/TCP pool logic (dialers injected) | Actual `net.Dial` / TLS stacks |
+| Inbound Handler, pairing, fragmentation and reassembly | Router / firewall / detour |
+| QUIC *interfaces* | QUIC *implementations*; no host-side wire codec or flow registry |
+
+Local development against a monorepo checkout: use a **gitignored**
+`go.work` at the workspace root (do **not** put `replace` in host `go.mod`):
+
+```bash
+# from mihomo-nowhere/
+go work init ./nowhere-go ./sing-box ./sing-box/test ./mihomo ./mihomo/test
+# or: go work use ./nowhere-go ./sing-box ...
+```
+
+Host `go.mod` keeps only a published `nowhere-go` version that targets the same Nowhere 2 protocol baseline. Push/CI resolve that module; local edits to `nowhere-go/` are picked up via `go.work`.
+
+Temporarily ignore the workspace:
+
+```bash
+GOWORK=off go test ./...
+```
+
+---
+
+## Develop & CI
+
+```bash
+go test ./...
+go test -race -shuffle=on -count=20 ./...
+go vet ./...
+staticcheck ./...
+go run ./cmd/nowhere-check            # wire vectors + self-check
+go run ./cmd/nowhere-check -version
+```
+
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.20.x / 1.26.x / stable** on push (`main`/`test`/tags), PR, and `workflow_dispatch`. The Portal CLI (`cmd/nowhere`) needs Go 1.26 because it vendors [quic-go](https://github.com/quic-go/quic-go) v0.62.0; the 1.20.x job tests the library only. A FreeBSD 15.1 amd64 job runs the same single-version test, vet, and CLI checks, and cross-builds `freebsd/arm64`. Race, fuzz, and benchmark jobs stay on Linux.
+
+The standalone **Portal / Vector** binary lives in [`cmd/nowhere`](cmd/nowhere). It accepts the same `portal://` and `vector://` URLs as the Rust `nowhere` CLI, plus the `generate-key`, `fingerprint`, and `probe` toolbox subcommands (the TUI and `status` are not included).
+
+```bash
+make nowhere
+./nowhere generate-key
+./nowhere 'portal://0f8c3b9a2d6e4f1c8a5b7d3e9c0a1f2b@:2000?log=info'
+./nowhere 'vector://0f8c3b9a2d6e4f1c8a5b7d3e9c0a1f2b@127.0.0.1:2000?up=tcp&down=tcp&socks=127.0.0.1:1080'
+```
+
+Portal listener and `next` hop keys must be 32–64 lowercase hexadecimal characters
+(`generate-key` prints one); Vector client keys stay free-form. Client carriers
+verify the Portal certificate against the system roots and the endpoint host
+name unless `pin=<sha256>` is set — `fingerprint` prints the leaf certificate
+SHA-256 of a `nowhere://` share link to obtain one.
+
+Pushing a `v*.*.*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml): tests, then `nowhere` binaries for Linux, Windows, macOS, and FreeBSD (`amd64` and `arm64`) plus `SHA256SUMS`. The `nowhere-check` conformance tool is not released; build it locally with `make nowhere-check` when needed. Reproduce the release locally with `make dist`. Consume the library with `go get`.
+
+```bash
+go get github.com/ohmycggk/nowhere-go@v2.0.0
+make dist VERSION=v2.0.0
+```

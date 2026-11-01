@@ -1,0 +1,162 @@
+name: CI
+
+on:
+  push:
+    branches: [main, test]
+    tags: ["v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: go test (${{ matrix.go }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Align with go.mod (1.20) + CLI toolchain (quic-go needs 1.26) + latest stable.
+        # 1.20.x is EOL upstream: regression testing only. It never receives security
+        # fixes (e.g. CVE-2026-111943 crypto/x509) and is never used for release
+        # builds; release.yml gates dist on a fixed toolchain.
+        go: ["1.20.x", "1.26.x", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          # Resolve against the live version manifest instead of the runner's
+          # toolcache: the cached 1.26.9 predates the CVE-2026-111943 fix and
+          # is rejected by nowhere-check.
+          check-latest: true
+          cache: true
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build nowhere-check
+        run: go build -o /tmp/nowhere-check ./cmd/nowhere-check
+      - name: Run nowhere-check
+        run: /tmp/nowhere-check
+      - name: Test and build Portal/Vector CLI
+        if: matrix.go != '1.20.x'
+        run: |
+          cd cmd/nowhere
+          GOWORK=off go test ./...
+          GOWORK=off go build -o /tmp/nowhere .
+      - name: nowhere CLI help
+        if: matrix.go != '1.20.x'
+        run: /tmp/nowhere -h
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@2026.2.2
+      - name: Run staticcheck
+        run: staticcheck ./...
+
+  race:
+    name: race and shuffle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - run: go test -race -shuffle=on -count=20 ./...
+
+  benchmark:
+    name: benchmark report and allocation gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Allocation ceilings
+        run: go test ./nw2/wire ./nw2/carrier/quic ./nw2/bundle -run=AllocationCeiling -count=1
+      - name: Benchmem report
+        run: go test ./nw2/wire ./nw2/carrier/quic ./nw2/bundle -run=^$ -bench=. -benchmem -count=3
+
+  fuzz:
+    name: wire fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Auth
+        run: go test ./wire -run=^$ -fuzz=^FuzzValidateAuthFrame$ -fuzztime=30s
+      - name: Flow
+        run: go test ./wire -run=^$ -fuzz=^FuzzReadFlowHeader$ -fuzztime=30s
+      - name: Target
+        run: go test ./wire -run=^$ -fuzz=^FuzzTarget$ -fuzztime=30s
+      - name: UoT
+        run: go test ./wire -run=^$ -fuzz=^FuzzReadUDPPacket$ -fuzztime=30s
+      - name: DATAGRAM
+        run: go test ./wire -run=^$ -fuzz=^FuzzDecodeUDPFrame$ -fuzztime=30s
+
+  freebsd:
+    name: freebsd test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Resolve Go tarball version
+        id: go
+        run: echo "version=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+      - name: Test and build on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          usesh: true
+          prepare: |
+            set -eu
+            fetch -o /tmp/go.tgz "https://go.dev/dl/${{ steps.go.outputs.version }}.freebsd-amd64.tar.gz"
+            rm -rf /usr/local/go
+            tar -C /usr/local -xzf /tmp/go.tgz
+          run: |
+            set -eu
+            export PATH="/usr/local/go/bin:${PATH}"
+            go version
+            go test -count=1 ./...
+            go vet ./...
+            go build -o /tmp/nowhere-check ./cmd/nowhere-check
+            /tmp/nowhere-check
+            (
+              cd cmd/nowhere
+              GOWORK=off go test ./...
+              GOWORK=off CGO_ENABLED=0 go build -o /tmp/nowhere .
+            )
+            /tmp/nowhere -h
+            CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build -o /tmp/nowhere-check-arm64 ./cmd/nowhere-check
+            (
+              cd cmd/nowhere
+              GOWORK=off CGO_ENABLED=0 GOOS=freebsd GOARCH=arm64 go build -o /tmp/nowhere-arm64 .
+            )

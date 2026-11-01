@@ -3,6 +3,7 @@ module github.com/sagernet/sing-box
 go 1.25.5
 
 require (
+	github.com/ohmycggk/nowhere-go v0.0.0
 	filippo.io/age v1.3.1
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/anytls/sing-anytls v0.0.11
@@ -198,3 +199,5 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
+
+replace github.com/ohmycggk/nowhere-go => ./third_party/nowhere-go
