@@ -1,6 +1,20 @@
-# 致谢与上游归属
+# 版权与致谢
 
-Vega 站在这些项目的肩膀上。它们各自的版权与许可如下。
+## 本项目
+
+    Vega
+    Copyright (C) 2026 PPX-LuBing <1711958652@qq.com>
+    License: GPL-3.0
+
+由我们编写的部分：`option/nowhere.go`、`protocol/nowhere/`、`panel/`、
+`tools/sbstats/`，以及对上游文件的少量改动（见 README 的「thin fork」一节）。
+
+因为整体是 sing-box 的衍生作品，本仓库整体以 **GPL-3.0** 分发，
+完整条款见 `LICENSE`。
+
+---
+
+Vega 站在下面这些项目的肩膀上。它们各自的版权与许可如下。
 
 ## sing-box
 
@@ -43,13 +57,8 @@ modernc sqlite 等），完整列表见各 `go.mod` / `go.sum`。它们各自的
 
 --------------------------------------------------------------------------
 
-## 我们的部分
+## 为什么不能换成更宽松的许可
 
-除上述上游代码外，本仓库中由我们编写的部分（`option/nowhere.go`、
-`protocol/nowhere/`、`panel/`、`tools/sbstats/` 以及对上游文件的少量改动）：
-
-    Copyright (C) 2026 PPX-LuBing <1711958652@qq.com>
-    License: GPL-3.0
-
-因为整体是 sing-box 的衍生作品，本仓库整体以 **GPL-3.0** 分发，
-完整条款见 `LICENSE`。
+上游 sing-box 与 nowhere-go 都是 GPL-3.0。GPL-3.0 要求衍生作品整体
+沿用同一许可，所以本仓库不能改成 MIT/Apache 之类。这也是为什么
+`LICENSE` 里放的是 GPL-3.0 的标准正文，而不是自定义条款。

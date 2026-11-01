@@ -167,8 +167,11 @@ Vega 站在这些项目的肩膀上：
 
 本项目是 sing-box 的衍生作品，整体以 **GNU GPL-3.0** 分发（完整条款见 [`LICENSE`](LICENSE)）。
 
-因为上游是 GPL-3.0，这是**法律上必须**的：衍生作品不能换成更宽松的许可。`LICENSE`
-文件在标准 GPL-3.0 正文之前保留了各上游项目的版权署名。
+`LICENSE` 放的是 GPL-3.0 的标准正文（不放自定义声明，这样 GitHub 能正确识别许可类型）；
+各方的版权署名与完整致谢在 [`NOTICE`](NOTICE)。
 
-我们自己的部分（`option/nowhere.go`、`protocol/nowhere/`、`panel/`、`tools/sbstats/`）
-同样以 GPL-3.0 授权，版权归 PPX-LuBing。
+    Vega                Copyright (C) 2026 PPX-LuBing <1711958652@qq.com>
+    sing-box            Copyright (C) 2022 nekohasekai <contact-sagernet@sekai.icu>
+    nowhere-go          Copyright (C) 2026 ohmycggk
+
+因为上游是 GPL-3.0，这是**法律上必须**的：衍生作品不能换成更宽松的许可。
