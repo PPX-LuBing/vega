@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
@@ -110,19 +111,15 @@ func TestClashShadowsocksUsesServerAndUserPSK(t *testing.T) {
 	}
 }
 
-// sing-box 订阅目前也必须跳过 nowhere：内核只有入站没出站，
-// 写进去客户端会因 "unknown outbound type" 整份配置加载失败。
-// 这条测试钉住「宁可少发一个节点，也不能发一份加载不了的配置」。
-func TestSingboxSkipsNowhereAndParses(t *testing.T) {
+// sing-box 订阅必须带 nowhere——这是本仓库内核相对上游的独有价值，
+// 也是客户端能用上自有协议的唯一途径。
+func TestSingboxIncludesNowhereAndParses(t *testing.T) {
 	st := testStore(t)
 	u := seed(t, st)
 
-	body, skipped, err := Singbox(st, u)
+	body, _, err := Singbox(st, u)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !strings.Contains(strings.Join(skipped, " "), "hk-nw") {
-		t.Fatalf("跳过的 nowhere 节点必须报出来，实际: %v", skipped)
 	}
 	var cfg map[string]any
 	if err = json.Unmarshal([]byte(body), &cfg); err != nil {
@@ -135,12 +132,19 @@ func TestSingboxSkipsNowhereAndParses(t *testing.T) {
 		switch ob["type"] {
 		case "nowhere":
 			sawNowhere = true
+			if ob["shared_key"] != u.SharedKey {
+				t.Errorf("nowhere 出站的 shared_key 不对: %v", ob["shared_key"])
+			}
+			// 出站载体就是 TLS1.3，没给 tls 块内核会拒绝加载
+			if _, ok := ob["tls"].(map[string]any); !ok {
+				t.Error("nowhere 出站必须带 tls 块")
+			}
 		case "selector":
 			sawSelector = true
 		}
 	}
-	if sawNowhere {
-		t.Fatal("内核没有 nowhere 出站，订阅里不该出现它")
+	if !sawNowhere {
+		t.Fatal("sing-box 订阅里必须有 nowhere 出站")
 	}
 	if !sawSelector {
 		t.Fatal("缺少 selector 出站，客户端没法切节点")
@@ -347,5 +351,51 @@ func TestSubTokenLifecycle(t *testing.T) {
 	// 代理凭据不受影响
 	if got.Password != u.Password || got.SharedKey != u.SharedKey || got.UUID != u.UUID {
 		t.Fatal("轮换订阅 token 不该动代理凭据")
+	}
+}
+
+// ---------------------------------------------------------------- ACME
+
+// 启用 ACME 却不给缓存目录必须直接报错。
+//
+// 没有缓存的话每次重启都会重新签发，很快撞上 Let's Encrypt 的
+// 每周同域名签发次数限制，之后连正常续期都会被拒。
+func TestACMERequiresCacheDir(t *testing.T) {
+	st := testStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := Serve(ctx, st, Config{
+		Listen:     "127.0.0.1:0",
+		Base:       "https://sub.example.com",
+		ACMEDomain: "sub.example.com",
+		// 故意不给 ACMECacheDir
+	})
+	if err == nil {
+		t.Fatal("启用 ACME 却没给缓存目录，应当报错")
+	}
+	if !strings.Contains(err.Error(), "acme_cache") {
+		t.Fatalf("错误信息应当点明缺的是缓存目录，实际: %v", err)
+	}
+}
+
+// 没配 ACME 时不该碰 80/443，也不该要求缓存目录——反代场景要能用。
+func TestPlainServeDoesNotRequireACME(t *testing.T) {
+	st := testStore(t)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(ctx, st, Config{Listen: "127.0.0.1:0", Base: "https://sub.example.com"})
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("明文模式应当正常关闭，实际: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后没有及时退出")
 	}
 }

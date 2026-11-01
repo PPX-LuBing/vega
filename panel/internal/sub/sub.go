@@ -4,11 +4,9 @@
 // 的 buildInbound 是镜像关系：内核往里收，订阅往外发，两边必须对同一份
 // 节点数据得出一致的协议参数，否则客户端连不上。
 //
-// 一个绕不开的约束：**两种客户端目前都用不了 nowhere**。
-//   - clash/mihomo 内核没有这个协议
-//   - 本仓库的 sing-box 内核只有 nowhere **入站**，还没写出站
-// 所以订阅里一律跳过 nowhere 节点，并通过返回值报出来——静默丢节点会让
-// 用户以为配好了却连不上。要真正支持，得先给内核补 nowhere 出站。
+// 一个绕不开的约束：**clash/mihomo 内核没有 nowhere 协议**，所以 clash 订阅
+// 会跳过它。sing-box 订阅带得动，但需要本仓库的内核（上游没有这个协议，
+// 也没有出站实现）。
 package sub
 
 import (
@@ -375,9 +373,11 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 
 	switch n.Proto {
 	case store.ProtoNowhere:
-		// 内核只有 nowhere 入站，没有出站；写进订阅客户端会报
-		// "unknown outbound type: nowhere" 而整份配置加载失败。
-		return nil, false
+		ob["type"] = "nowhere"
+		ob["shared_key"] = u.SharedKey
+		ob["morph"] = n.Morph
+		// 出站必带 TLS：载体就是 TLS1.3，没给会直接报错
+		ob["tls"] = forceTLS(n)
 
 	case store.ProtoAnyTLS:
 		ob["type"] = "anytls"

@@ -2,12 +2,17 @@ package sub
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/acme/autocert"
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
@@ -22,6 +27,16 @@ type Config struct {
 	Base string
 	// Interval 是客户端多久来拉一次，默认 12 小时。
 	Interval time.Duration
+
+	// 以下是 ACME 自动签发。全留空表示不启用，TLS 交给前面的反代。
+	// 启用时 ACMEDomain 必填，服务会自己开 443 和 80。
+	ACMEDomain   string
+	ACMEEmail    string
+	ACMECacheDir string
+	// ACMEHTTPAddr 是 HTTP-01 挑战与跳转用的地址，默认 :80。
+	ACMEHTTPAddr string
+	// ACMETLSAddr 是 HTTPS 监听地址，默认 :443。
+	ACMETLSAddr string
 }
 
 // Serve 起订阅 HTTP 服务，ctx 结束时优雅关闭。
@@ -52,13 +67,78 @@ func Serve(ctx context.Context, st *store.Store, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("订阅服务监听 %s 失败: %w", cfg.Listen, err)
 	}
-	log.Printf("订阅服务在 %s（base=%s）", cfg.Listen, cfg.Base)
 
-	go func() { _ = server.Serve(listener) }()
+	if cfg.ACMEDomain == "" {
+		// 没有 ACME：明文 HTTP，TLS 由前面的反代负责
+		log.Printf("订阅服务在 %s（base=%s，明文，TLS 交给反代）", cfg.Listen, cfg.Base)
+		go func() { _ = server.Serve(listener) }()
+	} else {
+		if err = serveACME(ctx, server, listener, cfg); err != nil {
+			return err
+		}
+	}
+
 	<-ctx.Done()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return server.Shutdown(shutdownCtx)
+}
+
+// serveACME 用 Let's Encrypt 自动签发并续期证书。
+//
+// 为什么内置而不是让用户配反代：订阅域名是客户端唯一要知道的地址，
+// 证书过期会让所有客户端同时拉不到订阅，而续期失败往往没人发现。
+// autocert 会在到期前 30 天自动续，并把证书落盘到 CacheDir。
+//
+// 同时开 :80 是必须的——HTTP-01 挑战走 80，而且用户输 http:// 时
+// 要能跳到 https。
+func serveACME(ctx context.Context, server *http.Server, listener net.Listener, cfg Config) error {
+	if cfg.ACMECacheDir == "" {
+		return fmt.Errorf("启用 ACME 时必须给 acme_cache（证书要落盘，否则每次重启都重新签发，会撞 Let's Encrypt 的频率限制）")
+	}
+	if err := os.MkdirAll(cfg.ACMECacheDir, 0o700); err != nil {
+		return fmt.Errorf("建 ACME 缓存目录失败: %w", err)
+	}
+	manager := &autocert.Manager{
+		Prompt:     autocert.AcceptTOS,
+		HostPolicy: autocert.HostWhitelist(cfg.ACMEDomain),
+		Cache:      autocert.DirCache(cfg.ACMECacheDir),
+		Email:      cfg.ACMEEmail,
+	}
+
+	// :80 只做挑战应答与跳转
+	httpAddr := cfg.ACMEHTTPAddr
+	if httpAddr == "" {
+		httpAddr = ":80"
+	}
+	redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target := "https://" + r.Host + r.URL.RequestURI()
+		http.Redirect(w, r, target, http.StatusMovedPermanently)
+	})
+	challengeServer := &http.Server{
+		Addr:              httpAddr,
+		Handler:           manager.HTTPHandler(redirect),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		if err := challengeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("ACME 挑战服务退出: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = challengeServer.Shutdown(shutdownCtx)
+	}()
+
+	server.TLSConfig = &tls.Config{
+		GetCertificate: manager.GetCertificate,
+		MinVersion:     tls.VersionTLS12,
+	}
+	log.Printf("订阅服务在 %s（base=%s，ACME 域名 %s，缓存 %s）", cfg.Listen, cfg.Base, cfg.ACMEDomain, cfg.ACMECacheDir)
+	go func() { _ = server.ServeTLS(listener, "", "") }()
+	return nil
 }
 
 type handler struct {

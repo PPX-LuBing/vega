@@ -17,7 +17,7 @@
 |---|---|---|
 | 修改的上游文件 | **12 个** | 可能冲突 |
 | 新增文件 | **264 个** | 永不冲突 |
-| 内核自有代码 | 1,505 行（`option/nowhere.go` + `protocol/nowhere/`） | — |
+| 内核自有代码 | 约 1,900 行（`option/nowhere.go` + `protocol/nowhere/`，含出站） | — |
 | 面板自有代码 | 5,730 行（`panel/`） | — |
 | 打补丁的第三方 | `third_party/nowhere-go/`（见下） | — |
 
@@ -29,7 +29,7 @@
 | `README.md` | +194 / −20 | 中——直接取我们的（`git checkout --ours README.md`） |
 | `go.mod` / `go.sum` | +4 | 中——上游升依赖时冲突，删掉冲突标记保留两边 |
 | `constant/proxy.go` | +1 | 低——加 `TypeNowhere` 常量 |
-| `include/registry.go` | +2 | 低——import + 注册各一行 |
+| `include/registry.go` | +3 | 低——import + 入站/出站注册各一行 |
 | `release/DEFAULT_BUILD_TAGS` | +1 / −1 | 低——加了 `with_v2ray_api` |
 | `release/DEFAULT_BUILD_TAGS_OTHERS` | +1 / −1 | 低——同上 |
 | `.github/workflows/test.yml` | 新增 job | 低 |

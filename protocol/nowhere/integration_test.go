@@ -296,3 +296,125 @@ func TestNowhereHotUsersAreAuthenticatedAndCounted(t *testing.T) {
 		}
 	}
 }
+
+// startKernelFromConfig 用给定配置起一个内核。
+func startKernelFromConfig(t *testing.T, config map[string]any) *box.Box {
+	t.Helper()
+	body, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := include.Context(context.Background())
+	var options option.Options
+	if err = options.UnmarshalJSONContext(ctx, body); err != nil {
+		t.Fatal(err)
+	}
+	b, err := box.New(box.Options{Context: ctx, Options: options})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = b.Close() })
+	if err = b.Start(); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// socksDial 做一次 SOCKS5 无认证握手，连到目标。
+func socksDial(t *testing.T, proxy, target string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", proxy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 问候：版本 5，一种方法（无认证）
+	if _, err = conn.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+	reply := make([]byte, 2)
+	if _, err = io.ReadFull(conn, reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply[0] != 5 || reply[1] != 0 {
+		t.Fatalf("SOCKS 握手被拒: %v", reply)
+	}
+	// 请求：CONNECT 到 IPv4 目标
+	ap := netip.MustParseAddrPort(target)
+	req := []byte{5, 1, 0, 1}
+	req = append(req, ap.Addr().AsSlice()...)
+	req = append(req, byte(ap.Port()>>8), byte(ap.Port()))
+	if _, err = conn.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	resp := make([]byte, 10)
+	if _, err = io.ReadFull(conn, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[1] != 0 {
+		t.Fatalf("SOCKS CONNECT 失败，代码 %d", resp[1])
+	}
+	return conn
+}
+
+// nowhere 出站必须真的能把流量送到 Portal 后面的目标。
+//
+// 这里起两个内核：左边只有 nowhere 入站（扮演落地），右边用 nowhere 出站
+// 经 SOCKS 入站转发。数据要穿过「SOCKS → 出站 → 载体 → 入站 → 直连 →
+// echo」整条链路，才算证明出站可用。
+func TestNowhereOutboundDialsThroughPortal(t *testing.T) {
+	echo := tcpEcho(t)
+	defer echo.Close()
+
+	// 左：Portal（落地）
+	portalAddr, portalControl := freeAddress(t), freeAddress(t)
+	portalPort := netip.MustParseAddrPort(portalAddr).Port()
+	startKernelFromConfig(t, map[string]any{
+		"log": map[string]any{"disabled": true},
+		"inbounds": []any{map[string]any{
+			"type": "nowhere", "tag": "portal", "listen": "127.0.0.1", "listen_port": portalPort,
+			"morph": false, "tls": map[string]any{"enabled": true, "insecure": true},
+			"users":        []any{map[string]any{"name": "alice", "shared_key": integrationAlice}},
+			"control_addr": portalControl, "control_secret": "integration-secret",
+		}},
+		"outbounds": []any{map[string]any{"type": "direct", "tag": "direct"}},
+		"route":     map[string]any{"final": "direct"},
+	})
+
+	// 右：Vector 出站（客户端）
+	socksAddr := freeAddress(t)
+	socksPort := netip.MustParseAddrPort(socksAddr).Port()
+	startKernelFromConfig(t, map[string]any{
+		"log": map[string]any{"disabled": true},
+		"inbounds": []any{map[string]any{
+			"type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": socksPort,
+		}},
+		"outbounds": []any{
+			map[string]any{
+				"type": "nowhere", "tag": "nw-out",
+				"server": "127.0.0.1", "server_port": portalPort,
+				"shared_key": integrationAlice, "morph": false,
+				"tls": map[string]any{"enabled": true, "insecure": true},
+			},
+			map[string]any{"type": "direct", "tag": "direct"},
+		},
+		"route": map[string]any{
+			"rules": []any{map[string]any{"inbound": []string{"socks-in"}, "outbound": "nw-out"}},
+			"final": "direct",
+		},
+	})
+
+	conn := socksDial(t, socksAddr, echo.Addr().String())
+	defer conn.Close()
+
+	payload := []byte("through-the-vector")
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("写出失败: %v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("读回失败: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("回声不一致: %q != %q", got, payload)
+	}
+}

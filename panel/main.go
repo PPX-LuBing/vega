@@ -13,8 +13,10 @@
 //	sbx-panel machine add|list|del     多机编排
 //	sbx-panel user sync                运行期改用户（不重启，仅 nowhere）
 //	sbx-panel serve                    起订阅服务（clash / sing-box）
+//	                                   加 --acme-domain 可自动签发证书
 //	sbx-panel user sub [name]          打印该用户的订阅地址
 //	sbx-panel user rotate-sub [name]   换一把订阅 token（地址泄露时用）
+//	sbx-panel user qr [name]           把订阅地址打成二维码（手机扫码导入）
 //	sbx-panel setting get|set          读写面板设置（如 sub_host）
 //	sbx-panel version
 package main
@@ -32,6 +34,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	qrcode "github.com/skip2/go-qrcode"
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
@@ -468,6 +471,9 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 	case "sub", "rotate-sub":
 		return runUserSub(st, args[0] == "rotate-sub", args[1:])
 
+	case "qr":
+		return runUserQR(st, args[1:])
+
 	case "list":
 		users, err := st.Users()
 		if err != nil {
@@ -614,6 +620,11 @@ func runServe(dbPath string, args []string) error {
 	listen := fs.String("listen", "127.0.0.1:8080", "监听地址；前面有反代时绑回环")
 	base := fs.String("base", "", "订阅地址前缀，如 https://sub.example.com")
 	interval := fs.Duration("interval", 12*time.Hour, "客户端多久来拉一次")
+	acmeDomain := fs.String("acme-domain", "", "启用 ACME 自动签发时填域名；留空则用明文，TLS 交给反代")
+	acmeEmail := fs.String("acme-email", "", "ACME 账号邮箱（Let's Encrypt 到期提醒用）")
+	acmeCache := fs.String("acme-cache", "", "ACME 证书缓存目录（启用 ACME 时必填）")
+	acmeHTTP := fs.String("acme-http", ":80", "ACME HTTP-01 挑战与跳转的监听地址")
+	acmeTLS := fs.String("acme-tls", ":443", "ACME 模式下的 HTTPS 监听地址")
 	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
 		return err
 	}
@@ -643,9 +654,14 @@ func runServe(dbPath string, args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	return sub.Serve(ctx, st, sub.Config{
-		Listen:   *listen,
-		Base:     strings.TrimRight(resolved, "/"),
-		Interval: *interval,
+		Listen:       *listen,
+		Base:         strings.TrimRight(resolved, "/"),
+		Interval:     *interval,
+		ACMEDomain:   strings.TrimSpace(*acmeDomain),
+		ACMEEmail:    strings.TrimSpace(*acmeEmail),
+		ACMECacheDir: strings.TrimSpace(*acmeCache),
+		ACMEHTTPAddr: *acmeHTTP,
+		ACMETLSAddr:  *acmeTLS,
 	})
 }
 
@@ -722,10 +738,38 @@ func runUserSub(st *store.Store, rotate bool, args []string) error {
 		}
 		fmt.Printf("%-12s %s/sub/%s\n", name, base, token)
 		fmt.Printf("%-12s %s/sub/%s/clash    (clash/mihomo)\n", "", base, token)
-		fmt.Printf("%-12s %s/sub/%s/singbox  (sing-box)\n", "", base, token)
+		fmt.Printf("%-12s %s/sub/%s/singbox  (sing-box，含 nowhere)\n", "", base, token)
 	}
 	if rotate {
 		fmt.Println("\n旧地址已失效。客户端需要重新拉取。")
 	}
+	return nil
+}
+
+// runUserQR 把订阅地址打成二维码，方便手机扫码导入。
+//
+// 打的是 clash 格式的地址：手机上的客户端绝大多数是 clash 系。
+// 用终端半块字符渲染，比用 ASCII 双字符紧凑一半。
+func runUserQR(st *store.Store, args []string) error {
+	base := strings.TrimRight(strings.TrimSpace(st.Setting("sub_base", "")), "/")
+	if base == "" {
+		return fmt.Errorf("还没配 sub_base，先执行: setting set sub_base https://你的订阅域名")
+	}
+	if len(args) != 1 {
+		return fmt.Errorf("用法: user qr <name>")
+	}
+	token, err := st.SubToken(args[0])
+	if err != nil {
+		return err
+	}
+	url := base + "/sub/" + token + "/clash"
+
+	qr, err := qrcode.New(url, qrcode.Medium)
+	if err != nil {
+		return fmt.Errorf("生成二维码失败: %w", err)
+	}
+	fmt.Printf("%s 的订阅地址：\n%s\n\n", args[0], url)
+	fmt.Print(qr.ToSmallString(false))
+	fmt.Println()
 	return nil
 }
