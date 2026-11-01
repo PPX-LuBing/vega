@@ -132,10 +132,14 @@ func serveACME(ctx context.Context, server *http.Server, listener net.Listener, 
 		_ = challengeServer.Shutdown(shutdownCtx)
 	}()
 
-	server.TLSConfig = &tls.Config{
-		GetCertificate: manager.GetCertificate,
-		MinVersion:     tls.VersionTLS12,
-	}
+	// 用 manager.TLSConfig() 而不是只塞 GetCertificate：它会把
+	// acme-tls/1 加进 NextProtos 并装好 ALPN 回调，这样 Let's Encrypt
+	// 的 TLS-ALPN-01 挑战也能应答。只给 GetCertificate 的话，对方发
+	// acme-tls/1 会撞上 "client requested unsupported application
+	// protocols" 然后回退到 HTTP-01——能签成，但日志里全是告警。
+	tlsConfig := manager.TLSConfig()
+	tlsConfig.MinVersion = tls.VersionTLS12
+	server.TLSConfig = tlsConfig
 	log.Printf("订阅服务在 %s（base=%s，ACME 域名 %s，缓存 %s）", cfg.Listen, cfg.Base, cfg.ACMEDomain, cfg.ACMECacheDir)
 	go func() { _ = server.ServeTLS(listener, "", "") }()
 	return nil
