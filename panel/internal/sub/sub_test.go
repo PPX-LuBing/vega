@@ -399,3 +399,63 @@ func TestPlainServeDoesNotRequireACME(t *testing.T) {
 		t.Fatal("取消后没有及时退出")
 	}
 }
+
+// ---------------------------------------------------------------- nowhere
+
+// nowhere 客户端只认 URI，不读 clash YAML 也不读 sing-box JSON。
+// 没有这个格式的话，用 nowhere 的人得手拼 URI——服务端地址、共享密钥、
+// morph 开关、SNI 一个都不能错，拼错了还查不出原因。
+func TestNowhereSubscriptionEmitsURIs(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+
+	body, skipped, err := Nowhere(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, "vector://"+u.SharedKey+"@203.0.113.9:8443?") {
+		t.Fatalf("URI 主体不对:\n%s", body)
+	}
+	// morph 必须显式写出来：两代协议的默认值不同，靠默认值迟早出错
+	if !strings.Contains(body, "morph=1") {
+		t.Error("morph 没有显式写出来")
+	}
+	// 非 nowhere 节点不该出现在这份订阅里
+	for _, tag := range []string{"hk-any", "hk-vless", "hk-hy2", "hk-ss"} {
+		if strings.Contains(body, tag) {
+			t.Errorf("非 nowhere 节点 %s 不该出现在 nowhere 订阅里", tag)
+		}
+	}
+	_ = skipped
+}
+
+// 共享密钥长度不对必须报错而不是拼出一条连不上的 URI。
+func TestNowhereSubscriptionRejectsBadKey(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+	bad := u
+	bad.SharedKey = "tooshort"
+	if err := st.SaveUser(bad); err != nil {
+		t.Fatal(err)
+	}
+	_, skipped, err := Nowhere(st, bad)
+	if err == nil {
+		t.Fatal("密钥长度不对应当报错")
+	}
+	if len(skipped) == 0 {
+		t.Fatal("应当说明是哪个节点的问题")
+	}
+}
+
+// 没有 nowhere 节点时要明确报错，而不是发一份空订阅让客户端干瞪眼。
+func TestNowhereSubscriptionWithoutNowhereNodes(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+	// 只授权非 nowhere 节点
+	if err := st.Revoke("hk-nw", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Nowhere(st, u); err == nil {
+		t.Fatal("没有 nowhere 节点时应当报错")
+	}
+}

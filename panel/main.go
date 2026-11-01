@@ -739,6 +739,7 @@ func runUserSub(st *store.Store, rotate bool, args []string) error {
 		fmt.Printf("%-12s %s/sub/%s\n", name, base, token)
 		fmt.Printf("%-12s %s/sub/%s/clash    (clash/mihomo)\n", "", base, token)
 		fmt.Printf("%-12s %s/sub/%s/singbox  (sing-box，含 nowhere)\n", "", base, token)
+		fmt.Printf("%-12s %s/sub/%s/nowhere  (nowhere 官方客户端)\n", "", base, token)
 	}
 	if rotate {
 		fmt.Println("\n旧地址已失效。客户端需要重新拉取。")

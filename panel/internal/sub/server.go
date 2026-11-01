@@ -199,8 +199,10 @@ func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
 		body, skipped, err = Clash(h.st, user)
 	case "singbox", "sing-box", "json":
 		body, skipped, err = Singbox(h.st, user)
+	case "nowhere", "nw3":
+		body, skipped, err = Nowhere(h.st, user)
 	default:
-		http.Error(w, "未知格式 "+format+"，用 clash 或 singbox", http.StatusNotFound)
+		http.Error(w, "未知格式 "+format+"，用 clash、singbox 或 nowhere", http.StatusNotFound)
 		return
 	}
 	if err != nil {
@@ -268,8 +270,13 @@ func formatFor(ua string) string {
 }
 
 func contentTypeFor(format string) string {
-	if format == "clash" || format == "mihomo" || format == "yaml" {
+	switch format {
+	case "clash", "mihomo", "yaml":
 		return "text/yaml; charset=utf-8"
+	case "nowhere", "nw3":
+		// 纯文本 URI 列表，不是 YAML 也不是 JSON
+		return "text/plain; charset=utf-8"
+	default:
+		return "application/json; charset=utf-8"
 	}
-	return "application/json; charset=utf-8"
 }

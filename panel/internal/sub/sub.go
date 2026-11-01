@@ -12,6 +12,7 @@ package sub
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -456,4 +457,82 @@ func singboxTLS(ob map[string]any, n store.Node) {
 		tls["server_name"] = n.SNI
 	}
 	ob["tls"] = tls
+}
+
+// ---------------------------------------------------------------- nowhere
+
+// Nowhere 生成 nowhere 官方客户端的订阅：每行一条 vector:// URI。
+//
+// 为什么需要单独一种格式：nowhere 客户端既不读 clash YAML 也不读 sing-box
+// JSON，它只认 URI。没有这个端点的话，用 nowhere 协议的人得自己拼 URI
+// （服务端地址、共享密钥、morph 开关、SNI 一个都不能错），很容易拼错还
+// 查不出原因。
+//
+// in= 是客户端自己的 SOCKS 监听地址，属于客户端的事，这里给一个默认值；
+// 多条同时跑要自己改成不同端口。
+func Nowhere(st *store.Store, u store.User) (string, []string, error) {
+	eps, skipped, err := Endpoints(st, u)
+	if err != nil {
+		return "", nil, err
+	}
+
+	var b strings.Builder
+	b.WriteString("# vega nowhere 订阅 · " + u.Name + "\n")
+	b.WriteString("#\n")
+	b.WriteString("# 每行是一条完整的 vector:// URI，直接喂给 nowhere 客户端：\n")
+	b.WriteString("#   nowhere '<下面某一行>'\n")
+	b.WriteString("#\n")
+	b.WriteString("# 想同时跑多条，把每行的 in= 改成不同端口。\n")
+	b.WriteString("# morph 必须与服务端一致，否则握手失败。\n\n")
+
+	count := 0
+	for _, e := range eps {
+		if e.Node.Proto != store.ProtoNowhere {
+			continue
+		}
+		uri, err := nowhereURI(e)
+		if err != nil {
+			skipped = append(skipped, fmt.Sprintf("%s: %v", e.Node.Tag, err))
+			continue
+		}
+		b.WriteString("# " + e.Name() + "\n")
+		b.WriteString(uri + "\n\n")
+		count++
+	}
+	if count == 0 {
+		return "", skipped, fmt.Errorf("该用户没有 nowhere 节点")
+	}
+	return b.String(), skipped, nil
+}
+
+// nowhereURI 把一条节点记录拼成 vector:// URI。
+func nowhereURI(e endpoint) (string, error) {
+	n := e.Node
+	key := strings.TrimSpace(e.User.SharedKey)
+	if key == "" {
+		return "", fmt.Errorf("用户没有 nowhere 共享密钥")
+	}
+	if len(key) != 32 {
+		return "", fmt.Errorf("共享密钥必须是 32 位小写十六进制，实际 %d 位", len(key))
+	}
+	// IPv6 地址要加方括号，否则 URI 解析会把地址里的冒号当端口分隔符
+	host := e.Host
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	// 手工拼查询串而不用 url.Values.Encode()：后者会把 in= 里的冒号编码成
+	// %3A，功能上没问题（客户端会解码），但订阅是给人看和改的，
+	// "127.0.0.1%3A1080" 会让人以为写错了。
+	params := []string{"in=127.0.0.1:1080"}
+	// morph 必须显式写出来：服务端开着而客户端没开（或反过来）会握手失败，
+	// 而默认值在两代协议之间不一样，靠默认值迟早出错。
+	if n.Morph {
+		params = append(params, "morph=1")
+	} else {
+		params = append(params, "morph=0")
+	}
+	if n.SNI != "" {
+		params = append(params, "sni="+url.QueryEscape(n.SNI))
+	}
+	return fmt.Sprintf("vector://%s@%s:%d?%s", key, host, n.Port, strings.Join(params, "&")), nil
 }
