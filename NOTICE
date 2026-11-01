@@ -1,0 +1,55 @@
+# 致谢与上游归属
+
+Vega 站在这些项目的肩膀上。它们各自的版权与许可如下。
+
+## sing-box
+
+<https://github.com/SagerNet/sing-box>
+
+本仓库是 sing-box 的 fork。内核的全部协议实现、路由、DNS、出站、规则引擎
+等均来自 sing-box，我们只做了极小的扩展（见 README 的「thin fork」一节）。
+
+    Copyright (C) 2022 nekohasekai <contact-sagernet@sekai.icu>
+    License: GPL-3.0
+
+上游的 README 原文曾保存在 `README.sing-box.md`，后因本仓库需要自己的
+项目说明而移除；上游文档见 <https://sing-box.sagernet.org>。
+
+## nowhere-go
+
+<https://github.com/ohmycggk/nowhere-go>
+
+`third_party/nowhere-go/` 是该库的副本（基线 v3.2.0，commit `6a8410c`），
+我们加了两处补丁：morph 的多密钥试解、portal 的多用户与运行期换名单。
+Nowhere 协议的握手、Morph 伪装、FLOW 与 UoT 等全部实现来自这个库。
+
+    Copyright (C) 2026 ohmycggk
+    License: GPL-3.0
+
+## Nowhere（协议规范与官方实现）
+
+<https://github.com/NodePassProject/Nowhere>
+
+nw3 协议的规范与 Rust 官方实现。nowhere-go 与之保持线上兼容，
+我们不自称对该协议有任何贡献。
+
+    License: GPL-3.0
+
+## 其他间接依赖
+
+内核与面板还使用了大量第三方 Go 模块（grpc、quic-go、bubbletea、lipgloss、
+modernc sqlite 等），完整列表见各 `go.mod` / `go.sum`。它们各自的许可
+以对应仓库为准。
+
+--------------------------------------------------------------------------
+
+## 我们的部分
+
+除上述上游代码外，本仓库中由我们编写的部分（`option/nowhere.go`、
+`protocol/nowhere/`、`panel/`、`tools/sbstats/` 以及对上游文件的少量改动）：
+
+    Copyright (C) 2026 PPX-LuBing <1711958652@qq.com>
+    License: GPL-3.0
+
+因为整体是 sing-box 的衍生作品，本仓库整体以 **GPL-3.0** 分发，
+完整条款见 `LICENSE`。

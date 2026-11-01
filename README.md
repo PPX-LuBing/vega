@@ -148,6 +148,27 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOAMD64=v1 go build -o vega-panel-linux ./
 
 同步上游：把新版 nowhere-go 复制过来，重新应用这两处改动（补丁约 265 行）。
 
+## 致谢
+
+Vega 站在这些项目的肩膀上：
+
+| 项目 | 我们用到了什么 |
+|---|---|
+| [sing-box](https://github.com/SagerNet/sing-box) | **整个内核**——协议实现、路由、DNS、出站、规则引擎全部来自它。我们只加了 0.5% |
+| [nowhere-go](https://github.com/ohmycggk/nowhere-go) | Nowhere 协议的 Go 实现——握手、Morph 伪装、FLOW 与 UoT |
+| [Nowhere](https://github.com/NodePassProject/Nowhere) | nw3 协议的规范与 Rust 官方实现 |
+| [bubbletea](https://github.com/charmbracelet/bubbletea) / [lipgloss](https://github.com/charmbracelet/lipgloss) | 面板的 TUI 框架 |
+| [modernc.org/sqlite](https://gitlab.com/cznic/sqlite) | 面板的纯 Go SQLite 驱动 |
+| [grpc-go](https://github.com/grpc/grpc-go) | `tools/sbstats` 查 v2ray_api |
+
+完整的版权与许可说明见 [`NOTICE`](NOTICE)。
+
 ## 许可
 
-内核与 nowhere-go 均为 **GPL-3.0**，本项目沿用 GPL-3.0。上游 sing-box 的 README 保留在 `README.sing-box.md`。
+本项目是 sing-box 的衍生作品，整体以 **GNU GPL-3.0** 分发（完整条款见 [`LICENSE`](LICENSE)）。
+
+因为上游是 GPL-3.0，这是**法律上必须**的：衍生作品不能换成更宽松的许可。`LICENSE`
+文件在标准 GPL-3.0 正文之前保留了各上游项目的版权署名。
+
+我们自己的部分（`option/nowhere.go`、`protocol/nowhere/`、`panel/`、`tools/sbstats/`）
+同样以 GPL-3.0 授权，版权归 PPX-LuBing。
