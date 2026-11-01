@@ -12,6 +12,10 @@
 //	sbx-panel status                   内核运行状态（可观测性）
 //	sbx-panel machine add|list|del     多机编排
 //	sbx-panel user sync                运行期改用户（不重启，仅 nowhere）
+//	sbx-panel serve                    起订阅服务（clash / sing-box）
+//	sbx-panel user sub [name]          打印该用户的订阅地址
+//	sbx-panel user rotate-sub [name]   换一把订阅 token（地址泄露时用）
+//	sbx-panel setting get|set          读写面板设置（如 sub_host）
 //	sbx-panel version
 package main
 
@@ -31,6 +35,7 @@ import (
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
+	"github.com/PPX-LuBing/vega/panel/internal/sub"
 	"github.com/PPX-LuBing/vega/panel/internal/tui"
 )
 
@@ -156,8 +161,12 @@ func run(args []string) error {
 		return runNode(dbPath, paths, args[1:])
 	case "user":
 		return runUser(dbPath, paths, args[1:])
+	case "serve":
+		return runServe(dbPath, args[1:])
+	case "setting":
+		return runSetting(dbPath, args[1:])
 	default:
-		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / show）", args[0])
+		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / serve / setting / show）", args[0])
 	}
 }
 
@@ -452,10 +461,13 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 	}
 	defer st.Close()
 	if len(args) == 0 {
-		return fmt.Errorf("用法: user add|list|del|grant|revoke|reset")
+		return fmt.Errorf("用法: user add|list|del|grant|revoke|reset|sub|rotate-sub")
 	}
 
 	switch args[0] {
+	case "sub", "rotate-sub":
+		return runUserSub(st, args[0] == "rotate-sub", args[1:])
+
 	case "list":
 		users, err := st.Users()
 		if err != nil {
@@ -591,4 +603,129 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("未知子命令: user %s", args[0])
+}
+
+// runServe 起订阅 HTTP 服务。
+//
+// 订阅地址里的主机名必须显式给（--base），因为面板不知道自己在公网叫什么；
+// 猜错的话所有客户端都会拿到连不上的地址。
+func runServe(dbPath string, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	listen := fs.String("listen", "127.0.0.1:8080", "监听地址；前面有反代时绑回环")
+	base := fs.String("base", "", "订阅地址前缀，如 https://sub.example.com")
+	interval := fs.Duration("interval", 12*time.Hour, "客户端多久来拉一次")
+	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("用法: serve --listen 127.0.0.1:8080 --base https://sub.example.com")
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	// --base 优先，其次读设置里的 sub_base，都没有就报错而不是猜
+	resolved := strings.TrimSpace(*base)
+	if resolved == "" {
+		resolved = strings.TrimSpace(st.Setting("sub_base", ""))
+	}
+	if resolved == "" {
+		return fmt.Errorf("必须给 --base（或先 setting set sub_base <url>），否则订阅里写不出客户端能用的地址")
+	}
+	// 本机节点的地址也依赖 sub_host，提前查一次，缺了就早报错
+	if strings.TrimSpace(st.Setting("sub_host", "")) == "" {
+		fmt.Println("提示：还没设 sub_host，本机上的节点无法生成订阅地址。")
+		fmt.Println("      用 setting set sub_host <你的公网 IP 或域名> 补上。")
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	return sub.Serve(ctx, st, sub.Config{
+		Listen:   *listen,
+		Base:     strings.TrimRight(resolved, "/"),
+		Interval: *interval,
+	})
+}
+
+// runSetting 读写面板设置。
+func runSetting(dbPath string, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("用法: setting get <key> | setting set <key> <value>")
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+
+	switch args[0] {
+	case "get":
+		fmt.Println(st.Setting(args[1], ""))
+		return nil
+	case "set":
+		if len(args) < 3 {
+			return fmt.Errorf("用法: setting set <key> <value>")
+		}
+		// 订阅地址相关的键顺手去掉尾部斜杠，避免拼出 //sub/...
+		value := strings.TrimRight(strings.TrimSpace(args[2]), "/")
+		if err := st.SetSetting(args[1], value); err != nil {
+			return err
+		}
+		fmt.Printf("已设置 %s = %s\n", args[1], value)
+		return nil
+	default:
+		return fmt.Errorf("用法: setting get <key> | setting set <key> <value>")
+	}
+}
+
+// runUserSub 打印（或轮换）某个用户的订阅地址。
+//
+// 不给名字就列出所有用户的，方便一次性导出一批订阅。
+func runUserSub(st *store.Store, rotate bool, args []string) error {
+	base := strings.TrimRight(strings.TrimSpace(st.Setting("sub_base", "")), "/")
+	if base == "" {
+		return fmt.Errorf("还没配 sub_base，先执行: setting set sub_base https://你的订阅域名")
+	}
+
+	var names []string
+	if len(args) > 0 {
+		names = args
+	} else {
+		users, err := st.Users()
+		if err != nil {
+			return err
+		}
+		for _, u := range users {
+			if u.Enabled {
+				names = append(names, u.Name)
+			}
+		}
+		if len(names) == 0 {
+			return fmt.Errorf("没有启用的用户")
+		}
+	}
+
+	for _, name := range names {
+		var (
+			token string
+			err   error
+		)
+		if rotate {
+			token, err = st.RotateSubToken(name)
+		} else {
+			token, err = st.SubToken(name)
+		}
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		fmt.Printf("%-12s %s/sub/%s\n", name, base, token)
+		fmt.Printf("%-12s %s/sub/%s/clash    (clash/mihomo)\n", "", base, token)
+		fmt.Printf("%-12s %s/sub/%s/singbox  (sing-box，含 nowhere)\n", "", base, token)
+	}
+	if rotate {
+		fmt.Println("\n旧地址已失效。客户端需要重新拉取。")
+	}
+	return nil
 }

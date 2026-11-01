@@ -106,6 +106,11 @@ type User struct {
 	ExpiresAt  int64  `json:"expires_at"`
 	Enabled    bool   `json:"enabled"`
 	Remark     string `json:"remark"`
+
+	// SubToken 是订阅地址里的凭据，和上面的代理凭据分开。
+	// 订阅 URL 会进浏览器历史、日志、剪贴板、二维码截图，
+	// 泄露时必须能单独轮换，不能连带把代理凭据一起换掉。
+	SubToken string `json:"sub_token"`
 }
 
 // Store 是数据库句柄。
@@ -183,7 +188,8 @@ CREATE TABLE IF NOT EXISTS users (
     quota_bytes INTEGER NOT NULL DEFAULT 0,
     expires_at  INTEGER NOT NULL DEFAULT 0,
     enabled     INTEGER NOT NULL DEFAULT 1,
-    remark      TEXT NOT NULL DEFAULT ''
+    remark      TEXT NOT NULL DEFAULT '',
+    sub_token   TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS grants (
     node_tag  TEXT NOT NULL,
@@ -224,6 +230,9 @@ CREATE TABLE IF NOT EXISTS settings (
 )`); err != nil {
 		return err
 	}
+	if err = s.ensureSubTokenColumn(); err != nil {
+		return err
+	}
 	// 老库补列：SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，只能先探测
 	if !s.hasColumn("nodes", "machine") {
 		if _, err = s.db.Exec(`ALTER TABLE nodes ADD COLUMN machine TEXT NOT NULL DEFAULT 'local'`); err != nil {
@@ -243,6 +252,15 @@ CREATE TABLE IF NOT EXISTS settings (
 }
 
 // hasColumn 探测某表是否有某列。
+// ensureSubTokenColumn 给老库补上 sub_token 列。
+func (s *Store) ensureSubTokenColumn() error {
+	if s.hasColumn("users", "sub_token") {
+		return nil
+	}
+	_, err := s.db.Exec(`ALTER TABLE users ADD COLUMN sub_token TEXT NOT NULL DEFAULT ''`)
+	return err
+}
+
 func (s *Store) hasColumn(table, column string) bool {
 	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
@@ -494,19 +512,21 @@ func (s *Store) SaveUser(u User) error {
 		u.SharedKey = NewNowhereKey()
 	}
 	_, err := s.db.Exec(`
-INSERT INTO users (name, uuid, password, shared_key, quota_bytes, expires_at, enabled, remark)
-VALUES (?,?,?,?,?,?,?,?)
+INSERT INTO users (name, uuid, password, shared_key, quota_bytes, expires_at, enabled, remark, sub_token)
+VALUES (?,?,?,?,?,?,?,?,?)
 ON CONFLICT(name) DO UPDATE SET
   quota_bytes=excluded.quota_bytes, expires_at=excluded.expires_at,
-  enabled=excluded.enabled, remark=excluded.remark`,
-		u.Name, u.UUID, u.Password, u.SharedKey, u.QuotaBytes, u.ExpiresAt, boolInt(u.Enabled), u.Remark)
+  enabled=excluded.enabled, remark=excluded.remark
+  -- 有意不动 sub_token：订阅凭据只由 SubToken/RotateSubToken 管，
+  -- 否则每次改配额都会把用户的订阅地址换掉。`,
+		u.Name, u.UUID, u.Password, u.SharedKey, u.QuotaBytes, u.ExpiresAt, boolInt(u.Enabled), u.Remark, u.SubToken)
 	return err
 }
 
 // Users 返回全部用户。
 func (s *Store) Users() ([]User, error) {
 	rows, err := s.db.Query(`SELECT name, uuid, password, shared_key, quota_bytes, expires_at,
-        enabled, remark FROM users ORDER BY name`)
+        enabled, remark, sub_token FROM users ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -516,7 +536,7 @@ func (s *Store) Users() ([]User, error) {
 		var u User
 		var enabled int
 		if err = rows.Scan(&u.Name, &u.UUID, &u.Password, &u.SharedKey, &u.QuotaBytes,
-			&u.ExpiresAt, &enabled, &u.Remark); err != nil {
+			&u.ExpiresAt, &enabled, &u.Remark, &u.SubToken); err != nil {
 			return nil, err
 		}
 		u.Enabled = enabled != 0
@@ -540,6 +560,53 @@ func (s *Store) User(name string) (User, error) {
 }
 
 // DeleteUser 删除用户及其授权与流量记录。
+// SubToken 返回用户的订阅 token，没有就生成一个并落库。
+//
+// 惰性生成：只有真的要用订阅的用户才会有 token，不给所有用户
+// 平白多一个可被扫描的凭据。
+func (s *Store) SubToken(name string) (string, error) {
+	u, err := s.User(name)
+	if err != nil {
+		return "", err
+	}
+	if u.SubToken != "" {
+		return u.SubToken, nil
+	}
+	token := NewNowhereKey() // 32 位小写十六进制，够随机
+	if _, err = s.db.Exec(`UPDATE users SET sub_token=? WHERE name=?`, token, name); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// RotateSubToken 换一把订阅 token。订阅地址泄露时用这个，代理凭据不受影响。
+func (s *Store) RotateSubToken(name string) (string, error) {
+	token := NewNowhereKey()
+	result, err := s.db.Exec(`UPDATE users SET sub_token=? WHERE name=?`, token, name)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return "", fmt.Errorf("用户不存在: %s", name)
+	}
+	return token, nil
+}
+
+// UserBySubToken 按订阅 token 反查用户。查不到返回错误。
+func (s *Store) UserBySubToken(token string) (User, error) {
+	if strings.TrimSpace(token) == "" {
+		return User{}, fmt.Errorf("空 token")
+	}
+	var u User
+	row := s.db.QueryRow(`SELECT name, uuid, password, shared_key, quota_bytes,
+        expires_at, enabled, remark, sub_token FROM users WHERE sub_token=?`, token)
+	if err := row.Scan(&u.Name, &u.UUID, &u.Password, &u.SharedKey, &u.QuotaBytes,
+		&u.ExpiresAt, &u.Enabled, &u.Remark, &u.SubToken); err != nil {
+		return User{}, fmt.Errorf("订阅 token 无效")
+	}
+	return u, nil
+}
+
 func (s *Store) DeleteUser(name string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
