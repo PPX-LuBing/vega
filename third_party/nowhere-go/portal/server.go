@@ -57,9 +57,9 @@ type User struct {
 
 // Server accepts Vector and, when Egress is set, one Egress registration.
 type Server struct {
-	creds    *wire.Credentials
-	keys     *morph.Keys
-	tls      *tls.Config
+	creds *wire.Credentials
+	keys  *morph.Keys
+	tls   *tls.Config
 
 	// 多用户模式（Users）。与上面的单密钥字段互斥。
 	//
@@ -74,10 +74,10 @@ type Server struct {
 	// 误判成开了 Morph，服务端开始等 prelude，而客户端根本没发。
 	multiUserMode bool
 	morphEnabled  bool
-	up       Upstream
-	egress   bool
-	upload   *flowio.Limiter
-	download *flowio.Limiter
+	up            Upstream
+	egress        bool
+	upload        *flowio.Limiter
+	download      *flowio.Limiter
 
 	admit admit
 	flows gate
@@ -101,6 +101,9 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("nw3: shared key and users are mutually exclusive")
 	}
 	if multi {
+		if err := validateUsers(cfg.Users); err != nil {
+			return nil, err
+		}
 		for i, u := range cfg.Users {
 			if err := wire.ValidateServiceKey(u.SharedKey); err != nil {
 				return nil, fmt.Errorf("nw3: user %d (%q): %w", i, u.Name, err)
@@ -140,7 +143,7 @@ func New(cfg Config) (*Server, error) {
 	s.multiUserMode = multi
 	s.morphEnabled = cfg.Morph
 	if multi {
-		s.users = cfg.Users
+		s.users = append([]User(nil), cfg.Users...)
 		s.credsList = make([]*wire.Credentials, 0, len(cfg.Users))
 		if cfg.Morph {
 			s.keysList = make([]morph.Keys, 0, len(cfg.Users))
@@ -166,9 +169,7 @@ func New(cfg Config) (*Server, error) {
 
 // multiUser 报告当前是否是多用户模式。
 func (s *Server) multiUser() bool {
-	s.usersMu.RLock()
-	defer s.usersMu.RUnlock()
-	return len(s.credsList) > 0
+	return s.multiUserMode
 }
 
 // UpdateUsers 在运行期替换多用户列表，**不中断已建立的连接**。
@@ -181,6 +182,15 @@ func (s *Server) UpdateUsers(users []User) error {
 	if !s.multiUserMode {
 		return errors.New("nw3: update users requires multi-user mode")
 	}
+	if err := validateUsers(users); err != nil {
+		return err
+	}
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+	oldKeys := make(map[string]morph.Keys, len(s.keysList))
+	for i, key := range s.keysList {
+		oldKeys[s.users[i].SharedKey] = key
+	}
 	credsList := make([]*wire.Credentials, 0, len(users))
 	keysList := make([]morph.Keys, 0, len(users))
 	for i, u := range users {
@@ -192,17 +202,35 @@ func (s *Server) UpdateUsers(users []User) error {
 			return err
 		}
 		credsList = append(credsList, creds)
-		keysList = append(keysList, morph.Derive([]byte(u.SharedKey)))
+		if s.morphEnabled {
+			key, exists := oldKeys[u.SharedKey]
+			if !exists {
+				key = morph.Derive([]byte(u.SharedKey))
+			}
+			keysList = append(keysList, key)
+		}
 	}
 
-	s.usersMu.Lock()
-	defer s.usersMu.Unlock()
 	s.users = append([]User(nil), users...)
 	s.credsList = credsList
 	if s.morphEnabled {
 		s.keysList = keysList
 	} else {
 		s.keysList = nil // plain 模式不能留 keysList，否则 morphing 会误判成 true
+	}
+	return nil
+}
+
+func validateUsers(users []User) error {
+	names, keys := map[string]bool{}, map[string]bool{}
+	for _, user := range users {
+		if user.Name == "" || names[user.Name] || keys[user.SharedKey] {
+			return errors.New("nw3: users require unique nonempty names and keys")
+		}
+		if err := wire.ValidateServiceKey(user.SharedKey); err != nil {
+			return err
+		}
+		names[user.Name], keys[user.SharedKey] = true, true
 	}
 	return nil
 }
@@ -219,6 +247,12 @@ func (s *Server) snapshotUsers() ([]*wire.Credentials, []morph.Keys, []User) {
 
 // userCtxKey 是用户身份的 context 键。
 type userCtxKey struct{}
+type sourceCtxKey struct{}
+
+func SourceFromContext(ctx context.Context) net.Addr {
+	addr, _ := ctx.Value(sourceCtxKey{}).(net.Addr)
+	return addr
+}
 
 // ContextWithUser 把用户身份放进 context，供上游做按用户统计。
 func ContextWithUser(ctx context.Context, name string) context.Context {
@@ -233,9 +267,14 @@ func UserFromContext(ctx context.Context) string {
 
 // Serve accepts TLS connections. The listener is closed when ctx ends.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		_ = ln.Close()
+		select {
+		case <-ctx.Done():
+			_ = ln.Close()
+		case <-done:
+		}
 	}()
 	for {
 		conn, err := ln.Accept()
@@ -274,9 +313,25 @@ func (s *Server) ServeQUIC(ctx context.Context, ln qio.Listener) error {
 }
 
 func (s *Server) serveTCP(ctx context.Context, raw net.Conn) {
+	conn := raw
+	parent := ctx
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-parent.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	defer conn.Close()
+	ctx = context.WithValue(ctx, sourceCtxKey{}, raw.RemoteAddr())
 	acceptedAt := time.Now()
 	deadline := acceptedAt.Add(authBudget())
 	credsList, keysList, userList := s.snapshotUsers()
+	if s.multiUserMode && len(credsList) == 0 {
+		return
+	}
 	morphing := s.keys != nil || len(keysList) > 0
 	if morphing {
 		// Abortive close stays on until Vector authentication succeeds.

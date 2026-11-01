@@ -30,13 +30,14 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/metadata"
 )
 
 // ---------------------------------------------------------------- protobuf 手写编解码
 //
 // 只用到三条消息，手写比引 protoc 和 sing-box 的 proto 依赖划算得多：
 //
-//	QueryStatsRequest  { string pattern = 1; bool reset = 2; }
+//	QueryStatsRequest  { repeated string patterns = 3; bool reset = 2; }
 //	QueryStatsResponse { repeated Stat stat = 1; }
 //	Stat               { string name = 1; int64 value = 2; }
 
@@ -103,6 +104,9 @@ func readVarint(data []byte, pos int) (uint64, int, error) {
 		}
 		b := data[pos]
 		pos++
+		if shift == 63 && b > 1 {
+			return 0, pos, fmt.Errorf("varint overflow")
+		}
 		value |= uint64(b&0x7f) << shift
 		if b&0x80 == 0 {
 			return value, pos, nil
@@ -140,6 +144,9 @@ func parseQueryStatsResponse(data []byte) (map[string]int64, error) {
 				if err != nil {
 					return out, err
 				}
+				if length > uint64(len(data)-pos) {
+					return out, fmt.Errorf("field length out of bounds")
+				}
 				pos += int(length)
 				continue
 			}
@@ -150,10 +157,13 @@ func parseQueryStatsResponse(data []byte) (map[string]int64, error) {
 		if err != nil {
 			return out, err
 		}
-		if pos+int(length) > len(data) {
+		if length > uint64(len(data)-pos) {
 			return out, fmt.Errorf("Stat 越界")
 		}
-		name, value := parseStat(data[pos : pos+int(length)])
+		name, value, err := parseStat(data[pos : pos+int(length)])
+		if err != nil {
+			return out, err
+		}
 		pos += int(length)
 		if name != "" {
 			out[name] = value
@@ -162,14 +172,14 @@ func parseQueryStatsResponse(data []byte) (map[string]int64, error) {
 	return out, nil
 }
 
-func parseStat(data []byte) (string, int64) {
+func parseStat(data []byte) (string, int64, error) {
 	var name string
 	var value int64
 	pos := 0
 	for pos < len(data) {
 		tag, next, err := readVarint(data, pos)
 		if err != nil {
-			return name, value
+			return "", 0, err
 		}
 		pos = next
 		field, wire := int(tag>>3), int(tag&7)
@@ -177,8 +187,8 @@ func parseStat(data []byte) (string, int64) {
 		case field == 1 && wire == 2:
 			var length uint64
 			length, pos, err = readVarint(data, pos)
-			if err != nil || pos+int(length) > len(data) {
-				return name, value
+			if err != nil || length > uint64(len(data)-pos) {
+				return "", 0, fmt.Errorf("invalid Stat name length")
 			}
 			name = string(data[pos : pos+int(length)])
 			pos += int(length)
@@ -186,14 +196,14 @@ func parseStat(data []byte) (string, int64) {
 			var raw uint64
 			raw, pos, err = readVarint(data, pos)
 			if err != nil {
-				return name, value
+				return "", 0, err
 			}
 			value = int64(raw)
 		default:
-			return name, value
+			return "", 0, fmt.Errorf("unsupported Stat field")
 		}
 	}
-	return name, value
+	return name, value, nil
 }
 
 // ---------------------------------------------------------------- 主流程
@@ -205,13 +215,14 @@ type stat struct {
 }
 
 type response struct {
-	Stat []stat `json:"stat"`
+	Stat     []stat `json:"stat"`
+	Instance string `json:"instance,omitempty"`
 }
 
 func main() {
 	server := flag.String("server", "127.0.0.1:10085", "v2ray_api 的 gRPC 地址")
 	pattern := flag.String("pattern", "", "只返回名字含该前缀的统计（如 user>>>）")
-	reset := flag.Bool("reset", false, "读取后清零（面板按月/按周期结算用）")
+	reset := flag.Bool("reset", false, "读取后清零（不要用于面板正在采集的内核）")
 	raw := flag.Bool("json", false, "直接输出原始 JSON（不排序、不带包装）")
 	timeout := flag.Duration("timeout", 10*time.Second, "超时")
 	flag.Parse()
@@ -231,13 +242,14 @@ func main() {
 
 	// QueryStatsRequest{ pattern, reset }
 	req := &rawMessage{}
-	req.data = appendString(req.data, 1, *pattern)
+	req.data = appendString(req.data, 3, *pattern)
 	req.data = appendBool(req.data, 2, *reset)
 
 	resp := &rawMessage{}
+	var headers metadata.MD
 	err = conn.Invoke(ctx,
 		"/v2ray.core.app.stats.command.StatsService/QueryStats",
-		req, resp, grpc.ForceCodec(codec))
+		req, resp, grpc.ForceCodec(codec), grpc.Header(&headers))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "QueryStats 失败: %v\n", err)
 		fmt.Fprintln(os.Stderr, "提示：sing-box 需要用 -tags with_v2ray_api 编译，且配置里启用 experimental.v2ray_api")
@@ -261,10 +273,20 @@ func main() {
 		items = append(items, stat{Name: name, Value: fmt.Sprintf("%d", values[name])})
 	}
 	if *raw {
-		items = nil
+		out, err := json.Marshal(values)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(string(out))
+		return
 	}
 
-	out, err := json.Marshal(response{Stat: items})
+	instance := ""
+	if values := headers.Get("vega-stats-instance"); len(values) > 0 {
+		instance = values[0]
+	}
+	out, err := json.Marshal(response{Stat: items, Instance: instance})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "序列化失败: %v\n", err)
 		os.Exit(1)

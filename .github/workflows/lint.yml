@@ -3,6 +3,7 @@ name: Lint
 on:
   push:
     branches:
+      - main
       - oldstable
       - stable
       - testing
@@ -13,6 +14,7 @@ on:
       - '!.github/workflows/lint.yml'
   pull_request:
     branches:
+      - main
       - oldstable
       - stable
       - testing

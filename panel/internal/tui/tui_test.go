@@ -1,14 +1,147 @@
 package tui
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
+
+func TestViewUsesOnlyCachedState(t *testing.T) {
+	m := testModel(t)
+	if err := m.store.SaveMachine(store.Machine{Name: "slow", Host: "192.0.2.1"}); err != nil {
+		t.Fatal(err)
+	}
+	m.reload()
+	if runtime.GOOS != "windows" {
+		dir := t.TempDir()
+		marker := filepath.Join(dir, "called")
+		t.Setenv("VIEW_MARKER", marker)
+		if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte("#!/bin/sh\necho called > \"$VIEW_MARKER\"\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", dir)
+		for tab := 0; tab < tabCount; tab++ {
+			m.tab = tab
+			_ = m.View()
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatal("View started an external process")
+		}
+	}
+	// Database access in View would now panic; all grant counts must be cached.
+	st := m.store
+	m.store = nil
+	defer func() { m.store = st }()
+	start := time.Now()
+	for tab := 0; tab < tabCount; tab++ {
+		m.tab = tab
+		_ = m.View()
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("View blocked on a probe")
+	}
+}
+
+func TestBackgroundActionLeavesNavigationResponsive(t *testing.T) {
+	m := testModel(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	_, cmd := m.action("testing", func() actionMsg { close(started); <-release; return actionMsg{text: "done"} })
+	if cmd == nil || !m.busy {
+		t.Fatal("action was not queued")
+	}
+	finished := make(chan tea.Msg, 1)
+	go func() { finished <- cmd() }()
+	<-started
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("3")})
+	if m.tab != tabUsers {
+		t.Fatal("navigation blocked by action")
+	}
+	if _, duplicate := m.collect(); duplicate != nil {
+		t.Fatal("duplicate action accepted")
+	}
+	close(release)
+	_, refresh := m.Update(<-finished)
+	if m.busy || m.status != "done" || refresh == nil {
+		t.Fatal("completion did not update UI")
+	}
+	// A command queued before shutdown must not access the closed store later.
+	m.Close()
+	if got := refresh(); got != nil {
+		t.Fatalf("command ran after close: %v", got)
+	}
+}
+
+func TestFormAcceptsUnicodePasteAndDeletesWholeRune(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabUsers
+	m.startAdd()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("香港用户alice")})
+	if got := m.form.values[0]; got != "香港用户alice" {
+		t.Fatal(got)
+	}
+	m.form.values[0] = "香港"
+	m.handleKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	if got := m.form.values[0]; got != "香" || !utf8.ValidString(got) {
+		t.Fatal(got)
+	}
+}
+
+func TestInvalidFormLimitsDoNotBecomeUnlimited(t *testing.T) {
+	for _, limits := range [][2]string{{"abc", "0"}, {"NaN", "0"}, {"0", "-1"}, {"0", "forever"}} {
+		t.Run(fmt.Sprint(limits), func(t *testing.T) {
+			m := testModel(t)
+			if err := m.submitUserForm([]string{"invalid", limits[0], limits[1]}); err == nil {
+				t.Fatal("invalid limits accepted")
+			}
+			if _, err := m.store.User("invalid"); err == nil {
+				t.Fatal("invalid user saved")
+			}
+		})
+	}
+}
+
+func TestEditRemarkPreservesExpiry(t *testing.T) {
+	for _, delta := range []time.Duration{-time.Hour, time.Hour, 30 * 24 * time.Hour} {
+		m := testModel(t)
+		u, err := m.store.User("alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.ExpiresAt = time.Now().Add(delta).Unix()
+		if err = m.store.SaveUser(u); err != nil {
+			t.Fatal(err)
+		}
+		m.reload()
+		m.tab = tabUsers
+		for i, user := range m.users {
+			if user.Name == "alice" {
+				m.cursor = i
+			}
+		}
+		m.startEdit()
+		m.form.values[2] = "new remark"
+		if err = m.form.submit(m.form.values); err != nil {
+			t.Fatal(err)
+		}
+		after, err := m.store.User("alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.ExpiresAt != u.ExpiresAt {
+			t.Fatalf("expiry changed: %d -> %d", u.ExpiresAt, after.ExpiresAt)
+		}
+	}
+}
 
 func testModel(t *testing.T) *Model {
 	t.Helper()
@@ -38,8 +171,10 @@ func testModel(t *testing.T) *Model {
 	if err = st.AddTraffic("alice", 1<<28, 1<<29, ""); err != nil {
 		t.Fatal(err)
 	}
-	return New(st, kernel.Paths{Service: "sbx", Bin: "/usr/local/bin/sbx",
+	m := New(st, kernel.Paths{Service: "sbx", Bin: "/usr/local/bin/sbx",
 		Config: "/etc/sbx/config.json", APIAddr: "127.0.0.1:10085"})
+	t.Cleanup(m.Close)
+	return m
 }
 
 // 每一页都要能渲染出内容，且带上关键信息。
@@ -223,22 +358,27 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestParseGBAndDays(t *testing.T) {
-	if got := parseGB("2"); got != 2<<30 {
+	if got, err := kernel.ParseQuotaGB("2"); err != nil || got != 2<<30 {
 		t.Errorf("parseGB(2) = %d", got)
 	}
-	if got := parseGB("0.5"); got != 1<<29 {
+	if got, err := kernel.ParseQuotaGB("0.5"); err != nil || got != 1<<29 {
 		t.Errorf("parseGB(0.5) = %d", got)
 	}
-	for _, bad := range []string{"", "abc", "-1", "0"} {
-		if got := parseGB(bad); got != 0 {
-			t.Errorf("parseGB(%q) 应为 0，实际 %d", bad, got)
+	for _, bad := range []string{"", "abc", "-1", "NaN", "Inf", "1e100", "1e-20"} {
+		if _, err := kernel.ParseQuotaGB(bad); err == nil {
+			t.Errorf("accepted invalid quota %q", bad)
 		}
 	}
-	if got := parseDays("0"); got != 0 {
+	if got, err := kernel.ParseExpiryDays("0"); err != nil || got != 0 {
 		t.Errorf("parseDays(0) 应为 0，实际 %d", got)
 	}
-	if parseDays("30") == 0 {
+	if expires, err := kernel.ParseExpiryDays("30"); err != nil || expires == 0 {
 		t.Error("parseDays(30) 不该是 0")
+	}
+	for _, bad := range []string{"", "-1", "abc", "365001", "1e100"} {
+		if _, err := kernel.ParseExpiryDays(bad); err == nil {
+			t.Errorf("accepted invalid days %q", bad)
+		}
 	}
 }
 

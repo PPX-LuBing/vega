@@ -10,6 +10,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,17 +38,17 @@ var Protocols = []string{
 // 面板本身跑在任意一台机器上（或本地），通过 SSH 把配置推给其它机器。
 // 不引入 agent 是刻意的：SSH 已经在运维手里，多一个常驻进程就多一份攻击面。
 type Machine struct {
-	Name   string `json:"name"`
-	Host   string `json:"host"`
-	SSHPort int   `json:"ssh_port"`
+	Name    string `json:"name"`
+	Host    string `json:"host"`
+	SSHPort int    `json:"ssh_port"`
 	SSHUser string `json:"ssh_user"`
 
-	KernelPath string `json:"kernel_path"`
-	ConfigPath string `json:"config_path"`
-	Service    string `json:"service"`
-	APIAddr    string `json:"api_addr"`
-	StatsBin   string `json:"stats_bin"`
-	ClashAddr  string `json:"clash_addr"`
+	KernelPath  string `json:"kernel_path"`
+	ConfigPath  string `json:"config_path"`
+	Service     string `json:"service"`
+	APIAddr     string `json:"api_addr"`
+	StatsBin    string `json:"stats_bin"`
+	ClashAddr   string `json:"clash_addr"`
 	ControlAddr string `json:"control_addr"`
 
 	Remark string `json:"remark"`
@@ -113,10 +115,32 @@ type Store struct {
 
 // Open 打开（并在需要时创建）数据库。
 func Open(path string) (*Store, error) {
+	if path != ":memory:" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return nil, err
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		if err = file.Chmod(0o600); err != nil {
+			file.Close()
+			return nil, err
+		}
+		if err = file.Close(); err != nil {
+			return nil, err
+		}
+		for _, suffix := range []string{"-wal", "-shm"} {
+			if err = os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
+				return nil, err
+			}
+		}
+	}
 	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	s := &Store{db: db}
 	if err = s.migrate(); err != nil {
 		_ = db.Close()
@@ -194,10 +218,25 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err != nil {
 		return err
 	}
+	if _, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS traffic_samples (
+    source TEXT NOT NULL, user_name TEXT NOT NULL, instance TEXT NOT NULL,
+    up INTEGER NOT NULL, down INTEGER NOT NULL, PRIMARY KEY(source,user_name,instance)
+)`); err != nil {
+		return err
+	}
 	// 老库补列：SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，只能先探测
 	if !s.hasColumn("nodes", "machine") {
 		if _, err = s.db.Exec(`ALTER TABLE nodes ADD COLUMN machine TEXT NOT NULL DEFAULT 'local'`); err != nil {
 			return err
+		}
+	}
+	for _, column := range []struct{ name, fallback string }{
+		{"clash_addr", "127.0.0.1:9090"}, {"control_addr", "127.0.0.1:10087"},
+	} {
+		if !s.hasColumn("machines", column.name) {
+			if _, err = s.db.Exec("ALTER TABLE machines ADD COLUMN " + column.name + " TEXT NOT NULL DEFAULT '" + column.fallback + "'"); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -295,8 +334,7 @@ func (s *Store) Machines() ([]Machine, error) {
 	return out, rows.Err()
 }
 
-// Machine 按名字取机器。没登记的名字按 local 的默认值兜底——
-// 节点写了 machine=hk 但忘了登记时，不该让整份配置生成失败。
+// Machine 按名字取机器；只有未登记的 local 可使用默认值。
 func (s *Store) Machine(name string) (Machine, error) {
 	if name == "" {
 		name = LocalMachine
@@ -344,6 +382,12 @@ func (s *Store) SaveNode(n Node) error {
 	}
 	if !ValidProto(n.Proto) {
 		return fmt.Errorf("不支持的协议: %s", n.Proto)
+	}
+	if _, err := s.Machine(n.Machine); err != nil {
+		return err
+	}
+	if n.TLSMode != "tls" && n.TLSMode != "reality" && n.TLSMode != "none" && n.TLSMode != "" {
+		return errors.New("TLS 模式必须为 tls/reality/none")
 	}
 	if n.Port <= 0 || n.Port > 65535 {
 		return fmt.Errorf("端口非法: %d", n.Port)
@@ -410,22 +454,35 @@ func (s *Store) Node(tag string) (Node, error) {
 
 // DeleteNode 删除节点及其授权。
 func (s *Store) DeleteNode(tag string) error {
-	if _, err := s.db.Exec(`DELETE FROM grants WHERE node_tag=?`, tag); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`DELETE FROM nodes WHERE tag=?`, tag)
-	return err
+	defer tx.Rollback()
+	if _, err = tx.Exec(`DELETE FROM grants WHERE node_tag=?`, tag); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`DELETE FROM nodes WHERE tag=?`, tag); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------- 用户
 
-// SaveUser 新增或覆盖一个用户；缺的凭据会自动生成。
+// SaveUser 新增或更新用户；新增时生成凭据，更新时保留已有凭据。
 func (s *Store) SaveUser(u User) error {
 	if u.Name == "" {
 		return errors.New("用户名不能为空")
 	}
 	if strings.ContainsAny(u.Name, " \t\n") {
 		return errors.New("用户名不能含空白字符")
+	}
+	if strings.Contains(u.Name, ">>>") {
+		return errors.New("用户名不能含 >>>")
+	}
+	if u.QuotaBytes < 0 || u.ExpiresAt < 0 {
+		return errors.New("配额和到期时间不能为负数")
 	}
 	if u.UUID == "" {
 		u.UUID = NewUUID()
@@ -440,7 +497,6 @@ func (s *Store) SaveUser(u User) error {
 INSERT INTO users (name, uuid, password, shared_key, quota_bytes, expires_at, enabled, remark)
 VALUES (?,?,?,?,?,?,?,?)
 ON CONFLICT(name) DO UPDATE SET
-  uuid=excluded.uuid, password=excluded.password, shared_key=excluded.shared_key,
   quota_bytes=excluded.quota_bytes, expires_at=excluded.expires_at,
   enabled=excluded.enabled, remark=excluded.remark`,
 		u.Name, u.UUID, u.Password, u.SharedKey, u.QuotaBytes, u.ExpiresAt, boolInt(u.Enabled), u.Remark)
@@ -485,22 +541,34 @@ func (s *Store) User(name string) (User, error) {
 
 // DeleteUser 删除用户及其授权与流量记录。
 func (s *Store) DeleteUser(name string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	for _, q := range []string{
 		`DELETE FROM grants WHERE user_name=?`,
 		`DELETE FROM traffic WHERE user_name=?`,
 		`DELETE FROM users WHERE name=?`,
 	} {
-		if _, err := s.db.Exec(q, name); err != nil {
+		if _, err = tx.Exec(q, name); err != nil {
 			return err
 		}
 	}
-	return nil
+	// Keep cumulative checkpoints so a delayed sample cannot re-add old usage.
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------- 授权
 
 // Grant 把节点授权给用户。
 func (s *Store) Grant(nodeTag, userName string) error {
+	if _, err := s.Node(nodeTag); err != nil {
+		return err
+	}
+	if _, err := s.User(userName); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO grants (node_tag, user_name) VALUES (?,?)`,
 		nodeTag, userName)
 	return err
@@ -552,6 +620,9 @@ func (s *Store) NodesForUser(userName string) ([]string, error) {
 
 // AddTraffic 累加某用户某天的流量。
 func (s *Store) AddTraffic(userName string, up, down int64, day string) error {
+	if up < 0 || down < 0 {
+		return errors.New("negative traffic delta")
+	}
 	if day == "" {
 		day = time.Now().Format("2006-01-02")
 	}
@@ -560,6 +631,56 @@ INSERT INTO traffic (user_name, day, up, down) VALUES (?,?,?,?)
 ON CONFLICT(user_name, day) DO UPDATE SET up=up+excluded.up, down=down+excluded.down`,
 		userName, day, up, down)
 	return err
+}
+
+type TrafficSample struct {
+	Name     string
+	Up, Down int64
+}
+
+// RecordTraffic commits counters and their deltas together; retries cannot double bill.
+func (s *Store) RecordTraffic(source, instance string, samples []TrafficSample) (int64, int64, error) {
+	if instance == "" {
+		return 0, 0, errors.New("missing stats instance; upgrade kernel and sb-stats")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	var totalUp, totalDown int64
+	day := time.Now().Format("2006-01-02")
+	for _, sample := range samples {
+		if sample.Up < 0 || sample.Down < 0 {
+			return 0, 0, errors.New("negative traffic counter")
+		}
+		var oldUp, oldDown int64
+		err = tx.QueryRow(`SELECT up,down FROM traffic_samples WHERE source=? AND user_name=? AND instance=?`, source, sample.Name, instance).Scan(&oldUp, &oldDown)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, 0, err
+		}
+		up, down := sample.Up, sample.Down
+		if err == nil {
+			up = max(sample.Up-oldUp, 0)
+			down = max(sample.Down-oldDown, 0)
+			sample.Up = max(sample.Up, oldUp)
+			sample.Down = max(sample.Down, oldDown)
+		}
+		if _, err = tx.Exec(`INSERT INTO traffic (user_name,day,up,down) VALUES (?,?,?,?)
+ON CONFLICT(user_name,day) DO UPDATE SET up=up+excluded.up,down=down+excluded.down`, sample.Name, day, up, down); err != nil {
+			return 0, 0, err
+		}
+		if _, err = tx.Exec(`INSERT INTO traffic_samples (source,user_name,instance,up,down) VALUES (?,?,?,?,?)
+ON CONFLICT(source,user_name,instance) DO UPDATE SET up=excluded.up,down=excluded.down`, source, sample.Name, instance, sample.Up, sample.Down); err != nil {
+			return 0, 0, err
+		}
+		totalUp += up
+		totalDown += down
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return totalUp, totalDown, nil
 }
 
 // Usage 返回某用户的累计用量。
@@ -612,6 +733,17 @@ func (s *Store) SetSetting(key, value string) error {
 	_, err := s.db.Exec(`INSERT INTO settings (key,value) VALUES (?,?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
 	return err
+}
+
+// ControlSecret is generated once and shared only with managed kernels.
+func (s *Store) ControlSecret() (string, error) {
+	secret := NewSecret() + NewSecret()
+	if _, err := s.db.Exec(`INSERT OR IGNORE INTO settings (key,value) VALUES ('control_secret',?)`, secret); err != nil {
+		return "", err
+	}
+	var value string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key='control_secret'`).Scan(&value)
+	return value, err
 }
 
 // ---------------------------------------------------------------- 工具

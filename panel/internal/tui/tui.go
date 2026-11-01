@@ -10,7 +10,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -62,12 +65,21 @@ type Model struct {
 	cursor int
 	mode   mode
 
-	nodes    []store.Node
-	users    []store.User
-	machines []store.Machine
-	usage    map[string][2]int64
-	snapshot kernel.Snapshot
-	snapErr  error
+	nodes            []store.Node
+	users            []store.User
+	machines         []store.Machine
+	usage            map[string][2]int64
+	snapshot         kernel.Snapshot
+	snapErr          error
+	states           map[string]kernel.MachineStatus
+	nodeUsers        map[string]int
+	userNodes        map[string]int
+	busy, refreshing bool
+	ctx              context.Context
+	cancel           context.CancelFunc
+	jobs             sync.WaitGroup
+	jobMu            sync.Mutex
+	closed           bool
 
 	// 表单
 	form      *form
@@ -83,7 +95,8 @@ type Model struct {
 
 // New 构造面板模型。
 func New(st *store.Store, paths kernel.Paths) *Model {
-	m := &Model{store: st, paths: paths, usage: map[string][2]int64{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &Model{store: st, paths: paths, usage: map[string][2]int64{}, states: map[string]kernel.MachineStatus{}, ctx: ctx, cancel: cancel}
 	m.reload()
 	m.setStatus("就绪。按 ? 看帮助。")
 	return m
@@ -97,11 +110,21 @@ func (m *Model) reload() {
 	if users, err := m.store.Users(); err == nil {
 		m.users = users
 	}
-	if machines, err := m.store.Machines(); err == nil {
+	if machines, err := kernel.ManagedMachines(m.store, m.paths); err == nil {
 		m.machines = machines
 	}
 	if usage, err := m.store.AllUsage(); err == nil {
 		m.usage = usage
+	}
+	m.nodeUsers, m.userNodes = map[string]int{}, map[string]int{}
+	for _, node := range m.nodes {
+		users, err := m.store.UsersForNode(node.Tag)
+		if err == nil {
+			m.nodeUsers[node.Tag] = len(users)
+			for _, name := range users {
+				m.userNodes[name]++
+			}
+		}
 	}
 	m.clampCursor()
 }
@@ -142,22 +165,60 @@ func (m *Model) setError(format string, args ...any) {
 }
 
 // Init 实现 tea.Model。启动时拉一次内核可观测数据。
-func (m *Model) Init() tea.Cmd { return fetchSnapshotCmd(m.paths) }
+func (m *Model) Init() tea.Cmd { return m.refresh() }
+
+// Close waits for commands before the caller closes the shared database.
+func (m *Model) Close() {
+	m.cancel()
+	m.jobMu.Lock()
+	m.closed = true
+	m.jobMu.Unlock()
+	m.jobs.Wait()
+}
+
+func (m *Model) command(run tea.Cmd) tea.Cmd {
+	return func() tea.Msg {
+		m.jobMu.Lock()
+		if m.closed {
+			m.jobMu.Unlock()
+			return nil
+		}
+		m.jobs.Add(1)
+		m.jobMu.Unlock()
+		defer m.jobs.Done()
+		return run()
+	}
+}
 
 // snapshotMsg 是异步拉取内核状态的结果。
 type snapshotMsg struct {
-	snapshot kernel.Snapshot
-	err      error
+	results []kernel.MachineStatus
 }
 
-// fetchSnapshotCmd 异步读 clash_api。
-//
-// 必须异步：Observe 有 5 秒超时，同步调用会让整个界面卡住。
-func fetchSnapshotCmd(paths kernel.Paths) tea.Cmd {
-	return func() tea.Msg {
-		snapshot, err := kernel.Observe(paths.ClashAddr)
-		return snapshotMsg{snapshot: snapshot, err: err}
+// Refresh runs all probes outside the event loop; View only reads the result.
+func (m *Model) refresh() tea.Cmd {
+	if m.refreshing {
+		return nil
 	}
+	m.refreshing = true
+	ctx, st, paths := m.ctx, m.store, m.paths
+	return m.command(func() tea.Msg {
+		return snapshotMsg{results: kernel.ObserveAll(ctx, st, paths)}
+	})
+}
+
+type actionMsg struct {
+	text string
+	err  bool
+}
+
+func (m *Model) action(label string, run func() actionMsg) (tea.Model, tea.Cmd) {
+	if m.busy {
+		return m, nil
+	}
+	m.busy = true
+	m.setStatus("%s…（可切页或退出）", label)
+	return m, m.command(func() tea.Msg { return run() })
 }
 
 // Update 实现 tea.Model。
@@ -167,8 +228,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		return m, nil
 	case snapshotMsg:
-		m.snapshot, m.snapErr = msg.snapshot, msg.err
+		m.refreshing = false
+		m.snapshot, m.snapErr = kernel.Snapshot{}, nil
+		m.states = map[string]kernel.MachineStatus{}
+		var failures []string
+		good := 0
+		for _, r := range msg.results {
+			m.states[r.Machine.Name] = r
+			if r.Err != nil {
+				failures = append(failures, r.Machine.Name+": "+r.Err.Error())
+				continue
+			}
+			good++
+			m.snapshot.Memory += r.Memory
+			m.snapshot.UploadTotal += r.UploadTotal
+			m.snapshot.DownloadTotal += r.DownloadTotal
+			m.snapshot.ActiveConnections += r.ActiveConnections
+		}
+		if good > 0 {
+			m.snapshot.Version = fmt.Sprintf("%d/%d 台已读取（版本见机器页）", good, len(msg.results))
+		}
+		if len(failures) > 0 {
+			m.snapErr = fmt.Errorf("%s", strings.Join(failures, "；"))
+		}
 		return m, nil
+	case actionMsg:
+		m.busy = false
+		m.status, m.isError = msg.text, msg.err
+		m.reload()
+		return m, m.refresh()
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -177,9 +265,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
+	if key == "ctrl+c" {
+		m.cancel()
+		m.quit = true
+		return m, tea.Quit
+	}
+	if m.busy && (key == "a" || key == "e" || key == "d" || key == "space" || key == " " || key == "r" || key == "c" || key == "s" || key == "x") {
+		return m, nil
+	}
 
 	// 表单模式独占按键
 	if m.mode == modeForm && m.form != nil {
+		if msg.Type == tea.KeyRunes {
+			text := string(msg.Runes)
+			if utf8.ValidString(text) && !strings.ContainsFunc(text, unicode.IsControl) {
+				m.form.values[m.form.cursor] += text
+			}
+			return m, nil
+		}
 		return m.handleFormKey(key)
 	}
 	// 确认模式
@@ -204,6 +307,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch key {
 	case "q", "ctrl+c":
+		m.cancel()
 		m.quit = true
 		return m, tea.Quit
 	case "1", "2", "3", "4", "5":
@@ -212,7 +316,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "u":
 		// 手动刷新内核状态
 		m.setStatus("正在读取内核状态…")
-		return m, fetchSnapshotCmd(m.paths)
+		return m, m.refresh()
 	case "tab":
 		m.tab = (m.tab + 1) % tabCount
 		m.cursor = 0
@@ -242,6 +346,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.collect()
 	case "s":
 		return m.syncUsers()
+	case "x":
+		return m.enforce()
 	}
 	return m, nil
 }
@@ -249,64 +355,81 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // ---------------------------------------------------------------- 动作
 
 func (m *Model) apply() (tea.Model, tea.Cmd) {
-	// 下发到所有登记的机器；一台失败不影响其它机器，所以逐个汇报
-	results := kernel.ApplyAll(context.Background(), m.store, m.paths)
-	var okCount, nodeTotal int
-	var failures []string
-	for _, r := range results {
-		if r.Err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", r.Machine, r.Err))
-			continue
+	return m.action("正在下发全部机器", func() actionMsg {
+		results := kernel.ApplyAll(m.ctx, m.store, m.paths)
+		var okCount, nodeTotal int
+		var failures []string
+		for _, r := range results {
+			if r.Err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", r.Machine, r.Err))
+				continue
+			}
+			okCount++
+			nodeTotal += r.Nodes
 		}
-		okCount++
-		nodeTotal += r.Nodes
-	}
-	if len(failures) > 0 {
-		m.setError("下发 %d/%d 台成功（%d 个入站）；失败：%s",
-			okCount, len(results), nodeTotal, strings.Join(failures, "；"))
-		return m, nil
-	}
-	m.setStatus("已下发 %d 台机器、共 %d 个入站。", okCount, nodeTotal)
-	return m, nil
+		text := fmt.Sprintf("下发 %d/%d 台成功（%d 个入站）", okCount, len(results), nodeTotal)
+		if len(failures) > 0 {
+			text += "；失败：" + strings.Join(failures, "；")
+		}
+		return actionMsg{text: text, err: len(failures) > 0}
+	})
 }
 
-// syncUsers 把用户名单推给运行中的内核，不重启。
-//
-// 这是 sing-box 原生没有的能力：配额摘人、加人都不用断线。
-// 只有 nowhere 协议支持（自有协议才有运行期换名单的接口）。
 func (m *Model) syncUsers() (tea.Model, tea.Cmd) {
-	results := kernel.SyncNowhereNodes(m.store, m.paths)
-	if len(results) == 0 {
-		m.setStatus("没有启用的 nowhere 节点，无需同步。")
-		return m, nil
-	}
-	var okCount, failed int
-	var failures []string
-	for _, r := range results {
-		if r.Err != nil {
-			failed++
-			failures = append(failures, fmt.Sprintf("%s: %v", r.Inbound, r.Err))
-			continue
+	return m.action("正在同步用户", func() actionMsg {
+		results := kernel.SyncNowhereNodesContext(m.ctx, m.store, m.paths)
+		var failures []string
+		for _, r := range results {
+			if r.Err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", r.Inbound, r.Err))
+			}
 		}
-		okCount++
-	}
-	if failed > 0 {
-		m.setError("同步 %d/%d 个节点成功；失败：%s", okCount, len(results), strings.Join(failures, "；"))
-		return m, nil
-	}
-	m.setStatus("已运行期更新 %d 个 nowhere 节点的用户（未重启）。", okCount)
-	return m, nil
+		text := fmt.Sprintf("同步 %d/%d 个节点成功（只影响新连接，未重启）", len(results)-len(failures), len(results))
+		if len(failures) > 0 {
+			text += "；" + strings.Join(failures, "；")
+		}
+		return actionMsg{text: text, err: len(failures) > 0}
+	})
 }
 
 func (m *Model) collect() (tea.Model, tea.Cmd) {
-	up, down, err := kernel.Collect(m.store, m.paths)
-	if err != nil {
-		m.setError("采集失败: %v", err)
-		return m, nil
-	}
-	m.reload()
-	m.setStatus("采集完成：↑ %s / ↓ %s。", kernel.HumanBytes(up), kernel.HumanBytes(down))
-	return m, nil
+	return m.action("正在采集全部机器", func() actionMsg {
+		var up, down int64
+		var failures []string
+		for _, r := range kernel.CollectAll(m.ctx, m.store, m.paths) {
+			if r.Err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", r.Machine, r.Err))
+				continue
+			}
+			up += r.Up
+			down += r.Down
+		}
+		text := fmt.Sprintf("已采集：↑ %s / ↓ %s", kernel.HumanBytes(up), kernel.HumanBytes(down))
+		if len(failures) > 0 {
+			text += "；部分失败：" + strings.Join(failures, "；")
+		}
+		return actionMsg{text: text, err: len(failures) > 0}
+	})
+}
+
+func (m *Model) enforce() (tea.Model, tea.Cmd) {
+	return m.action("正在采集并执行配额（变化机器将重启）", func() actionMsg {
+		var changed int
+		var failures []string
+		for _, r := range kernel.Enforce(m.ctx, m.store, m.paths) {
+			if r.Err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", r.Machine, r.Err))
+			}
+			if r.Changed {
+				changed++
+			}
+		}
+		text := fmt.Sprintf("执行完成：%d 台配置变化并已重启", changed)
+		if len(failures) > 0 {
+			text += "；" + strings.Join(failures, "；")
+		}
+		return actionMsg{text: text, err: len(failures) > 0}
+	})
 }
 
 func (m *Model) toggleEnabled() (tea.Model, tea.Cmd) {
@@ -404,13 +527,24 @@ func (m *Model) startEdit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		user := m.users[m.cursor]
+		originalDays := daysText(user.ExpiresAt)
 		m.form = newForm("编辑用户 "+user.Name, []field{
 			{label: "配额(GB)", def: gbText(user.QuotaBytes)},
-			{label: "有效期(天)", def: daysText(user.ExpiresAt)},
+			{label: "有效期(天)", def: originalDays},
 			{label: "备注", def: user.Remark},
 		}, func(values []string) error {
-			user.QuotaBytes = parseGB(values[0])
-			user.ExpiresAt = parseDays(values[1])
+			quota, err := kernel.ParseQuotaGB(values[0])
+			if err != nil {
+				return err
+			}
+			user.QuotaBytes = quota
+			if values[1] != originalDays {
+				expires, err := kernel.ParseExpiryDays(values[1])
+				if err != nil {
+					return err
+				}
+				user.ExpiresAt = expires
+			}
 			user.Remark = strings.TrimSpace(values[2])
 			return m.store.SaveUser(user)
 		})
@@ -445,10 +579,18 @@ func (m *Model) submitNodeForm(values []string) error {
 }
 
 func (m *Model) submitUserForm(values []string) error {
+	quota, err := kernel.ParseQuotaGB(values[1])
+	if err != nil {
+		return err
+	}
+	expires, err := kernel.ParseExpiryDays(values[2])
+	if err != nil {
+		return err
+	}
 	user := store.User{
 		Name:       strings.TrimSpace(values[0]),
-		QuotaBytes: parseGB(values[1]),
-		ExpiresAt:  parseDays(values[2]),
+		QuotaBytes: quota,
+		ExpiresAt:  expires,
 		Enabled:    true,
 	}
 	if user.Name == "" {
@@ -508,12 +650,13 @@ func (m *Model) handleFormKey(key string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "backspace":
 		if len(f.values[f.cursor]) > 0 {
-			f.values[f.cursor] = f.values[f.cursor][:len(f.values[f.cursor])-1]
+			_, size := utf8.DecodeLastRuneInString(f.values[f.cursor])
+			f.values[f.cursor] = f.values[f.cursor][:len(f.values[f.cursor])-size]
 		}
 		return m, nil
 	}
 	// 可打印字符直接进当前字段
-	if len(key) == 1 && key[0] >= 32 && key[0] < 127 {
+	if key == " " {
 		f.values[f.cursor] += key
 	}
 	return m, nil
@@ -568,9 +711,18 @@ func (m *Model) viewHeader() string {
 			tabs[i] = styleTabOff.Render(label)
 		}
 	}
-	state := kernel.ServiceState(m.paths.Service)
+	state := "未读取"
+	if len(m.states) > 0 {
+		active := 0
+		for _, s := range m.states {
+			if s.State == "active" && s.Err == nil {
+				active++
+			}
+		}
+		state = fmt.Sprintf("%d/%d 在线", active, len(m.states))
+	}
 	stateText := styleOK.Render(state)
-	if state != "active" {
+	if m.snapErr != nil {
 		stateText = styleErr.Render(state)
 	}
 	return styleTitle.Render("sbx-panel") + styleDim.Render("  内核 ") + stateText +
@@ -592,7 +744,7 @@ func (m *Model) viewHelp() string {
 	if m.mode == modeForm {
 		return styleHelp.Render("  Tab/↑↓ 切换字段 · Enter 保存 · Esc 取消 · 直接打字输入")
 	}
-	return styleHelp.Render("  1-5/Tab 切换页 · ↑↓ 选择 · a 新增 · e 编辑 · d 删除 · 空格 启停 · r 下发全部 · c 采集 · s 改用户 · u 刷新状态 · q 退出")
+	return styleHelp.Render("  1-5/Tab 切页 · ↑↓ 选择 · a 新增 · e 编辑 · d 删除 · 空格 启停 · r 下发 · c 采集 · s 热同步 · x 执行配额(可能重启) · u 刷新 · q 退出")
 }
 
 func (m *Model) viewOverview() string {
@@ -626,16 +778,16 @@ func (m *Model) viewOverview() string {
 	row("配置", m.paths.Config)
 
 	// 可观测性：数据来自 clash_api，按 u 刷新
-	switch {
-	case m.snapErr != nil:
+	if m.snapErr != nil {
 		row("内核状态", styleErr.Render("读取失败: "+m.snapErr.Error()))
-	case m.snapshot.Version != "":
+	}
+	if m.snapshot.Version != "" {
 		row("内核版本", m.snapshot.Version)
 		row("活动连接", fmt.Sprintf("%d", m.snapshot.ActiveConnections))
 		row("进程流量", fmt.Sprintf("↑ %s   ↓ %s",
 			kernel.HumanBytes(m.snapshot.UploadTotal), kernel.HumanBytes(m.snapshot.DownloadTotal)))
 		row("内存占用", kernel.HumanBytes(m.snapshot.Memory))
-	default:
+	} else if m.snapErr == nil {
 		row("内核状态", styleDim.Render("未读取（按 u 刷新）"))
 	}
 	if len(m.snapshot.TopHosts) > 0 {
@@ -649,9 +801,9 @@ func (m *Model) viewOverview() string {
 	b.WriteString("\n")
 	// 注意：\n 必须放在 Render 外面。lipgloss 会把多行字符串的每一行
 	// 补齐到最宽行的宽度，把换行符塞进去会让后续内容被空格推开。
-	b.WriteString(styleDim.Render("  提示：配额与到期是在「下发」时生效的——sing-box 没有热重载，"))
+	b.WriteString(styleDim.Render("  提示：c 只采集；x 采集后执行配额，配置变化时重启对应机器并断开旧会话。"))
 	b.WriteString("\n")
-	b.WriteString(styleDim.Render("        停用/超额的用户会在下一次 r 之后从配置里消失。"))
+	b.WriteString(styleDim.Render("        自动轮询：sbx-panel enforce --watch；s 热同步仅影响 Nowhere 新连接。"))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -665,13 +817,12 @@ func (m *Model) viewNodes() string {
 		"TAG", "协议", "端口", "TLS", "用户", "状态")))
 	b.WriteString("\n")
 	for i, node := range m.nodes {
-		users, _ := m.store.UsersForNode(node.Tag)
 		state := styleOK.Render("启用")
 		if !node.Enabled {
 			state = styleDim.Render("停用")
 		}
 		line := fmt.Sprintf("  %-18s %-13s %-7d %-9s %-7d ",
-			truncate(node.Tag, 18), node.Proto, node.Port, node.TLSMode, len(users))
+			truncate(node.Tag, 18), node.Proto, node.Port, node.TLSMode, m.nodeUsers[node.Tag])
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸") + styleSelected.Render(line[1:]) + state + "\n")
 		} else {
@@ -696,7 +847,6 @@ func (m *Model) viewUsers() string {
 		if user.QuotaBytes > 0 {
 			quota = kernel.HumanBytes(user.QuotaBytes)
 		}
-		nodes, _ := m.store.NodesForUser(user.Name)
 
 		state := string(kernel.EvaluateUser(user, used, time.Now()))
 		stateStyle := styleOK
@@ -711,7 +861,7 @@ func (m *Model) viewUsers() string {
 
 		line := fmt.Sprintf("  %-16s %-11s %-11s %-12s %-6d ",
 			truncate(user.Name, 16), kernel.HumanBytes(used), quota,
-			expiryText(user.ExpiresAt), len(nodes))
+			expiryText(user.ExpiresAt), m.userNodes[user.Name])
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸") + styleSelected.Render(line[1:]) + stateStyle.Render(state) + "\n")
 		} else {
@@ -763,9 +913,12 @@ func (m *Model) viewMachines() string {
 				nodeCount++
 			}
 		}
-		state, stateStyle := "在线", styleOK
-		if !kernel.Reachable(machine) {
-			state, stateStyle = "不可达", styleErr
+		state, stateStyle := "未读取", styleDim
+		if status, ok := m.states[machine.Name]; ok {
+			state, stateStyle = status.State+" "+status.Version, styleOK
+			if status.Err != nil {
+				state, stateStyle = "读取失败", styleErr
+			}
 		}
 		line := fmt.Sprintf("  %-12s %-22s %-6s %-24s %-6d ",
 			truncate(machine.Name, 12), truncate(host, 22), sshPort,
@@ -875,22 +1028,4 @@ func daysText(ts int64) string {
 		return "0"
 	}
 	return strconv.Itoa(days)
-}
-
-// parseGB 把 "100" / "100.5" 解析成字节；空或非法返回 0。
-func parseGB(text string) int64 {
-	value, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
-	if err != nil || value <= 0 {
-		return 0
-	}
-	return int64(value * float64(int64(1)<<30))
-}
-
-// parseDays 把天数解析成到期时间戳；0 或非法表示永久。
-func parseDays(text string) int64 {
-	days, err := strconv.Atoi(strings.TrimSpace(text))
-	if err != nil || days <= 0 {
-		return 0
-	}
-	return time.Now().AddDate(0, 0, days).Unix()
 }

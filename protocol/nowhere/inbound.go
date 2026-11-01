@@ -3,6 +3,7 @@ package nowhere
 import (
 	"context"
 	"crypto/tls"
+	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
@@ -17,8 +18,8 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	N "github.com/sagernet/sing/common/network"
 
-	nowherewire "github.com/ohmycggk/nowhere-go/wire"
 	"github.com/ohmycggk/nowhere-go/portal"
+	nowherewire "github.com/ohmycggk/nowhere-go/wire"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -50,6 +51,9 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 
 	// Nowhere 建立在 TLS 之上，没有 TLS 就没有 Portal。
+	if options.Egress {
+		return nil, E.New("nowhere: egress requires QUIC, which this inbound does not support")
+	}
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, E.New("nowhere: TLS is required")
 	}
@@ -62,6 +66,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	// 凭据在构造期就校验掉，配错了不该等到 Start。
 	if _, _, err = resolveCredentials(options); err != nil {
 		return nil, err
+	}
+	if options.ControlAddr != "" && options.ControlAddr != "off" {
+		if !isLoopback(options.ControlAddr) {
+			return nil, E.New("nowhere: control_addr must be loopback")
+		}
+		if strings.TrimSpace(options.ControlSecret) == "" {
+			return nil, E.New("nowhere: control_secret is required when control_addr is enabled")
+		}
 	}
 	inb.options = options
 
@@ -79,6 +91,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
+	h.ctx = scope.Context()
 	if err := h.tlsConfig.Start(); err != nil {
 		return err
 	}
@@ -101,7 +114,7 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		Users:        portalUsers,
 		Morph:        morph,
 		TLS:          stdTLS,
-		Upstream:     &upstream{router: h.router, logger: h.logger},
+		Upstream:     &upstream{router: h.router, ctx: h.ctx, tag: h.Tag()},
 		Egress:       h.options.Egress,
 		UploadMbps:   h.options.UploadMbps,
 		DownloadMbps: h.options.DownloadMbps,
@@ -116,10 +129,11 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if controlAddr == "" {
 		controlAddr = "127.0.0.1:10087"
 	}
-	if controlAddr != "off" {
+	if controlAddr != "off" && h.options.ControlSecret != "" {
 		if err = h.registerControl(controlAddr); err != nil {
 			return err
 		}
+		scope.Add(h.unregisterControl)
 	}
 
 	// 这里**不能**用 listener.Start()：它会连自己的 accept 循环一起启动
@@ -209,16 +223,24 @@ func resolveCredentials(options option.NowhereInboundOptions) ([]portal.User, st
 	}
 	if len(options.Users) > 0 {
 		users := make([]portal.User, 0, len(options.Users))
+		names, keys := map[string]bool{}, map[string]bool{}
 		for i, u := range options.Users {
-			if u.SharedKey == "" {
-				return nil, "", E.New("nowhere: users[", i, "] (", u.Name, ") is missing shared_key")
+			if err := nowherewire.ValidateServiceKey(u.SharedKey); err != nil {
+				return nil, "", E.Cause(err, "nowhere: users[", i, "]")
 			}
+			if strings.TrimSpace(u.Name) != u.Name || u.Name == "" || names[u.Name] || keys[u.SharedKey] {
+				return nil, "", E.New("nowhere: users require unique nonempty names and keys")
+			}
+			names[u.Name], keys[u.SharedKey] = true, true
 			users = append(users, portal.User{Name: u.Name, SharedKey: u.SharedKey})
 		}
 		return users, "", nil
 	}
 	if options.SharedKey == "" {
 		return nil, "", E.New("nowhere: shared_key or users is required")
+	}
+	if err := nowherewire.ValidateServiceKey(options.SharedKey); err != nil {
+		return nil, "", err
 	}
 	return nil, options.SharedKey, nil
 }

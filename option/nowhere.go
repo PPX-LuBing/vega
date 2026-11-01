@@ -17,7 +17,7 @@ type NowhereInboundOptions struct {
 	ListenOptions
 	InboundTLSOptionsContainer
 
-	// SharedKey 单密钥模式的共享密钥（base64）。
+	// SharedKey is exactly 32 lowercase hexadecimal characters.
 	SharedKey string `json:"shared_key,omitempty"`
 
 	// Users 多用户模式。与 SharedKey 互斥。
@@ -35,14 +35,15 @@ type NowhereInboundOptions struct {
 	Egress bool `json:"egress,omitempty"`
 
 	// ControlAddr 是运行期改用户的控制端点，只允许绑回环。
-	// 默认 127.0.0.1:10087；设为 "off" 可关闭。
-	ControlAddr string `json:"control_addr,omitempty"`
+	// Disabled unless ControlSecret is set; "off" explicitly disables it.
+	ControlAddr   string `json:"control_addr,omitempty"`
+	ControlSecret string `json:"control_secret,omitempty"`
 }
 
 // NowhereUser 是一个 Nowhere 用户。
 type NowhereUser struct {
 	Name string `json:"name,omitempty"`
-	// SharedKey 该用户的共享密钥（base64）。留空表示由面板生成。
+	// SharedKey is exactly 32 lowercase hexadecimal characters.
 	SharedKey string `json:"shared_key,omitempty"`
 }
 

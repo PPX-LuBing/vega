@@ -1,9 +1,10 @@
 package nowhere
 
 import (
-	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -12,102 +13,110 @@ import (
 	"time"
 
 	"github.com/ohmycggk/nowhere-go/portal"
+	"github.com/ohmycggk/nowhere-go/wire"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/service"
 )
-
-// 控制端点：让面板在**不重启内核**的前提下增删用户。
-//
-// sing-box 原生没有这个能力——改用户只能改配置再重启，所有人断线一次。
-// Nowhere 的认证是「逐个试解密钥」，本来就不需要重启：换一份名单，
-// 新连接按新名单认证，老连接按原样跑完。
-//
-// 为什么是进程级而不是每个入站一个：一台机器上通常有多个 nowhere 入站
-// （不同端口/不同证书），如果各自绑一个端口，第二个就会 bind 失败。
-// 所以由第一个启动的入站负责监听，其余注册进来，请求里用 inbound 字段定向。
-//
-// 安全边界：只监听本机回环。和内核自己的 clash_api / v2ray_api 一个级别
-// （它们同样没有鉴权），能连上回环的人本来就能读配置文件。
 
 var (
 	controlMu       sync.Mutex
-	controlInbounds = map[string]*Inbound{} // tag -> 入站
+	controlInbounds = map[string]*Inbound{}
 	controlServer   *http.Server
 	controlListen   string
+	controlSecret   string
 )
 
-// controlUser 是控制端点接收的用户条目。
 type controlUser struct {
 	Name      string `json:"name"`
 	SharedKey string `json:"shared_key"`
 }
 
 type controlRequest struct {
-	// Inbound 指定只改哪个入站；留空表示改全部已注册的 nowhere 入站。
-	Inbound string        `json:"inbound,omitempty"`
-	Users   []controlUser `json:"users"`
+	Inbound string         `json:"inbound,omitempty"`
+	Users   *[]controlUser `json:"users"`
 }
 
 type controlResponse struct {
 	OK      bool     `json:"ok"`
 	Updated []string `json:"updated,omitempty"`
-	Users   int      `json:"users,omitempty"`
+	Users   int      `json:"users"`
 	Error   string   `json:"error,omitempty"`
 }
 
-// registerControl 把本入站登记进共享控制端点，必要时负责监听。
 func (h *Inbound) registerControl(addr string) error {
-	if strings.TrimSpace(addr) == "" || addr == "off" {
+	if addr == "off" {
 		return nil
 	}
-	if !isLoopback(addr) {
-		return fmt.Errorf("nowhere: control_addr 必须绑回环（收到 %q）", addr)
+	secret := h.options.ControlSecret
+	if !isLoopback(addr) || strings.TrimSpace(secret) == "" {
+		return fmt.Errorf("nowhere: control endpoint requires a loopback address and control_secret")
 	}
-
+	// Resolve localhost ourselves rather than trusting hostname resolution.
+	if host, port, _ := net.SplitHostPort(addr); host == "localhost" {
+		addr = net.JoinHostPort("127.0.0.1", port)
+	}
 	controlMu.Lock()
 	defer controlMu.Unlock()
-
-	controlInbounds[h.Tag()] = h
+	if _, exists := controlInbounds[h.Tag()]; exists {
+		return fmt.Errorf("nowhere: duplicate control inbound %q", h.Tag())
+	}
 	if controlServer != nil {
-		// 已经有端点在跑：确认地址一致就够了（不一致说明配置自相矛盾）
-		if controlListen != addr {
-			return fmt.Errorf("nowhere: 控制端点已监听 %s，入站 %s 却要求 %s（同一进程内必须一致）",
-				controlListen, h.Tag(), addr)
+		if controlListen != addr || controlSecret != secret {
+			return fmt.Errorf("nowhere: control address and secret must match across inbounds")
 		}
-		h.logger.Info("nowhere: 入站 ", h.Tag(), " 已登记到控制端点 ", addr)
+		controlInbounds[h.Tag()] = h
 		return nil
 	}
-
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("nowhere: listen control endpoint: %w", err)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/users", handleControlUsers)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeControl(w, http.StatusOK, controlResponse{OK: true, Updated: controlTags()})
 	})
-
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		delete(controlInbounds, h.Tag())
-		return fmt.Errorf("nowhere: 控制端点监听失败: %w", err)
+	server := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+secret)) != 1 {
+				writeControl(w, http.StatusUnauthorized, controlResponse{Error: "unauthorized"})
+				return
+			}
+			mux.ServeHTTP(w, r)
+		}),
 	}
-	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	controlServer = server
-	controlListen = addr
-
+	controlServer, controlListen, controlSecret = server, addr, secret
+	controlInbounds[h.Tag()] = h
 	go func() { _ = server.Serve(listener) }()
-	go func() {
-		<-h.ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		controlMu.Lock()
-		controlServer = nil
-		controlListen = ""
-		controlMu.Unlock()
-		_ = server.Shutdown(shutdownCtx)
-	}()
-
-	h.logger.Info("nowhere: 控制端点在 ", addr, "（POST /users 可不重启改用户）")
 	return nil
 }
 
+func (h *Inbound) unregisterControl() error {
+	controlMu.Lock()
+	defer controlMu.Unlock()
+	if controlInbounds[h.Tag()] != h {
+		return nil
+	}
+	delete(controlInbounds, h.Tag())
+	if len(controlInbounds) != 0 || controlServer == nil {
+		return nil
+	}
+	err := controlServer.Close()
+	controlServer, controlListen, controlSecret = nil, "", ""
+	return err
+}
+
 func controlTags() []string {
+	controlMu.Lock()
+	defer controlMu.Unlock()
+	return controlTagsLocked()
+}
+
+func controlTagsLocked() []string {
 	out := make([]string, 0, len(controlInbounds))
 	for tag := range controlInbounds {
 		out = append(out, tag)
@@ -118,30 +127,32 @@ func controlTags() []string {
 
 func handleControlUsers(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		writeControl(w, http.StatusMethodNotAllowed, controlResponse{Error: "只接受 POST"})
+		writeControl(w, http.StatusMethodNotAllowed, controlResponse{Error: "POST or PUT required"})
 		return
 	}
 	var request controlRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil {
-		writeControl(w, http.StatusBadRequest, controlResponse{Error: "请求体不是合法 JSON: " + err.Error()})
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeControl(w, http.StatusBadRequest, controlResponse{Error: "invalid JSON: " + err.Error()})
 		return
 	}
-
-	users, err := parseControlUsers(request.Users)
+	if err := decoder.Decode(new(any)); err != io.EOF || request.Users == nil {
+		writeControl(w, http.StatusBadRequest, controlResponse{Error: "users must be an explicit array; only one JSON object is allowed"})
+		return
+	}
+	users, err := parseControlUsers(*request.Users)
 	if err != nil {
 		writeControl(w, http.StatusBadRequest, controlResponse{Error: err.Error()})
 		return
 	}
-
 	controlMu.Lock()
+	defer controlMu.Unlock()
 	targets := make([]*Inbound, 0, len(controlInbounds))
 	if request.Inbound != "" {
 		target, ok := controlInbounds[request.Inbound]
 		if !ok {
-			controlMu.Unlock()
-			writeControl(w, http.StatusNotFound, controlResponse{
-				Error: fmt.Sprintf("没有这个 nowhere 入站: %s（现有：%s）",
-					request.Inbound, strings.Join(controlTags(), ", "))})
+			writeControl(w, http.StatusNotFound, controlResponse{Error: "unknown inbound: " + request.Inbound})
 			return
 		}
 		targets = append(targets, target)
@@ -150,41 +161,50 @@ func handleControlUsers(w http.ResponseWriter, r *http.Request) {
 			targets = append(targets, target)
 		}
 	}
-	controlMu.Unlock()
-
 	if len(targets) == 0 {
-		writeControl(w, http.StatusServiceUnavailable, controlResponse{Error: "没有已注册的 nowhere 入站"})
+		writeControl(w, http.StatusServiceUnavailable, controlResponse{Error: "no registered nowhere inbounds"})
 		return
 	}
-
-	// 逐个改：任一失败就如实汇报，不假装全部成功
-	updated := make([]string, 0, len(targets))
+	// Validate every target before changing any of them.
 	for _, target := range targets {
-		if err = target.server.UpdateUsers(users); err != nil {
-			writeControl(w, http.StatusBadRequest, controlResponse{
-				Error: fmt.Sprintf("入站 %s 更新失败: %v", target.Tag(), err), Updated: updated})
+		if len(target.options.Users) == 0 {
+			writeControl(w, http.StatusBadRequest, controlResponse{Error: "user updates require multi-user mode"})
 			return
 		}
-		target.logger.Info("nowhere: 用户名单已更新为 ", len(users), " 人（未重启）")
+	}
+	updated := make([]string, 0, len(targets))
+	for _, target := range targets {
+		if api := service.FromContext[adapter.V2RayServer](target.ctx); api != nil {
+			if stats, ok := api.StatsService().(interface{ RegisterUsers([]string) }); ok {
+				names := make([]string, 0, len(users))
+				for _, user := range users {
+					names = append(names, user.Name)
+				}
+				stats.RegisterUsers(names)
+			}
+		}
+		if err = target.server.UpdateUsers(users); err != nil {
+			writeControl(w, http.StatusBadRequest, controlResponse{Error: err.Error(), Updated: updated})
+			return
+		}
 		updated = append(updated, target.Tag())
 	}
 	sort.Strings(updated)
 	writeControl(w, http.StatusOK, controlResponse{OK: true, Updated: updated, Users: len(users)})
 }
 
-// parseControlUsers 校验并归一化请求里的用户列表。
 func parseControlUsers(items []controlUser) ([]portal.User, error) {
 	users := make([]portal.User, 0, len(items))
-	seen := map[string]bool{}
-	for i, item := range items {
+	names, keys := map[string]bool{}, map[string]bool{}
+	for _, item := range items {
 		name := strings.TrimSpace(item.Name)
-		if name == "" {
-			return nil, fmt.Errorf("第 %d 个用户没有名字", i)
+		if name == "" || names[name] || keys[item.SharedKey] {
+			return nil, fmt.Errorf("users require unique nonempty names and keys")
 		}
-		if seen[name] {
-			return nil, fmt.Errorf("用户名重复: %s", name)
+		if err := wire.ValidateServiceKey(item.SharedKey); err != nil {
+			return nil, err
 		}
-		seen[name] = true
+		names[name], keys[item.SharedKey] = true, true
 		users = append(users, portal.User{Name: name, SharedKey: item.SharedKey})
 	}
 	return users, nil
@@ -196,15 +216,14 @@ func writeControl(w http.ResponseWriter, status int, payload controlResponse) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// isLoopback 判断监听地址是否只绑回环。
 func isLoopback(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
 	}
-	switch host {
-	case "127.0.0.1", "::1", "localhost":
+	if host == "localhost" {
 		return true
 	}
-	return false
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

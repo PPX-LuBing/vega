@@ -16,6 +16,9 @@ import (
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 func init() {
@@ -62,6 +65,8 @@ func NewStatsService(options option.V2RayStatsServiceOptions) *StatsService {
 }
 
 func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
+	s.access.Lock()
+	defer s.access.Unlock()
 	inbound := metadata.Inbound
 	user := metadata.User
 	outbound := matchOutbound.Tag()
@@ -73,7 +78,6 @@ func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, meta
 	if !countInbound && !countOutbound && !countUser {
 		return conn
 	}
-	s.access.Lock()
 	if countInbound {
 		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
@@ -86,11 +90,12 @@ func (s *StatsService) RoutedConnection(ctx context.Context, conn net.Conn, meta
 		readCounter = append(readCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
 	}
-	s.access.Unlock()
 	return bufio.NewInt64CounterConn(conn, readCounter, writeCounter)
 }
 
 func (s *StatsService) RoutedPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
+	s.access.Lock()
+	defer s.access.Unlock()
 	inbound := metadata.Inbound
 	user := metadata.User
 	outbound := matchOutbound.Tag()
@@ -102,7 +107,6 @@ func (s *StatsService) RoutedPacketConnection(ctx context.Context, conn N.Packet
 	if !countInbound && !countOutbound && !countUser {
 		return conn
 	}
-	s.access.Lock()
 	if countInbound {
 		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
@@ -115,11 +119,12 @@ func (s *StatsService) RoutedPacketConnection(ctx context.Context, conn N.Packet
 		readCounter = append(readCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
 	}
-	s.access.Unlock()
 	return bufio.NewInt64CounterPacketConn(conn, readCounter, nil, writeCounter, nil)
 }
 
 func (s *StatsService) RoutedFlow(ctx context.Context, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) tun.FlowTracker {
+	s.access.Lock()
+	defer s.access.Unlock()
 	inbound := metadata.Inbound
 	user := metadata.User
 	outbound := matchOutbound.Tag()
@@ -131,7 +136,6 @@ func (s *StatsService) RoutedFlow(ctx context.Context, metadata adapter.InboundC
 	if !countInbound && !countOutbound && !countUser {
 		return nil
 	}
-	s.access.Lock()
 	if countInbound {
 		uplinkCounter = append(uplinkCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
 		downlinkCounter = append(downlinkCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
@@ -144,8 +148,21 @@ func (s *StatsService) RoutedFlow(ctx context.Context, metadata adapter.InboundC
 		uplinkCounter = append(uplinkCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
 		downlinkCounter = append(downlinkCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
 	}
-	s.access.Unlock()
 	return &statsFlowTracker{uplinkCounter: uplinkCounter, downlinkCounter: downlinkCounter}
+}
+
+// RegisterUsers enables accounting for users added without restarting inbounds.
+func (s *StatsService) RegisterUsers(names []string) {
+	if s == nil {
+		return
+	}
+	s.access.Lock()
+	defer s.access.Unlock()
+	for _, name := range names {
+		if name != "" {
+			s.users[name] = true
+		}
+	}
 }
 
 var _ tun.FlowTracker = (*statsFlowTracker)(nil)
@@ -193,6 +210,7 @@ func (s *StatsService) GetStats(ctx context.Context, request *GetStatsRequest) (
 }
 
 func (s *StatsService) QueryStats(ctx context.Context, request *QueryStatsRequest) (*QueryStatsResponse, error) {
+	_ = grpc.SetHeader(ctx, metadata.Pairs("vega-stats-instance", s.createdAt.UTC().Format(time.RFC3339Nano)))
 	var response QueryStatsResponse
 	s.access.Lock()
 	defer s.access.Unlock()

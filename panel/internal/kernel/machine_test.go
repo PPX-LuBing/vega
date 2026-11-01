@@ -2,13 +2,202 @@ package kernel
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
+
+func fakeCommand(t *testing.T, name, body string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return path
+}
+
+func TestPushValidationAndRestartFailurePreserveConfig(t *testing.T) {
+	for _, checkFails := range []bool{true, false} {
+		t.Run(fmt.Sprint(checkFails), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			if err := os.WriteFile(path, []byte("known-good"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			body := "exit 0"
+			if checkFails {
+				body = "exit 1"
+			}
+			kernel := fakeCommand(t, "kernel", body)
+			log := filepath.Join(dir, "restart.log")
+			t.Setenv("RESTART_LOG", log)
+			fakeCommand(t, "systemctl", `echo restart >> "$RESTART_LOG"; exit 1`)
+			result := PushToMachine(context.Background(), store.Machine{Name: store.LocalMachine, KernelPath: kernel, ConfigPath: path, Service: "test"}, map[string]any{"inbounds": []any{}})
+			if result.Err == nil {
+				t.Fatal("failure hidden")
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || string(got) != "known-good" {
+				t.Fatalf("old config lost: %q %v", got, err)
+			}
+			_, err = os.Stat(log)
+			if checkFails && !os.IsNotExist(err) {
+				t.Fatal("restarted before validation")
+			}
+		})
+	}
+}
+
+func TestRemotePushValidatesAndRollsBack(t *testing.T) {
+	for _, mode := range []string{"check-fails", "restart-fails", "success"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			if err := os.WriteFile(path, []byte("known-good"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			check := "exit 0"
+			if mode == "check-fails" {
+				check = "exit 1"
+			}
+			kernel := fakeCommand(t, "kernel", check)
+			log := filepath.Join(dir, "restart.log")
+			t.Setenv("RESTART_LOG", log)
+			t.Setenv("RESTART_MODE", mode)
+			fakeCommand(t, "systemctl", `
+echo restart >> "$RESTART_LOG"
+if [ "$RESTART_MODE" = restart-fails ] && [ "$(wc -l < "$RESTART_LOG" | tr -d ' ')" = 1 ]; then exit 1; fi`)
+			fakeCommand(t, "scp", `
+previous=; last=
+for arg; do previous=$last; last=$arg; done
+cp "$previous" "${last#*:}"`)
+			fakeCommand(t, "ssh", `for arg; do script=$arg; done; exec sh -c "$script"`)
+			if runtime.GOOS != "linux" {
+				fakeCommand(t, "flock", "exit 0") // Linux CI exercises the real remote lock.
+			}
+			result := PushToMachine(context.Background(), store.Machine{Name: "remote", Host: "example.invalid", SSHUser: "root", KernelPath: kernel, ConfigPath: path, Service: "test"}, map[string]any{"inbounds": []any{}})
+			if (result.Err == nil) != (mode == "success") {
+				t.Fatalf("unexpected push result: %v", result.Err)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || (string(got) == "known-good") != (mode != "success") {
+				t.Fatalf("unexpected installed config %q: %v", got, err)
+			}
+			if info, err := os.Stat(path + ".lock"); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("expected persistent flock inode: %v", err)
+			}
+			if mode == "check-fails" {
+				if _, err = os.Stat(log); !os.IsNotExist(err) {
+					t.Fatal("remote restarted before validation")
+				}
+			}
+			if mode == "restart-fails" {
+				body, err := os.ReadFile(log)
+				if err != nil || strings.Count(string(body), "restart") != 2 {
+					t.Fatalf("restored service not restarted: %s %v", body, err)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyAllKeepsImplicitLocalWithRemoteMachines(t *testing.T) {
+	st := testStore(t)
+	if err := st.SaveMachine(store.Machine{Name: "remote", Host: "example.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveNode(store.Node{Tag: "local-node", Proto: store.ProtoAnyTLS, Port: 8443, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveUser(store.User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Grant("local-node", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths()
+	paths.Bin = fakeCommand(t, "kernel", "exit 0")
+	paths.Config = filepath.Join(t.TempDir(), "config.json")
+	fakeCommand(t, "systemctl", "exit 0")
+	fakeCommand(t, "scp", "exit 1")
+	results := ApplyAll(context.Background(), st, paths)
+	if len(results) != 2 || results[0].Machine != store.LocalMachine || results[0].Err != nil || results[0].Nodes != 1 {
+		t.Fatalf("implicit local omitted: %+v", results)
+	}
+}
+
+func TestNowhereControlSettingsInConfig(t *testing.T) {
+	st := testStore(t)
+	if err := st.SaveNode(store.Node{Tag: "nw", Proto: store.ProtoNowhere, Port: 8443, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveUser(store.User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Grant("nw", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	paths := testPaths()
+	paths.ControlAddr = "127.0.0.1:23456"
+	cfg, err := BuildConfig(st, paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := cfg["inbounds"].([]any)[0].(map[string]any)
+	secret, err := st.ControlSecret()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node["control_addr"] != paths.ControlAddr || node["control_secret"] != secret {
+		t.Fatal("control settings missing")
+	}
+	rules := cfg["route"].(map[string]any)["rules"].([]any)
+	if rules[0].(map[string]any)["action"] != "resolve" || rules[1].(map[string]any)["action"] != "reject" {
+		t.Fatal("management policy must resolve domains before rejecting loopback targets")
+	}
+}
+
+func TestSyncRemoteDoesNotUseLocalEndpoint(t *testing.T) {
+	st := testStore(t)
+	if err := st.SaveMachine(store.Machine{Name: "remote", Host: "example.invalid"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveNode(store.Node{Tag: "remote-node", Machine: "remote", Proto: store.ProtoNowhere, Port: 8443, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveUser(store.User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Grant("remote-node", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	fakeCommand(t, "ssh", `cat > "$SYNC_STDIN"; printf '{"ok":true,"users":1}'`)
+	path := filepath.Join(t.TempDir(), "stdin")
+	t.Setenv("SYNC_STDIN", path)
+	results := SyncNowhereNodes(st, Paths{ControlAddr: "127.0.0.1:1"})
+	if len(results) != 1 || results[0].Err != nil || results[0].Users != 1 {
+		t.Fatalf("%+v", results)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, _ := st.ControlSecret()
+	if !strings.Contains(string(body), secret) || !strings.Contains(string(body), "remote-node") {
+		t.Fatal("missing remote payload")
+	}
+}
 
 // 多机编排的核心不变量：每台机器的配置里只能有它自己的节点。
 // 搞错了就是「香港的配置里出现了台湾的入站」这种事故。
@@ -88,11 +277,11 @@ func TestEmptyMachineCountsAsLocal(t *testing.T) {
 // 远端命令里的路径必须被安全引用：路径里有空格或引号时不能被 shell 拆开。
 func TestShellQuote(t *testing.T) {
 	cases := map[string]string{
-		"/usr/local/bin/sbx":       "'/usr/local/bin/sbx'",
-		"/opt/my dir/sbx":          "'/opt/my dir/sbx'",
-		"/opt/it's/sbx":            `'/opt/it'\''s/sbx'`,
-		"; rm -rf /":               "'; rm -rf /'",
-		"$(whoami)":                "'$(whoami)'",
+		"/usr/local/bin/sbx": "'/usr/local/bin/sbx'",
+		"/opt/my dir/sbx":    "'/opt/my dir/sbx'",
+		"/opt/it's/sbx":      `'/opt/it'\''s/sbx'`,
+		"; rm -rf /":         "'; rm -rf /'",
+		"$(whoami)":          "'$(whoami)'",
 	}
 	for input, want := range cases {
 		if got := shellQuote(input); got != want {
@@ -174,16 +363,15 @@ func TestPushToMachineLocalWritesConfig(t *testing.T) {
 		Service: "sbx-panel-nonexistent-service-for-test",
 	}
 	result := PushToMachine(context.Background(), machine, config)
-	// 配置一定写下去了
-	if _, err := os.ReadFile(dir + "/config.json"); err != nil {
-		t.Fatalf("配置没有写盘: %v", err)
+	// Failed validation must not install a config or restart the service.
+	if _, err := os.ReadFile(dir + "/config.json"); !os.IsNotExist(err) {
+		t.Fatalf("invalid config was installed: %v", err)
 	}
 	// 重启不存在的服务必须报错（不能假装成功）
 	if result.Err == nil {
 		t.Fatal("重启不存在的服务应当报错")
 	}
-	if !strings.Contains(result.Err.Error(), "systemctl") &&
-		!strings.Contains(result.Err.Error(), "重启") {
+	if !strings.Contains(result.Err.Error(), "校验") {
 		t.Fatalf("错误信息不够明确: %v", result.Err)
 	}
 	if result.Nodes != 1 {

@@ -1,12 +1,23 @@
 package nowhere
 
 import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/ohmycggk/nowhere-go/portal"
+	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 )
 
-// 控制端点必须拒绝绑非回环地址——它没有任何鉴权，暴露到公网等于把用户名单
-// 交给任何人改。
+// 控制端点即使有令牌也只能绑定回环，避免暴露管理面。
 func TestIsLoopback(t *testing.T) {
 	for _, addr := range []string{"127.0.0.1:10087", "[::1]:10087", "localhost:10087"} {
 		if !isLoopback(addr) {
@@ -17,6 +28,93 @@ func TestIsLoopback(t *testing.T) {
 		if isLoopback(addr) {
 			t.Errorf("%s 不该被判定为回环", addr)
 		}
+	}
+}
+
+func TestControlAuthenticationValidationAndCleanup(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	newInbound := func(tag string) *Inbound {
+		server, err := portal.New(portal.Config{Users: []portal.User{{Name: "alice", SharedKey: testKeyAlice}}, TLS: &tls.Config{}, Upstream: portal.Direct{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Inbound{Adapter: inbound.NewAdapter("nowhere", tag), ctx: context.Background(), logger: log.NewNOPFactory().NewLogger("test"), server: server,
+			options: option.NowhereInboundOptions{Users: []option.NowhereUser{{Name: "alice", SharedKey: testKeyAlice}}, ControlAddr: addr, ControlSecret: "test-secret"}}
+	}
+	first := newInbound("first")
+	if err = first.registerControl(addr); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.unregisterControl() })
+	request := func(body, auth string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/users", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+	valid := fmt.Sprintf(`{"inbound":"first","users":[{"name":"alice","shared_key":"%s"}]}`, testKeyAlice)
+	for _, auth := range []string{"", "Bearer wrong"} {
+		if got := request(valid, auth); got != http.StatusUnauthorized {
+			t.Fatalf("unauthorized request: %d", got)
+		}
+	}
+	for _, body := range []string{`{}`, `{"users":null}`, `{"users":[],"unknown":true}`, `{"users":[]} {}`, `{"users":[{"name":"alice","shared_key":"bad"}]}`} {
+		if got := request(body, "Bearer test-secret"); got != http.StatusBadRequest {
+			t.Fatalf("body %s: %d", body, got)
+		}
+	}
+	if got := request(valid, "Bearer test-secret"); got != http.StatusOK {
+		t.Fatal(got)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = controlTags()
+		}
+	}()
+	for i := 0; i < 30; i++ {
+		h := newInbound(fmt.Sprint("n", i))
+		if err = h.registerControl(addr); err != nil {
+			t.Fatal(err)
+		}
+		if err = h.unregisterControl(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wg.Wait()
+	if err = first.unregisterControl(); err != nil {
+		t.Fatal(err)
+	}
+	if len(controlTags()) != 0 {
+		t.Fatal("stale inbounds")
+	}
+	if err = first.registerControl(addr); err != nil {
+		t.Fatalf("endpoint not released: %v", err)
+	}
+}
+
+func TestMissingUsersDoesNotClearRegistry(t *testing.T) {
+	w := httptest.NewRecorder()
+	handleControlUsers(w, httptest.NewRequest(http.MethodPost, "/users", strings.NewReader(`{}`)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatal(w.Code)
 	}
 }
 

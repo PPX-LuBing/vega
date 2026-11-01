@@ -15,15 +15,20 @@
 git fetch upstream --tags
 git rebase <新版本 tag>
 
-# 解冲突：只有这几个文件会冲突，都是加行
+# 解冲突：重点检查这些接入点，不保证冲突只发生在这里
 #   constant/proxy.go     TypeNowhere 常量
 #   include/registry.go   import + 注册
 #   go.mod                依赖（删掉冲突标记保留两边）
+#   experimental/v2rayapi/stats.go 热用户、实例标识与并发保护
+#   release/DEFAULT_BUILD_TAGS*  默认启用 v2ray_api
+#   .github/workflows/{test,lint}.yml main 与独立 module 回归
 #   README.md             直接取我们的（--ours）
 
 # 验证
-go build ./protocol/nowhere/ && go test ./protocol/nowhere/
-(cd panel && go test ./...)
+go test -race -tags with_v2ray_api ./protocol/nowhere/... ./experimental/v2rayapi/...
+(cd panel && go test -race ./...)
+(cd third_party/nowhere-go && go test -race ./...)
+(cd tools/sbstats && go test ./... && go vet ./...)
 go build -tags "with_gvisor,with_quic,with_utls,with_acme,with_clash_api,with_v2ray_api" ./cmd/sing-box
 ```
 
@@ -34,5 +39,5 @@ go build -tags "with_gvisor,with_quic,with_utls,with_acme,with_clash_api,with_v2
 ## third_party/nowhere-go
 
 基线是 [ohmycggk/nowhere-go](https://github.com/ohmycggk/nowhere-go) 的 `v3.2.0`（commit `6a8410c`），
-加了两处补丁（`morph/morph.go` 多密钥、`portal/server.go` 多用户与运行期换名单）。
-同步方式：复制新版过来，重新应用这两处改动。
+本地补丁集中在 `morph/morph.go`（多密钥）与 `portal/server.go`（多用户、运行期换名单、沿用未变密钥的防重放状态与连接清理）。
+同步方式：合并新版与这两个文件的本地改动，保留对应测试，并运行整个独立 module 的竞态回归。

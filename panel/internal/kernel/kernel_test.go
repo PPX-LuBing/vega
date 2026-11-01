@@ -2,6 +2,9 @@ package kernel
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -181,6 +184,37 @@ func TestParseStats(t *testing.T) {
 	}
 }
 
+func TestCollectUsesRetrySafeCounters(t *testing.T) {
+	st := testStore(t)
+	dir := t.TempDir()
+	output := filepath.Join(dir, "stats.json")
+	args := filepath.Join(dir, "args")
+	t.Setenv("STATS_OUTPUT", output)
+	t.Setenv("STATS_ARGS", args)
+	bin := fakeCommand(t, "sb-stats", `printf '%s\n' "$@" > "$STATS_ARGS"; cat "$STATS_OUTPUT"`)
+	paths := testPaths()
+	paths.StatsBin = bin
+	if err := os.WriteFile(output, []byte(`{"instance":"boot-1","stat":[{"name":"user>>>alice>>>traffic>>>uplink","value":"100"},{"name":"user>>>alice>>>traffic>>>downlink","value":"200"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range [][2]int64{{100, 200}, {0, 0}} {
+		up, down, err := Collect(st, paths)
+		if err != nil || up != want[0] || down != want[1] {
+			t.Fatalf("collect %d/%d, want %v: %v", up, down, want, err)
+		}
+	}
+	body, err := os.ReadFile(args)
+	if err != nil || strings.Contains(string(body), "reset") {
+		t.Fatalf("destructive collection: %s: %v", body, err)
+	}
+	if err = os.WriteFile(output, []byte(`{"stat":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err = Collect(st, paths); err == nil {
+		t.Fatal("old stats binary accepted without instance marker")
+	}
+}
+
 // 配置要能序列化成内核认的 JSON（键名不能写错）。
 func TestConfigJSONShape(t *testing.T) {
 	st := testStore(t)
@@ -209,12 +243,12 @@ func TestConfigJSONShape(t *testing.T) {
 
 func TestHumanBytes(t *testing.T) {
 	cases := map[int64]string{
-		0:          "0 B",
-		512:        "512 B",
-		1024:       "1.00 KB",
-		1 << 20:    "1.00 MB",
-		1 << 30:    "1.00 GB",
-		3 << 29:    "1.50 GB",
+		0:       "0 B",
+		512:     "512 B",
+		1024:    "1.00 KB",
+		1 << 20: "1.00 MB",
+		1 << 30: "1.00 GB",
+		3 << 29: "1.50 GB",
 	}
 	for input, want := range cases {
 		if got := HumanBytes(input); got != want {
@@ -230,10 +264,10 @@ func TestHumanBytes(t *testing.T) {
 func TestEvaluateUserAndUsableAgree(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name  string
-		user  store.User
-		used  int64
-		state UserState
+		name   string
+		user   store.User
+		used   int64
+		state  UserState
 		usable bool
 	}{
 		{"正常", store.User{Name: "a", Enabled: true}, 0, UserStateOK, true},

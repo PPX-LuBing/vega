@@ -5,6 +5,7 @@
 //	sbx-panel                          打开 TUI
 //	sbx-panel apply                    生成配置并重启内核（可脚本化）
 //	sbx-panel collect                  采集一次流量
+//	sbx-panel enforce [--watch]        采集并执行配额（变化机器会重启）
 //	sbx-panel node add|list|del        节点管理
 //	sbx-panel user add|list|del|grant  用户与授权
 //	sbx-panel show                     打印生成的配置（排错用）
@@ -20,8 +21,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -83,20 +86,28 @@ func run(args []string) error {
 		fmt.Printf("已下发 %d 台机器。\n", len(results))
 		return nil
 	case "status":
-		fmt.Printf("内核: %s  服务: %s (%s)\n", paths.Bin, paths.Service, kernel.ServiceState(paths.Service))
-		snapshot, err := kernel.Observe(paths.ClashAddr)
+		st, err := store.Open(dbPath)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("  版本:     %s\n", snapshot.Version)
-		fmt.Printf("  活动连接: %d\n", snapshot.ActiveConnections)
-		fmt.Printf("  进程流量: ↑ %s / ↓ %s\n",
-			kernel.HumanBytes(snapshot.UploadTotal), kernel.HumanBytes(snapshot.DownloadTotal))
-		fmt.Printf("  内存占用: %s\n", kernel.HumanBytes(snapshot.Memory))
-		for _, item := range snapshot.TopHosts {
-			fmt.Printf("    %-40s %d 条\n", item.Host, item.Count)
+		defer st.Close()
+		failed := 0
+		for _, r := range kernel.ObserveAll(context.Background(), st, paths) {
+			fmt.Printf("%s: 服务 %s (%s)\n", r.Machine.Name, r.Machine.Service, r.State)
+			if r.Err != nil {
+				failed++
+				fmt.Printf("  读取失败: %v\n", r.Err)
+				continue
+			}
+			fmt.Printf("  版本: %s  活动连接: %d  内存: %s\n", r.Version, r.ActiveConnections, kernel.HumanBytes(r.Memory))
+			fmt.Printf("  进程流量: ↑ %s / ↓ %s\n", kernel.HumanBytes(r.UploadTotal), kernel.HumanBytes(r.DownloadTotal))
+		}
+		if failed > 0 {
+			return fmt.Errorf("%d 台机器状态读取失败", failed)
 		}
 		return nil
+	case "enforce":
+		return runEnforce(dbPath, paths, args[1:])
 	case "machine":
 		return runMachine(dbPath, args[1:])
 	case "collect":
@@ -105,11 +116,22 @@ func run(args []string) error {
 			return err
 		}
 		defer st.Close()
-		up, down, err := kernel.Collect(st, paths)
-		if err != nil {
-			return err
+		var up, down int64
+		var failed int
+		for _, r := range kernel.CollectAll(context.Background(), st, paths) {
+			if r.Err != nil {
+				failed++
+				fmt.Printf("  ✗ %s: %v\n", r.Machine, r.Err)
+				continue
+			}
+			up += r.Up
+			down += r.Down
+			fmt.Printf("  %s: ↑ %s / ↓ %s\n", r.Machine, kernel.HumanBytes(r.Up), kernel.HumanBytes(r.Down))
 		}
 		fmt.Printf("采集: ↑ %s / ↓ %s\n", kernel.HumanBytes(up), kernel.HumanBytes(down))
+		if failed > 0 {
+			return fmt.Errorf("%d 台机器采集失败，成功机器已入库", failed)
+		}
 		return nil
 	case "show":
 		st, err := store.Open(dbPath)
@@ -132,7 +154,52 @@ func run(args []string) error {
 	case "user":
 		return runUser(dbPath, paths, args[1:])
 	default:
-		return fmt.Errorf("未知命令: %s（试 version / apply / collect / node / user / show）", args[0])
+		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / show）", args[0])
+	}
+}
+
+func runEnforce(dbPath string, paths kernel.Paths, args []string) error {
+	fs := flag.NewFlagSet("enforce", flag.ContinueOnError)
+	watch := fs.Bool("watch", false, "持续采集并执行配额/到期，配置变化时重启对应机器")
+	interval := fs.Duration("interval", 30*time.Second, "两轮完成之间的间隔，至少 1s")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *interval < time.Second {
+		return fmt.Errorf("用法: enforce [--watch] [--interval 30s]，间隔至少 1s")
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	for {
+		failed := 0
+		for _, r := range kernel.Enforce(ctx, st, paths) {
+			if r.Err != nil {
+				failed++
+				fmt.Printf("%s: 失败: %v\n", r.Machine, r.Err)
+			} else if r.Changed {
+				fmt.Printf("%s: 配置已更新，已重启以关闭旧会话\n", r.Machine)
+			} else if !*watch {
+				fmt.Printf("%s: 配置未变，无需重启\n", r.Machine)
+			}
+		}
+		if !*watch {
+			if failed > 0 {
+				return fmt.Errorf("%d 台机器执行失败", failed)
+			}
+			return nil
+		}
+		timer := time.NewTimer(*interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
 	}
 }
 
@@ -142,11 +209,12 @@ func runTUI(dbPath string, paths kernel.Paths) error {
 		return err
 	}
 	defer st.Close()
-	program := tea.NewProgram(tui.New(st, paths), tea.WithAltScreen())
+	model := tui.New(st, paths)
+	defer model.Close()
+	program := tea.NewProgram(model, tea.WithAltScreen())
 	_, err = program.Run()
 	return err
 }
-
 
 // reorderArgs 把位置参数挪到末尾，让 flag 包能正确解析。
 //
@@ -237,6 +305,7 @@ func runMachine(dbPath string, args []string) error {
 		apiAddr := fs.String("api", "127.0.0.1:10085", "v2ray_api 地址")
 		statsBin := fs.String("stats-bin", "/usr/local/bin/sb-stats", "统计工具路径")
 		clashAddr := fs.String("clash", "127.0.0.1:9090", "clash_api 地址")
+		controlAddr := fs.String("control", "127.0.0.1:10087", "nowhere 控制地址")
 		remark := fs.String("remark", "", "备注")
 		if err = fs.Parse(reorderArgs(fs, args[1:])); err != nil {
 			return err
@@ -248,7 +317,7 @@ func runMachine(dbPath string, args []string) error {
 		machine := store.Machine{
 			Name: name, Host: *host, SSHPort: *sshPort, SSHUser: *sshUser,
 			KernelPath: *kernelPath, ConfigPath: *configPath, Service: *service,
-			APIAddr: *apiAddr, StatsBin: *statsBin, ClashAddr: *clashAddr, Remark: *remark,
+			APIAddr: *apiAddr, StatsBin: *statsBin, ClashAddr: *clashAddr, ControlAddr: *controlAddr, Remark: *remark,
 		}
 		if err = st.SaveMachine(machine); err != nil {
 			return err
@@ -407,8 +476,8 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 
 	case "add":
 		fs := flag.NewFlagSet("user add", flag.ContinueOnError)
-		quotaGB := fs.Float64("quota", 0, "配额 GB，0 不限")
-		days := fs.Int("days", 0, "有效天数，0 永久")
+		quotaGB := fs.String("quota", "0", "配额 GB，0 不限")
+		days := fs.String("days", "0", "有效天数，0 永久")
 		remark := fs.String("remark", "", "备注")
 		if err := fs.Parse(reorderArgs(fs, args[1:])); err != nil {
 			return err
@@ -417,12 +486,17 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 			return fmt.Errorf("用法: user add <name> --quota 100 --days 30")
 		}
 		name := fs.Arg(0)
+		quota, err := kernel.ParseQuotaGB(*quotaGB)
+		if err != nil {
+			return err
+		}
+		expires, err := kernel.ParseExpiryDays(*days)
+		if err != nil {
+			return err
+		}
 		user := store.User{
 			Name: name, Remark: *remark, Enabled: true,
-			QuotaBytes: int64(*quotaGB * float64(int64(1)<<30)),
-		}
-		if *days > 0 {
-			user.ExpiresAt = nowPlusDays(*days)
+			QuotaBytes: quota, ExpiresAt: expires,
 		}
 		if err := st.SaveUser(user); err != nil {
 			return err
@@ -514,8 +588,4 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("未知子命令: user %s", args[0])
-}
-
-func nowPlusDays(days int) int64 {
-	return time.Now().AddDate(0, 0, days).Unix()
 }

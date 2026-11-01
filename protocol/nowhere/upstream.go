@@ -2,71 +2,114 @@ package nowhere
 
 import (
 	"context"
+	"io"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing/common/logger"
+	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/ohmycggk/nowhere-go/portal"
 	"github.com/ohmycggk/nowhere-go/wire"
 )
 
-// upstream 把 nowhere Portal 的「拉模型」上游接到 sing-box 的「推模型」路由上。
-//
-// portal.Upstream 要求我们自己拨号并把 net.Conn 交回去：
-//
-//	DialTCP(ctx, target) (net.Conn, error)
-//
-// 而 sing-box 的 router 是反过来的——我们给它一个 conn，它去路由：
-//
-//	RouteConnectionEx(ctx, conn, metadata, onClose)
-//
-// 两者用 net.Pipe() 桥接：拿到的其中一端交给 router，另一端还给 portal。
-// portal 往这端写什么，router 就从那端读到什么。
-//
-// UDP 暂时走 portal.Direct（直连），因为 net.Pipe 是流式的，
-// 承载不了 datagram 语义。要让 Nowhere 的 UDP 也吃上 sing-box 路由，
-// 需要一对本地 UDP socket 做桥，见 TODO。
 type upstream struct {
-	portal.Direct
 	router adapter.ConnectionRouterEx
-	logger logger.ContextLogger
+	ctx    context.Context
+	tag    string
 }
 
-// DialTCP 通过 sing-box 路由建立到 target 的连接。
-func (u *upstream) DialTCP(ctx context.Context, target wire.Target) (net.Conn, error) {
-	destination := targetSocksaddr(target)
-	client, server := net.Pipe()
-
-	var metadata adapter.InboundContext
-	metadata.Inbound = "nowhere"
-	metadata.InboundType = "nowhere"
-	metadata.Destination = destination
-	// portal 在试解 prelude/AuthFrame 时确定了用户身份，带进来之后
-	// sing-box 的连接元数据、路由规则和统计都能看到这个用户。
-	if user := portal.UserFromContext(ctx); user != "" {
-		metadata.User = user
+func (u *upstream) metadata(ctx context.Context, target wire.Target) adapter.InboundContext {
+	return adapter.InboundContext{
+		Inbound: u.tag, InboundType: "nowhere",
+		Destination: targetSocksaddr(target), User: portal.UserFromContext(ctx),
+		Source: M.SocksaddrFromNet(portal.SourceFromContext(ctx)),
 	}
+}
 
-	go func() {
-		u.router.RouteConnectionEx(ctx, server, metadata, func(err error) {
-			_ = server.Close()
-		})
-	}()
+func (u *upstream) DialTCP(ctx context.Context, target wire.Target) (net.Conn, error) {
+	client, server := streamPair()
+	stop := context.AfterFunc(u.ctx, func() { _ = client.Close(); _ = server.Close() })
+	go u.router.RouteConnectionEx(ctx, server, u.metadata(ctx, target), func(error) {
+		stop()
+		_ = client.Close()
+		_ = server.Close()
+	})
 	return client, nil
 }
 
-// targetSocksaddr 把 nowhere 的 wire.Target 翻译成 sing-box 的 Socksaddr。
-//
-// wire.Target 要么带 Addr（IP 直连），要么带 Host（域名），不会同时有。
+func (u *upstream) DialUDP(ctx context.Context, target wire.Target) (net.Conn, error) {
+	client, server := net.Pipe()
+	stop := context.AfterFunc(u.ctx, func() { _ = client.Close(); _ = server.Close() })
+	metadata := u.metadata(ctx, target)
+	packet := bufio.NewUnbindPacketConnWithAddr(&datagramConn{Conn: server}, metadata.Destination)
+	go u.router.RoutePacketConnectionEx(ctx, packet, metadata, func(error) {
+		stop()
+		_ = client.Close()
+		_ = server.Close()
+	})
+	return &datagramConn{Conn: client}, nil
+}
+
+// Each direction has its own pipe so an EOF does not discard the response.
+type streamConn struct {
+	net.Conn
+	writer net.Conn
+}
+
+func streamPair() (net.Conn, net.Conn) {
+	aRead, bWrite := net.Pipe()
+	bRead, aWrite := net.Pipe()
+	return &streamConn{Conn: aRead, writer: aWrite}, &streamConn{Conn: bRead, writer: bWrite}
+}
+
+func (c *streamConn) Write(p []byte) (int, error)        { return c.writer.Write(p) }
+func (c *streamConn) CloseWrite() error                  { return c.writer.Close() }
+func (c *streamConn) Close() error                       { _ = c.Conn.Close(); return c.writer.Close() }
+func (c *streamConn) SetWriteDeadline(t time.Time) error { return c.writer.SetWriteDeadline(t) }
+func (c *streamConn) SetDeadline(t time.Time) error {
+	if err := c.Conn.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.writer.SetWriteDeadline(t)
+}
+
+// Preserve UDP packet boundaries across the in-memory byte stream.
+type datagramConn struct {
+	net.Conn
+	readMu, writeMu sync.Mutex
+}
+
+func (c *datagramConn) Read(p []byte) (int, error) {
+	c.readMu.Lock()
+	defer c.readMu.Unlock()
+	packet, err := wire.ReadUoT(c.Conn)
+	if err != nil {
+		return 0, err
+	}
+	if len(packet) > len(p) {
+		return 0, io.ErrShortBuffer
+	}
+	return copy(p, packet), nil
+}
+
+func (c *datagramConn) Write(p []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := wire.WriteUoT(c.Conn, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+var _ N.WriteCloser = (*streamConn)(nil)
+
 func targetSocksaddr(target wire.Target) M.Socksaddr {
 	if target.Host != "" {
 		return M.ParseSocksaddrHostPort(target.Host, target.Port)
 	}
-	return M.Socksaddr{
-		Fqdn: "",
-		Addr: target.Addr,
-		Port: target.Port,
-	}
+	return M.Socksaddr{Addr: target.Addr, Port: target.Port}
 }
