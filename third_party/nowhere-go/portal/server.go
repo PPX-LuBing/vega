@@ -172,6 +172,25 @@ func (s *Server) multiUser() bool {
 	return s.multiUserMode
 }
 
+// UserCount 返回当前生效的用户数。
+//
+// 单密钥模式下是 1（那个共享密钥本身），多用户模式下是名单长度。
+// 控制端点的 /health 用它报出实际人数，而不是写死 0。
+func (s *Server) UserCount() int {
+	if s == nil {
+		return 0
+	}
+	s.usersMu.RLock()
+	defer s.usersMu.RUnlock()
+	if s.multiUserMode {
+		return len(s.users)
+	}
+	if s.creds != nil {
+		return 1
+	}
+	return 0
+}
+
 // UpdateUsers 在运行期替换多用户列表，**不中断已建立的连接**。
 //
 // 面板改用户（加人、停用、超额摘除）不必重启内核：新连接立刻按新名单认证，

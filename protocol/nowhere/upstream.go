@@ -2,7 +2,6 @@ package nowhere
 
 import (
 	"context"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -90,8 +89,14 @@ func (c *datagramConn) Read(p []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// 缓冲区装不下时**截断**，不返回 io.ErrShortBuffer。
+	//
+	// ReadUoT 已经把整个包从流里读出来了，此时再报错就等于把这一份
+	// 报文静默丢掉；而调用方看到错误通常会重试，重试拿到的却是下一
+	// 个包，数据就串位了。截断是 UDP 的常规语义（net.UDPConn.Read
+	// 也是这么做的），至少不会破坏流的边界。
 	if len(packet) > len(p) {
-		return 0, io.ErrShortBuffer
+		return copy(p, packet), nil
 	}
 	return copy(p, packet), nil
 }

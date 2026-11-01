@@ -74,7 +74,13 @@ func (h *Inbound) registerControl(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/users", handleControlUsers)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		writeControl(w, http.StatusOK, controlResponse{OK: true, Updated: controlTags()})
+		// Users 是**已注册入站的用户数之和**。每个入站的名单可以不同，
+		// 要看单个入站用 POST /users 的返回值，或读 updated 里的 tag。
+		writeControl(w, http.StatusOK, controlResponse{
+			OK:      true,
+			Updated: controlTags(),
+			Users:   controlUserCount(),
+		})
 	})
 	server := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second,
@@ -108,6 +114,26 @@ func (h *Inbound) unregisterControl() error {
 	err := controlServer.Close()
 	controlServer, controlListen, controlSecret = nil, "", ""
 	return err
+}
+
+// controlUserCount 汇总所有已注册入站当前生效的用户数。
+func controlUserCount() int {
+	controlMu.Lock()
+	inbounds := make([]*Inbound, 0, len(controlInbounds))
+	for _, target := range controlInbounds {
+		inbounds = append(inbounds, target)
+	}
+	controlMu.Unlock()
+
+	// 在锁外逐个查：UserCount 自己会拿 Server 的读锁，嵌套进来容易出
+	// 锁序问题，而且这些入站的名单不会因为我们这里读一下就变。
+	total := 0
+	for _, target := range inbounds {
+		if target != nil && target.server != nil {
+			total += target.server.UserCount()
+		}
+	}
+	return total
 }
 
 func controlTags() []string {
