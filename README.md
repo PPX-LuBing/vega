@@ -27,12 +27,26 @@ vega/
 
 ### 跟随上游
 
+当前基线是上游的 **`v1.14.4`** tag（commit `c005f35`）。
+
+注意：sing-box 的**默认分支是 `testing`**（开发分支），没有 `main`。跟版本建议直接跟 **tag**：
+
 ```sh
-git fetch upstream
-git rebase upstream/main        # 或 upstream/dev
+git fetch upstream --tags
+
+git rebase v1.15.0        # 换成你要跟的目标版本 tag
+# 或者跟开发分支（不推荐用于生产）：
+# git rebase upstream/testing
 ```
 
 冲突只会出现在上面那 3 个上游文件里，且都是加行——通常一次就能过。唯一需要留意的是 `go.mod`（上游升依赖时会冲突，删掉冲突标记保留两边即可）。
+
+跟完之后重新编译并跑一遍测试：
+
+```sh
+go build ./protocol/nowhere/ && go test ./protocol/nowhere/
+(cd panel && go test ./...)
+```
 
 ### 支持哪些协议
 
