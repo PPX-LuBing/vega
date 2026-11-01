@@ -23,8 +23,11 @@ import (
 type endpoint struct {
 	Node store.Node
 	User store.User
-	// Host 是客户端应当连接的地址（公网），不是内核的 listen。
+	// Host / Port 是客户端应当连接的地址与端口，不是内核的 listen。
+	//
+	// 有中转时这里是接入点（前置），直连时就是节点自己的地址。
 	Host string
+	Port int
 }
 
 // Name 是订阅里这个节点的显示名。
@@ -98,7 +101,14 @@ func Endpoints(st *store.Store, u store.User) ([]endpoint, []string, error) {
 			skip = append(skip, n.Tag+": 该机器的地址解析不到")
 			continue
 		}
-		out = append(out, endpoint{Node: n, User: u, Host: host})
+		// 有接入点就用接入点：客户端连前置，由前置转到中转再落到本机。
+		// 发直连地址会让客户端绕开中转，延迟从几十毫秒涨到几百毫秒。
+		port := n.Port
+		if n.EntryHost != "" && n.EntryPort > 0 {
+			host = n.EntryHost
+			port = n.EntryPort
+		}
+		out = append(out, endpoint{Node: n, User: u, Host: host, Port: port})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Node.Tag < out[j].Node.Tag })
 	return out, skip, nil
@@ -191,7 +201,7 @@ func clashProxy(e endpoint) (string, bool) {
 		b.WriteString("  - name: " + yamlQuote(e.Name()) + "\n")
 		line("type", kind)
 		line("server", e.Host)
-		line("port", fmt.Sprint(n.Port))
+		line("port", fmt.Sprint(e.Port))
 	}
 
 	switch n.Proto {
@@ -390,7 +400,7 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 	ob := map[string]any{
 		"tag":         e.Name(),
 		"server":      e.Host,
-		"server_port": n.Port,
+		"server_port": e.Port,
 	}
 
 	switch n.Proto {
@@ -555,5 +565,5 @@ func nowhereURI(e endpoint) (string, error) {
 	if n.SNI != "" {
 		params = append(params, "sni="+url.QueryEscape(n.SNI))
 	}
-	return fmt.Sprintf("vector://%s@%s:%d?%s", key, host, n.Port, strings.Join(params, "&")), nil
+	return fmt.Sprintf("vector://%s@%s:%d?%s", key, host, e.Port, strings.Join(params, "&")), nil
 }

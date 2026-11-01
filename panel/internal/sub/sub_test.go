@@ -606,3 +606,103 @@ func TestGroupOutboundsExist(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------- 接入点
+
+// 有中转时订阅必须发接入点，而不是节点自己的直连地址。
+//
+// 这是踩过的坑：内核在香港监听 30002，客户端要连的是前置 123.207.1.101:23334，
+// 由前置转到中转再落到香港。订阅发了直连地址，客户端就绕开了中转，
+// 延迟从几十毫秒涨到三百多毫秒——而且表面上「能连上」，很难发现。
+func TestSubscriptionUsesEntryPoint(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+
+	// 先确认默认发的是直连地址
+	before, _, err := Clash(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(before, "server: 203.0.113.9") {
+		t.Fatalf("没有接入点时应当发直连地址:\n%s", before)
+	}
+
+	// 给节点配上接入点
+	n, err := st.Node("hk-ss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.EntryHost = "123.207.1.101"
+	n.EntryPort = 23334
+	if err := st.SaveNode(n); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _, err := Clash(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(after, "server: 123.207.1.101") {
+		t.Fatalf("配了接入点后应当发接入点地址:\n%s", after)
+	}
+	if !strings.Contains(after, "port: 23334") {
+		t.Fatalf("端口也应当是接入点端口:\n%s", after)
+	}
+	// 只看 hk-ss 那一条：夹具里其它节点共用同一台机器，没配接入点，
+	// 它们照旧发直连地址是对的
+	if !strings.Contains(proxyBlock(after, "hk-ss"), "server: 123.207.1.101") {
+		t.Fatal("hk-ss 这一条应当发接入点地址")
+	}
+
+	// sing-box 侧同样
+	sb, _, err := Singbox(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sb, `"server":"123.207.1.101"`) && !strings.Contains(sb, `"server": "123.207.1.101"`) {
+		t.Fatalf("sing-box 订阅也应当发接入点:\n%s", sb)
+	}
+}
+
+// 只给 host 不给 port（或反过来）是配置漏了，必须拒绝而不是猜一个。
+func TestEntryPointRequiresBothFields(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+	n, err := st.Node("hk-ss")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CLI 层的校验在 main.go，这里只确认 store 不会因为只有一个字段而崩溃
+	n.EntryHost = "1.2.3.4"
+	n.EntryPort = 0
+	if err := st.SaveNode(n); err != nil {
+		t.Fatal(err)
+	}
+	body, _, err := Clash(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 只有 host 没有 port 时退回直连，不能发出一个端口为 0 的节点
+	if strings.Contains(body, "port: 0") {
+		t.Fatal("不能发出端口为 0 的节点")
+	}
+}
+
+// proxyBlock 从 clash 订阅里抠出某个 proxy 的 YAML 片段，方便按节点断言。
+func proxyBlock(doc, name string) string {
+	lines := strings.Split(doc, "\n")
+	start := -1
+	for i, l := range lines {
+		if strings.Contains(l, "name:") && strings.Contains(l, name) {
+			start = i
+			continue
+		}
+		if start >= 0 && i > start && strings.HasPrefix(l, "  - name:") {
+			return strings.Join(lines[start:i], "\n")
+		}
+	}
+	if start >= 0 {
+		return strings.Join(lines[start:], "\n")
+	}
+	return ""
+}

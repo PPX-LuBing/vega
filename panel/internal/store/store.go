@@ -68,6 +68,16 @@ type Node struct {
 	Remark  string `json:"remark"`
 	Enabled bool   `json:"enabled"`
 
+	// EntryHost / EntryPort 是**客户端接入点**，和内核实际监听的
+	// Listen/Port 是两回事。
+	//
+	// 典型场景是中转：内核在香港监听 30002，但客户端要连的是前置
+	// 123.207.1.101:23334，由前置转到中转再落到香港。订阅里必须发接入点，
+	// 发直连地址会让客户端绕开中转，延迟从几十毫秒涨到几百毫秒。
+	// 留空表示没有中转，客户端直连 Listen/Port。
+	EntryHost string `json:"entry_host"`
+	EntryPort int    `json:"entry_port"`
+
 	// TLS：mode 为 tls / reality / none
 	TLSMode  string `json:"tls_mode"`
 	SNI      string `json:"sni"`
@@ -178,7 +188,9 @@ CREATE TABLE IF NOT EXISTS nodes (
     up_mbps    INTEGER NOT NULL DEFAULT 0,
     down_mbps  INTEGER NOT NULL DEFAULT 0,
     ss_method  TEXT NOT NULL DEFAULT '',
-    ss_password TEXT NOT NULL DEFAULT ''
+    ss_password TEXT NOT NULL DEFAULT '',
+    entry_host TEXT NOT NULL DEFAULT '',
+    entry_port INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS users (
     name        TEXT PRIMARY KEY,
@@ -233,6 +245,10 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err = s.ensureSubTokenColumn(); err != nil {
 		return err
 	}
+	// 接入点两列：老库没有，补上
+	if err = s.ensureEntryColumns(); err != nil {
+		return err
+	}
 	// 老库补列：SQLite 的 ADD COLUMN 不支持 IF NOT EXISTS，只能先探测
 	if !s.hasColumn("nodes", "machine") {
 		if _, err = s.db.Exec(`ALTER TABLE nodes ADD COLUMN machine TEXT NOT NULL DEFAULT 'local'`); err != nil {
@@ -259,6 +275,22 @@ func (s *Store) ensureSubTokenColumn() error {
 	}
 	_, err := s.db.Exec(`ALTER TABLE users ADD COLUMN sub_token TEXT NOT NULL DEFAULT ''`)
 	return err
+}
+
+// ensureEntryColumns 给老库补上接入点两列。
+func (s *Store) ensureEntryColumns() error {
+	for _, col := range []struct{ name, ddl string }{
+		{"entry_host", `ALTER TABLE nodes ADD COLUMN entry_host TEXT NOT NULL DEFAULT ''`},
+		{"entry_port", `ALTER TABLE nodes ADD COLUMN entry_port INTEGER NOT NULL DEFAULT 0`},
+	} {
+		if s.hasColumn("nodes", col.name) {
+			continue
+		}
+		if _, err := s.db.Exec(col.ddl); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) hasColumn(table, column string) bool {
@@ -415,18 +447,20 @@ func (s *Store) SaveNode(n Node) error {
 	}
 	_, err := s.db.Exec(`
 INSERT INTO nodes (tag, machine, proto, listen, port, remark, enabled, tls_mode, sni, cert_path, key_path,
-                   dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps, ss_method, ss_password)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps, ss_method, ss_password,
+                   entry_host, entry_port)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(tag) DO UPDATE SET
   machine=excluded.machine, proto=excluded.proto, listen=excluded.listen, port=excluded.port, remark=excluded.remark,
   enabled=excluded.enabled, tls_mode=excluded.tls_mode, sni=excluded.sni,
   cert_path=excluded.cert_path, key_path=excluded.key_path, dest=excluded.dest,
   priv_key=excluded.priv_key, pub_key=excluded.pub_key, short_id=excluded.short_id,
   morph=excluded.morph, up_mbps=excluded.up_mbps, down_mbps=excluded.down_mbps,
-  ss_method=excluded.ss_method, ss_password=excluded.ss_password`,
+  ss_method=excluded.ss_method, ss_password=excluded.ss_password,
+  entry_host=excluded.entry_host, entry_port=excluded.entry_port`,
 		n.Tag, orLocal(n.Machine), n.Proto, n.Listen, n.Port, n.Remark, boolInt(n.Enabled), n.TLSMode, n.SNI,
 		n.CertPath, n.KeyPath, n.Dest, n.PrivKey, n.PubKey, n.ShortID, boolInt(n.Morph),
-		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword)
+		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort)
 	return err
 }
 
@@ -434,7 +468,7 @@ ON CONFLICT(tag) DO UPDATE SET
 func (s *Store) Nodes() ([]Node, error) {
 	rows, err := s.db.Query(`SELECT tag, machine, proto, listen, port, remark, enabled, tls_mode, sni,
         cert_path, key_path, dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps,
-        ss_method, ss_password
+        ss_method, ss_password, entry_host, entry_port
         FROM nodes ORDER BY port`)
 	if err != nil {
 		return nil, err
@@ -446,7 +480,8 @@ func (s *Store) Nodes() ([]Node, error) {
 		var enabled, morph int
 		if err = rows.Scan(&n.Tag, &n.Machine, &n.Proto, &n.Listen, &n.Port, &n.Remark, &enabled, &n.TLSMode,
 			&n.SNI, &n.CertPath, &n.KeyPath, &n.Dest, &n.PrivKey, &n.PubKey, &n.ShortID,
-			&morph, &n.UpMbps, &n.DownMbps, &n.SSMethod, &n.SSPassword); err != nil {
+			&morph, &n.UpMbps, &n.DownMbps, &n.SSMethod, &n.SSPassword,
+			&n.EntryHost, &n.EntryPort); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled != 0

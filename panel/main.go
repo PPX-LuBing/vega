@@ -374,15 +374,20 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("%-18s %-13s %-7s %-9s %-6s %s\n", "TAG", "协议", "端口", "TLS", "用户", "状态")
+		fmt.Printf("%-18s %-13s %-7s %-9s %-6s %-24s %s\n", "TAG", "协议", "端口", "TLS", "用户", "客户端接入点", "状态")
 		for _, n := range nodes {
 			users, _ := st.UsersForNode(n.Tag)
 			state := "启用"
 			if !n.Enabled {
 				state = "停用"
 			}
-			fmt.Printf("%-18s %-13s %-7d %-9s %-6d %s\n",
-				n.Tag, n.Proto, n.Port, n.TLSMode, len(users), state)
+			// 接入点为空表示客户端直连，跟内核监听一致
+			entry := "直连"
+			if n.EntryHost != "" {
+				entry = fmt.Sprintf("%s:%d", n.EntryHost, n.EntryPort)
+			}
+			fmt.Printf("%-18s %-13s %-7d %-9s %-6d %-24s %s\n",
+				n.Tag, n.Proto, n.Port, n.TLSMode, len(users), entry, state)
 		}
 		return nil
 
@@ -402,6 +407,8 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		pubKey := fs.String("pub-key", "", "REALITY 公钥")
 		shortID := fs.String("short-id", "", "REALITY short id")
 		morph := fs.Bool("morph", true, "Nowhere Morph")
+		entryHost := fs.String("entry-host", "", "客户端接入地址（有中转时填，留空=直连本机）")
+		entryPort := fs.Int("entry-port", 0, "客户端接入端口（有中转时填）")
 		if err := fs.Parse(reorderArgs(fs, args[1:])); err != nil {
 			return err
 		}
@@ -409,11 +416,15 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 			return fmt.Errorf("用法: node add <tag> --proto --port")
 		}
 		tag := fs.Arg(0)
+		if (*entryHost == "") != (*entryPort == 0) {
+			return fmt.Errorf("--entry-host 与 --entry-port 要么都给，要么都不给（只给一个说明配置漏了）")
+		}
 		node := store.Node{
 			Tag: tag, Proto: *proto, Port: *port, TLSMode: *tlsMode, SNI: *sni,
 			Remark: *remark, Listen: *listen, Enabled: true, Morph: *morph,
 			Dest: *dest, PrivKey: *privKey, PubKey: *pubKey, ShortID: *shortID,
 			CertPath: *cert, KeyPath: *key, Machine: *machineName,
+			EntryHost: *entryHost, EntryPort: *entryPort,
 		}
 		if node.Remark == "" {
 			node.Remark = tag
