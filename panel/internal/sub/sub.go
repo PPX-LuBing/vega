@@ -150,12 +150,35 @@ func Clash(st *store.Store, u store.User) (string, []string, error) {
 	for _, n := range names {
 		b.WriteString("      - " + yamlQuote(n) + "\n")
 	}
+	// 规则里引用到的策略组（AI/Streaming/CDN）必须存在，否则 clash 加载时报错
+	for _, g := range presetGroups {
+		b.WriteString("  - name: " + g.Name + "\n    type: select\n    proxies:\n")
+		for _, m := range g.Members {
+			b.WriteString("      - " + yamlQuote(m) + "\n")
+		}
+		b.WriteString("      - PROXY\n")
+	}
+
+	b.WriteString("\nrule-providers:\n")
+	for _, pr := range presetProviders {
+		// 名字里带 ! 之类特殊字符要加引号，否则 YAML 会当成 tag
+		key := pr.Name
+		if !isPlainKey(key) {
+			key = yamlQuote(key)
+		}
+		b.WriteString("  " + key + ":\n")
+		b.WriteString("    type: http\n    behavior: " + pr.Behavior + "\n    format: mrs\n")
+		b.WriteString("    url: " + yamlQuote(pr.URL) + "\n")
+		b.WriteString("    path: ./ruleset/" + pr.File + "\n    interval: 86400\n")
+	}
+
 	b.WriteString("\nrules:\n")
-	b.WriteString("  - GEOIP,private,DIRECT,no-resolve\n")
-	b.WriteString("  - GEOIP,cn,DIRECT\n")
-	b.WriteString("  - MATCH,PROXY\n")
+	for _, r := range presetRules {
+		b.WriteString("  - " + r + "\n")
+	}
 	return b.String(), skipped, nil
 }
+
 
 // clashProxy 把单个节点渲染成 clash 的 proxy 条目。不支持的协议返回 false。
 func clashProxy(e endpoint) (string, bool) {
@@ -310,34 +333,32 @@ func Singbox(st *store.Store, u store.User) (string, []string, error) {
 		"idle_timeout": "30m",
 	}
 	outbounds = append([]any{selector, urltest}, outbounds...)
+	// 规则里引用到的策略组（AI/Streaming/CDN）必须真的存在出站，
+	// 否则内核加载时报 "outbound not found"。
+	for _, g := range presetGroups {
+		members := make([]string, 0, len(g.Members))
+		for _, m := range g.Members {
+			if tag, reject := outboundTag(m); !reject {
+				members = append(members, tag)
+			}
+		}
+		outbounds = append(outbounds, map[string]any{
+			"type": "selector", "tag": g.Name,
+			"outbounds": members, "default": members[0],
+		})
+	}
 	outbounds = append(outbounds, map[string]any{"type": "direct", "tag": "direct"})
 
 	cfg := map[string]any{
 		"log":       map[string]any{"level": "info", "timestamp": true},
 		"outbounds": outbounds,
 		"route": map[string]any{
-			"rules": []any{
-				map[string]any{"action": "sniff"},
-				map[string]any{"protocol": "dns", "action": "hijack-dns"},
-				map[string]any{"ip_is_private": true, "outbound": "direct"},
-				map[string]any{"rule_set": []string{"geosite-cn", "geoip-cn"}, "outbound": "direct"},
-			},
-			"final": "proxy",
+			"rules": singboxRouteRules(),
+			"final": singboxFinal(),
 			// 出站的域名解析走哪个 DNS 必须显式给，否则 1.14 起会告警、
 			// 后续版本会直接拒绝加载。
 			"default_domain_resolver": "local",
-			"rule_set": []any{
-				map[string]any{
-					"type": "remote", "tag": "geosite-cn", "format": "binary",
-					"url":             "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-					"download_detour": "direct", "update_interval": "7d",
-				},
-				map[string]any{
-					"type": "remote", "tag": "geoip-cn", "format": "binary",
-					"url":             "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
-					"download_detour": "direct", "update_interval": "7d",
-				},
-			},
+			"rule_set":                singboxRuleSets(),
 		},
 		// 国内直连靠规则集。sing-box 不认 clash 的 "geoip:cn" 写法，
 		// 必须给出真正的 rule_set 定义，否则加载时报 parse prefix 失败。
@@ -348,7 +369,7 @@ func Singbox(st *store.Store, u store.User) (string, []string, error) {
 			},
 			"rules": []any{
 				map[string]any{"ip_is_private": true, "server": "local"},
-				map[string]any{"rule_set": []string{"geosite-cn"}, "server": "local"},
+				map[string]any{"rule_set": []string{"geolocation-cn"}, "server": "local"},
 			},
 			"final": "remote",
 		},

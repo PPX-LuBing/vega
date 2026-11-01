@@ -85,7 +85,7 @@ func TestClashSkipsNowhereAndReportsIt(t *testing.T) {
 	if strings.Contains(body, "停用的") {
 		t.Fatal("停用的节点不该进订阅")
 	}
-	for _, want := range []string{"香港 anytls", "香港", "203.0.113.9", "GEOIP,cn,DIRECT", "MATCH,PROXY"} {
+	for _, want := range []string{"香港 anytls", "香港", "203.0.113.9", "RULE-SET,cn_ip,DIRECT", "MATCH,PROXY"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("clash 订阅缺少 %q", want)
 		}
@@ -457,5 +457,152 @@ func TestNowhereSubscriptionWithoutNowhereNodes(t *testing.T) {
 	}
 	if _, _, err := Nowhere(st, u); err == nil {
 		t.Fatal("没有 nowhere 节点时应当报错")
+	}
+}
+
+// ---------------------------------------------------------------- 分流规则
+
+// SSH 默认必须走代理。
+//
+// 这条是踩过坑的：管理流量直连看着省事，但国内到境外的 SSH 经常又慢又断，
+// 穿代理反而稳定。之前 polarisx 的预设里有 DST-PORT,22,DIRECT，上传大文件
+// 时慢到不能用，去掉之后才正常。谁要是「顺手」把它加回来，这条测试会拦住。
+func TestSSHIsNotForcedDirect(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+
+	cl, _, err := Clash(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"DST-PORT,22", "DST-PORT, 22"} {
+		if strings.Contains(cl, bad) {
+			t.Fatalf("clash 规则里不该有 %q——SSH 必须走代理", bad)
+		}
+	}
+
+	sb, _, err := Singbox(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sb, `"port"`) && strings.Contains(sb, "22") {
+		var cfg map[string]any
+		if err := json.Unmarshal([]byte(sb), &cfg); err == nil {
+			route, _ := cfg["route"].(map[string]any)
+			rules, _ := route["rules"].([]any)
+			for _, raw := range rules {
+				rule, _ := raw.(map[string]any)
+				if ports, ok := rule["port"].([]any); ok {
+					for _, p := range ports {
+						if p == float64(22) && rule["outbound"] == "direct" {
+							t.Fatal("sing-box 规则里不该把 22 端口强制直连")
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// clash 与 sing-box 的分流规则必须来自同一份定义。
+//
+// 两份规则手工维护迟早会漂移，出现「clash 走了代理但 sing-box 直连」
+// 这种谁也查不出来的问题。这里用条数做粗校验。
+func TestBothFormatsShareRuleSet(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+
+	cl, _, err := Clash(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clashRules := 0
+	inRules := false
+	for _, line := range strings.Split(cl, "\n") {
+		if line == "rules:" {
+			inRules = true
+			continue
+		}
+		if inRules && strings.HasPrefix(line, "  - ") {
+			clashRules++
+		}
+	}
+	if clashRules != len(presetRules) {
+		t.Fatalf("clash 规则数 %d 与定义 %d 不一致", clashRules, len(presetRules))
+	}
+
+	sb, _, err := Singbox(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(sb), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	route, _ := cfg["route"].(map[string]any)
+	rules, _ := route["rules"].([]any)
+	// 前 3 条是固定动作（嗅探/DNS 劫持/私有地址），其余来自同一份定义；
+	// MATCH 变成了 route.final 不算规则。
+	if len(rules)-3 != len(presetRules)-1 {
+		t.Fatalf("sing-box 规则数 %d（减固定 3 条）与 clash 的 %d 条对不上——"+
+			"说明有规则在转换时被静默丢掉了，那会让两种客户端分流不一致",
+			len(rules)-3, len(presetRules)-1)
+	}
+}
+
+// 每条 clash 规则类型都必须有 sing-box 对应写法。
+//
+// 这是上一条测试的补充：上一条查总数，这条查类型。之前 PROCESS-NAME
+// 就没有映射，7 条 Emby 规则被静默丢掉，总数测试才发现。
+func TestEveryRuleTypeIsConvertible(t *testing.T) {
+	supported := map[string]bool{
+		"IP-CIDR": true, "IP-CIDR6": true, "DOMAIN": true,
+		"DOMAIN-SUFFIX": true, "DOMAIN-KEYWORD": true,
+		"RULE-SET": true, "GEOIP": true, "PROCESS-NAME": true,
+	}
+	for _, raw := range presetRules {
+		if raw == "MATCH,PROXY" || strings.HasPrefix(raw, "AND,(") {
+			continue // 分别由 final 和 quicBlockRule 处理
+		}
+		f := splitRule(raw)
+		if len(f) < 3 {
+			t.Errorf("规则字段不足: %s", raw)
+			continue
+		}
+		if !supported[f[0]] {
+			t.Errorf("规则类型 %q 没有 sing-box 对应写法，会被静默丢掉: %s", f[0], raw)
+		}
+	}
+}
+
+// 规则里引用到的策略组必须有对应的出站，否则客户端加载时报 outbound not found。
+func TestGroupOutboundsExist(t *testing.T) {
+	st := testStore(t)
+	u := seed(t, st)
+	sb, _, err := Singbox(st, u)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal([]byte(sb), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	tags := map[string]bool{}
+	for _, raw := range cfg["outbounds"].([]any) {
+		ob, _ := raw.(map[string]any)
+		if tag, ok := ob["tag"].(string); ok {
+			tags[tag] = true
+		}
+	}
+	route, _ := cfg["route"].(map[string]any)
+	for _, raw := range route["rules"].([]any) {
+		rule, _ := raw.(map[string]any)
+		tag, ok := rule["outbound"].(string)
+		if !ok {
+			continue
+		}
+		if !tags[tag] {
+			t.Fatalf("规则引用了不存在的出站 %q", tag)
+		}
 	}
 }
