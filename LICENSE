@@ -1,22 +1,25 @@
-Vega —— 基于 sing-box 的衍生作品
+Vega - a thin fork of sing-box
 Copyright (C) 2026 PPX-LuBing <1711958652@qq.com>
 
-本程序包含以下上游项目的代码，版权归各自作者所有：
+This program is a derivative work of the projects listed below.
+Their copyright notices are retained here; see NOTICE for full attribution.
 
     sing-box      Copyright (C) 2022 nekohasekai <contact-sagernet@sekai.icu>
     nowhere-go    Copyright (C) 2026 ohmycggk
-    Nowhere       Copyright (C) NodePassProject 贡献者
+    Nowhere       Copyright (C) NodePassProject contributors
 
-完整的致谢与各项目的许可说明见 NOTICE 文件。
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-本程序是自由软件：你可以再分发和/或修改它，遵循 GNU 通用公共许可证
-（GNU GPL）第 3 版或（由你选择）任何更新版本的条款。
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
 
-本程序的分发是希望它有用，但不提供任何担保，甚至不包括适销性或
-特定用途适用性的默示担保。详见 GNU 通用公共许可证。
-
-你应该已经随本程序收到了 GNU 通用公共许可证的副本。如果没有，
-见 <https://www.gnu.org/licenses/>。
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 --------------------------------------------------------------------------
 
