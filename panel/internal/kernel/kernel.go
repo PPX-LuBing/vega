@@ -318,6 +318,12 @@ func buildInbound(node store.Node, users []store.User) (map[string]any, error) {
 		inbound["transport"] = transport
 	}
 	if tlsBlock := buildTLS(node); tlsBlock != nil && node.Proto != store.ProtoShadowsocks {
+		// TUIC 跑在 QUIC 上，服务端必须宣告 h3。不宣告的话客户端会以
+		// "CRYPTO_ERROR 0x178: server did not select an ALPN protocol"
+		// 直接握手失败——服务端日志里什么都看不到，很难查。
+		if node.Proto == store.ProtoTUIC {
+			tlsBlock["alpn"] = []string{"h3"}
+		}
 		inbound["tls"] = tlsBlock
 	}
 	return inbound, nil
