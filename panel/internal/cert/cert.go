@@ -151,10 +151,31 @@ func (m *Manager) Sync(ctx context.Context) (bool, error) {
 // 它可能一直阻塞到签发完成（autocert 内部上限 5 分钟），调用方自己决定
 // 要不要放 goroutine。
 func (m *Manager) Arm() error {
-	if _, err := m.auto.GetCertificate(&tls.ClientHelloInfo{ServerName: m.cfg.Domain}); err != nil {
+	if _, err := m.auto.GetCertificate(armHello(m.cfg.Domain)); err != nil {
 		return fmt.Errorf("获取 %s 的证书失败: %w", m.cfg.Domain, err)
 	}
 	return nil
+}
+
+// armHello 造一个「现代客户端」的 ClientHelloInfo 交给 autocert。
+//
+// 为什么不能只填 ServerName：autocert 的 supportsECDSA 会在 hello.CipherSuites
+// 里找 ECDSA 套件，一个都找不到就认为「这客户端只支持 RSA」，转而去签一张 RSA
+// 证书（缓存键变成 <域名>+rsa）。全空的 ClientHelloInfo 正好落进这个坑——实测
+// 它会在服务启动时立刻向 Let's Encrypt 多签一张 RSA 证书，覆盖掉刚迁移出来的
+// EC 证书，等于凭空消耗一次签发配额。
+func armHello(domain string) *tls.ClientHelloInfo {
+	return &tls.ClientHelloInfo{
+		ServerName: domain,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		},
+		SignatureSchemes:  []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256},
+		SupportedCurves:   []tls.CurveID{tls.CurveP256},
+		SupportedVersions: []uint16{tls.VersionTLS13, tls.VersionTLS12},
+	}
 }
 
 // Status 报告稳定证书文件的现状。
@@ -257,6 +278,9 @@ func StatusOf(certDir, domain string) Status {
 func DiscoverDomain(certDir string) (string, error) {
 	entries, err := os.ReadDir(certDir)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("证书目录 %s 还不存在：订阅服务签发第一张证书后会自动创建", certDir)
+		}
 		return "", fmt.Errorf("读证书目录 %s 失败: %w", certDir, err)
 	}
 	var found []string
@@ -326,13 +350,14 @@ func (c *stableCache) Put(ctx context.Context, key string, data []byte) error {
 // isDomainCert 判断这个 cache key 是不是本域名的证书。
 //
 // autocert 的键（见 autocert.go 的 certKey.String 与 accountKey）：
-// 证书是 <域名>（ECDSA）或 <域名>+rsa（RSA），tls-alpn-01 的临时证书是
-// <域名>+token，账号密钥是 acme_account+key（老版本 acme_account.key）。
+// 证书是 <域名>（ECDSA）或 <域名>+rsa（客户端不支持 ECDSA 时签的那份），
+// tls-alpn-01 的临时证书是 <域名>+token，账号密钥是 acme_account+key。
+//
+// 只认 <域名> 那一份。稳定文件只能有一份，EC 和 RSA 都往同一个路径写会互相
+// 覆盖（谁最后签谁赢），内核就被反复重启。节点客户端是 sing-box 系，都支持
+// ECDSA，EC 那份够用——原来的手工拆出来的也是 EC 那份，实测四个协议都通。
 func (c *stableCache) isDomainCert(key string) bool {
-	if strings.HasPrefix(key, "acme_account") || strings.HasSuffix(key, "+token") {
-		return false
-	}
-	return strings.TrimSuffix(key, "+rsa") == c.m.cfg.Domain
+	return key == c.m.cfg.Domain
 }
 
 // splitPEM 拆开 autocert 缓存里的 PEM：私钥一段、证书链一段。

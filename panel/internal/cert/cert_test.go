@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -114,15 +115,55 @@ func TestPutIgnoresNonCertificateKeys(t *testing.T) {
 	}
 }
 
-// RSA 那份（<域名>+rsa）也是本域名的证书，同样要落盘。
-func TestPutAcceptsRSAVariant(t *testing.T) {
+// RSA 那份（<域名>+rsa）不能写稳定文件：它和 EC 那份抢同一个路径，
+// 谁最后签谁赢，内核会被反复重启。
+func TestPutIgnoresRSAVariant(t *testing.T) {
 	var changes []Change
 	manager := newTestManager(t, &changes)
-	if err := manager.cache.Put(context.Background(), "hk.example.com+rsa", selfSigned(t, "hk.example.com", time.Now().Add(90*24*time.Hour))); err != nil {
+	ctx := context.Background()
+	if err := manager.cache.Put(ctx, "hk.example.com", selfSigned(t, "hk.example.com", time.Now().Add(90*24*time.Hour))); err != nil {
 		t.Fatal(err)
 	}
-	if !manager.Status().Exists {
-		t.Fatal("+rsa 那份没落盘")
+	before := manager.Status().SHA256
+	if err := manager.cache.Put(ctx, "hk.example.com+rsa", selfSigned(t, "hk.example.com", time.Now().Add(60*24*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if after := manager.Status().SHA256; after != before {
+		t.Fatalf("+rsa 那份把稳定文件覆盖了: %s -> %s", before, after)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("OnChange 调了 %d 次，想要 1 次", len(changes))
+	}
+}
+
+// 这条不变量是踩过坑的：autocert 的 supportsECDSA 在 hello.CipherSuites 里找
+// ECDSA 套件，一个都没有就认为「客户端只支持 RSA」，于是去签一张 RSA 证书。
+// 曾经这里传的是只填了 ServerName 的空 ClientHelloInfo，结果服务一启动就
+// 向 Let's Encrypt 多签一张 RSA 证书，把刚迁移出来的 EC 证书覆盖掉。
+func TestArmHelloAdvertisesECDSA(t *testing.T) {
+	hello := armHello("hk.example.com")
+	if hello.ServerName != "hk.example.com" {
+		t.Fatalf("ServerName = %q", hello.ServerName)
+	}
+	ecdsaSuite := false
+	for _, suite := range hello.CipherSuites {
+		switch suite {
+		case tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:
+			ecdsaSuite = true
+		}
+	}
+	if !ecdsaSuite {
+		t.Fatal("ClientHello 里没有 ECDSA 套件，autocert 会误判成「只支持 RSA」并多签一张证书")
+	}
+	if len(hello.SupportedCurves) == 0 || len(hello.SignatureSchemes) == 0 {
+		t.Fatal("ClientHello 缺 SupportedCurves / SignatureSchemes")
+	}
+	for _, proto := range hello.SupportedProtos {
+		if proto == "acme-tls/1" {
+			t.Fatal("不能宣告 acme-tls/1，否则会被当成 tls-alpn-01 挑战证书")
+		}
 	}
 }
 
