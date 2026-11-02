@@ -259,6 +259,20 @@ func buildInbound(node store.Node, users []store.User) (map[string]any, error) {
 		inbound["type"] = "anytls"
 		inbound["users"] = passwordMembers(users)
 
+	case store.ProtoTUIC:
+		// TUIC 的凭据是 uuid + password 一对，和其它协议只用一个字段不同
+		inbound["type"] = "tuic"
+		members := make([]any, 0, len(users))
+		for _, u := range users {
+			members = append(members, map[string]any{
+				"name": u.Name, "uuid": u.UUID, "password": u.Password,
+			})
+		}
+		inbound["users"] = members
+		// TUIC 是 QUIC 上的协议，拥塞控制用 bbr 比默认的 cubic 在高丢包线路上
+		// 明显更快，而这类线路正是用它的理由
+		inbound["congestion_control"] = "bbr"
+
 	case store.ProtoHysteria2:
 		inbound["type"] = "hysteria2"
 		inbound["users"] = passwordMembers(users)

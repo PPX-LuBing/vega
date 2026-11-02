@@ -221,6 +221,17 @@ func clashProxy(e endpoint) (string, bool) {
 		clashForceTLS(&b, n)
 		line("udp", "true")
 
+	case store.ProtoTUIC:
+		head("tuic")
+		line("uuid", yamlQuote(u.UUID))
+		line("password", yamlQuote(u.Password))
+		// TUIC 跑在 QUIC 上，ALPN 必须是 h3，否则服务端直接拒绝握手
+		line("alpn", "[h3]")
+		line("congestion-controller", "bbr")
+		line("udp-relay-mode", "native")
+		clashForceTLS(&b, n)
+		line("udp", "true")
+
 	case store.ProtoHysteria2:
 		head("hysteria2")
 		line("password", yamlQuote(u.Password))
@@ -472,6 +483,17 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 		ob["password"] = u.Password
 		// anytls 的名字就来自 "any TLS"，没有 TLS 无从谈起
 		ob["tls"] = forceTLS(n)
+
+	case store.ProtoTUIC:
+		ob["type"] = "tuic"
+		ob["uuid"] = u.UUID
+		ob["password"] = u.Password
+		ob["congestion_control"] = "bbr"
+		ob["udp_relay_mode"] = "native"
+		tls := forceTLS(n)
+		// ALPN 必须是 h3：TUIC 是 QUIC 上的协议，ALPN 不对会直接被拒
+		tls["alpn"] = []string{"h3"}
+		ob["tls"] = tls
 
 	case store.ProtoHysteria2:
 		ob["type"] = "hysteria2"

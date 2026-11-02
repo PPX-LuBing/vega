@@ -23,6 +23,7 @@ import (
 const (
 	ProtoNowhere     = "nowhere"
 	ProtoAnyTLS      = "anytls"
+	ProtoTUIC        = "tuic"
 	ProtoHysteria2   = "hysteria2"
 	ProtoVLESS       = "vless"
 	ProtoVMess       = "vmess"
@@ -32,7 +33,7 @@ const (
 
 // Protocols 是面板支持的协议白名单。
 var Protocols = []string{
-	ProtoNowhere, ProtoAnyTLS, ProtoHysteria2, ProtoVLESS, ProtoVMess, ProtoTrojan, ProtoShadowsocks,
+	ProtoNowhere, ProtoAnyTLS, ProtoTUIC, ProtoHysteria2, ProtoVLESS, ProtoVMess, ProtoTrojan, ProtoShadowsocks,
 }
 
 // Machine 是一台被面板编排的机器。
