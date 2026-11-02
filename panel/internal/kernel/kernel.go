@@ -269,12 +269,12 @@ func buildInbound(node store.Node, users []store.User) (map[string]any, error) {
 			inbound["down_mbps"] = node.DownMbps
 		}
 
-	case store.ProtoVLESS:
-		inbound["type"] = "vless"
+	case store.ProtoVLESS, store.ProtoVMess:
+		inbound["type"] = node.Proto
 		members := make([]any, 0, len(users))
 		for _, u := range users {
 			member := map[string]any{"name": u.Name, "uuid": u.UUID}
-			if node.TLSMode == "reality" {
+			if node.Proto == store.ProtoVLESS && node.TLSMode == "reality" {
 				member["flow"] = "xtls-rprx-vision"
 			}
 			members = append(members, member)
@@ -300,6 +300,9 @@ func buildInbound(node store.Node, users []store.User) (map[string]any, error) {
 		return nil, fmt.Errorf("不支持的协议: %s", node.Proto)
 	}
 
+	if transport := node.TransportConfig(); transport != nil {
+		inbound["transport"] = transport
+	}
 	if tlsBlock := buildTLS(node); tlsBlock != nil && node.Proto != store.ProtoShadowsocks {
 		inbound["tls"] = tlsBlock
 	}
@@ -392,11 +395,8 @@ func firstCSV(s string) string {
 }
 
 func splitHostPort(s string) (string, string, bool) {
-	idx := strings.LastIndex(s, ":")
-	if idx <= 0 || idx == len(s)-1 {
-		return "", "", false
-	}
-	return s[:idx], s[idx+1:], true
+	host, port, err := net.SplitHostPort(s)
+	return host, port, err == nil
 }
 
 // ---------------------------------------------------------------- 内核控制

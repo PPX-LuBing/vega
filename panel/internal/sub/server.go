@@ -3,11 +3,13 @@ package sub
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -37,112 +39,115 @@ type Config struct {
 	ACMEHTTPAddr string
 	// ACMETLSAddr 是 HTTPS 监听地址，默认 :443。
 	ACMETLSAddr string
+	CertFile    string
+	KeyFile     string
 }
 
 // Serve 起订阅 HTTP 服务，ctx 结束时优雅关闭。
 func Serve(ctx context.Context, st *store.Store, cfg Config) error {
-	if cfg.Listen == "" {
-		return fmt.Errorf("订阅服务缺少 listen 地址")
-	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = 12 * time.Hour
 	}
-	handler := &handler{st: st, cfg: cfg}
-
+	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
+		return fmt.Errorf("TLS requires both certificate and key")
+	}
+	if cfg.ACMEDomain != "" && cfg.CertFile != "" {
+		return fmt.Errorf("choose ACME or certificate files, not both")
+	}
+	addr := cfg.Listen
+	if cfg.ACMEDomain != "" || cfg.CertFile != "" {
+		addr = cfg.ACMETLSAddr
+		if addr == "" {
+			addr = ":443"
+		}
+	}
+	if addr == "" {
+		return fmt.Errorf("subscription listen address is required")
+	}
+	h := &handler{st: st, cfg: cfg}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/sub/", handler.subscription)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("vega sub ok\n"))
-	})
-
-	server := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-	}
-	listener, err := net.Listen("tcp", cfg.Listen)
-	if err != nil {
-		return fmt.Errorf("订阅服务监听 %s 失败: %w", cfg.Listen, err)
-	}
-
-	if cfg.ACMEDomain == "" {
-		// 没有 ACME：明文 HTTP，TLS 由前面的反代负责
-		log.Printf("订阅服务在 %s（base=%s，明文，TLS 交给反代）", cfg.Listen, cfg.Base)
-		go func() { _ = server.Serve(listener) }()
-	} else {
-		if err = serveACME(ctx, server, listener, cfg); err != nil {
+	mux.HandleFunc("/sub/", h.subscription)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "vega sub ok") })
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
+	var challenge *http.Server
+	var challengeListener net.Listener
+	if cfg.ACMEDomain != "" {
+		if cfg.ACMECacheDir == "" {
+			return fmt.Errorf("ACME requires acme_cache")
+		}
+		if err := os.MkdirAll(cfg.ACMECacheDir, 0700); err != nil {
 			return err
 		}
+		base, err := url.Parse(cfg.Base)
+		if err != nil || base.Scheme != "https" || base.Hostname() != cfg.ACMEDomain || base.User != nil {
+			return fmt.Errorf("ACME base must be an HTTPS URL for the configured domain")
+		}
+		manager := &autocert.Manager{Prompt: autocert.AcceptTOS, HostPolicy: autocert.HostWhitelist(cfg.ACMEDomain), Cache: autocert.DirCache(cfg.ACMECacheDir), Email: cfg.ACMEEmail}
+		server.TLSConfig = manager.TLSConfig()
+		server.TLSConfig.MinVersion = tls.VersionTLS12
+		challenge = &http.Server{Handler: manager.HTTPHandler(httpsRedirect(base)), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+		httpAddr := cfg.ACMEHTTPAddr
+		if httpAddr == "" {
+			httpAddr = ":80"
+		}
+		challengeListener, err = net.Listen("tcp", httpAddr)
+		if err != nil {
+			return fmt.Errorf("ACME HTTP listen: %w", err)
+		}
+		defer challengeListener.Close()
+	} else if cfg.CertFile != "" {
+		pair, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+		if err != nil {
+			return fmt.Errorf("load subscription certificate: %w", err)
+		}
+		server.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{pair}}
 	}
-
-	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	return server.Shutdown(shutdownCtx)
-}
-
-// serveACME 用 Let's Encrypt 自动签发并续期证书。
-//
-// 为什么内置而不是让用户配反代：订阅域名是客户端唯一要知道的地址，
-// 证书过期会让所有客户端同时拉不到订阅，而续期失败往往没人发现。
-// autocert 会在到期前 30 天自动续，并把证书落盘到 CacheDir。
-//
-// 同时开 :80 是必须的——HTTP-01 挑战走 80，而且用户输 http:// 时
-// 要能跳到 https。
-func serveACME(ctx context.Context, server *http.Server, listener net.Listener, cfg Config) error {
-	if cfg.ACMECacheDir == "" {
-		return fmt.Errorf("启用 ACME 时必须给 acme_cache（证书要落盘，否则每次重启都重新签发，会撞 Let's Encrypt 的频率限制）")
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("subscription listen: %w", err)
 	}
-	if err := os.MkdirAll(cfg.ACMECacheDir, 0o700); err != nil {
-		return fmt.Errorf("建 ACME 缓存目录失败: %w", err)
-	}
-	manager := &autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(cfg.ACMEDomain),
-		Cache:      autocert.DirCache(cfg.ACMECacheDir),
-		Email:      cfg.ACMEEmail,
-	}
-
-	// :80 只做挑战应答与跳转
-	httpAddr := cfg.ACMEHTTPAddr
-	if httpAddr == "" {
-		httpAddr = ":80"
-	}
-	redirect := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		target := "https://" + r.Host + r.URL.RequestURI()
-		http.Redirect(w, r, target, http.StatusMovedPermanently)
-	})
-	challengeServer := &http.Server{
-		Addr:              httpAddr,
-		Handler:           manager.HTTPHandler(redirect),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	go func() {
-		if err := challengeServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("ACME 挑战服务退出: %v", err)
+	defer listener.Close()
+	servers := []*http.Server{server}
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, srv := range servers {
+			if err := srv.Shutdown(shutdown); err != nil {
+				_ = srv.Close()
+			}
 		}
 	}()
+	failures := make(chan error, 2)
+	if challenge != nil {
+		servers = append(servers, challenge)
+		go func() { failures <- challenge.Serve(challengeListener) }()
+	}
+	useTLS := server.TLSConfig != nil
 	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = challengeServer.Shutdown(shutdownCtx)
+		if useTLS {
+			failures <- server.ServeTLS(listener, "", "")
+		} else {
+			failures <- server.Serve(listener)
+		}
 	}()
+	log.Printf("subscription listening on %s (TLS=%t)", listener.Addr(), useTLS)
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-failures:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
 
-	// 用 manager.TLSConfig() 而不是只塞 GetCertificate：它会把
-	// acme-tls/1 加进 NextProtos 并装好 ALPN 回调，这样 Let's Encrypt
-	// 的 TLS-ALPN-01 挑战也能应答。只给 GetCertificate 的话，对方发
-	// acme-tls/1 会撞上 "client requested unsupported application
-	// protocols" 然后回退到 HTTP-01——能签成，但日志里全是告警。
-	tlsConfig := manager.TLSConfig()
-	tlsConfig.MinVersion = tls.VersionTLS12
-	server.TLSConfig = tlsConfig
-	log.Printf("订阅服务在 %s（base=%s，ACME 域名 %s，缓存 %s）", cfg.Listen, cfg.Base, cfg.ACMEDomain, cfg.ACMECacheDir)
-	go func() { _ = server.ServeTLS(listener, "", "") }()
-	return nil
+func httpsRedirect(base *url.URL) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		target := *base
+		target.Path, target.RawPath, target.RawQuery = r.URL.Path, r.URL.RawPath, r.URL.RawQuery
+		http.Redirect(w, r, target.String(), http.StatusMovedPermanently)
+	})
 }
 
 type handler struct {
@@ -152,16 +157,16 @@ type handler struct {
 
 // subscription 处理 /sub/<token>[/<format>]。
 //
-// token 放在路径里而不是查询串：查询串更容易被日志和 Referer 带出去，
-// 而且路径形式对各类客户端的自定义订阅地址更友好。
+// The path contains a bearer credential; reverse proxies must redact access logs.
 func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "只接受 GET", http.StatusMethodNotAllowed)
 		return
 	}
 	rest := strings.TrimPrefix(r.URL.Path, "/sub/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
-	if len(parts) == 0 || parts[0] == "" {
+	if len(parts) == 0 || len(parts) > 2 || parts[0] == "" {
 		http.Error(w, "缺少订阅 token", http.StatusNotFound)
 		return
 	}
@@ -199,6 +204,8 @@ func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
 		body, skipped, err = Clash(h.st, user)
 	case "singbox", "sing-box", "json":
 		body, skipped, err = Singbox(h.st, user)
+	case "plain", "base64":
+		body, skipped, err = Links(h.st, user, format == "base64")
 	case "nowhere", "nw3":
 		body, skipped, err = Nowhere(h.st, user)
 	default:
@@ -216,9 +223,12 @@ func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentTypeFor(format))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Profile-Update-Interval", fmt.Sprint(int(h.cfg.Interval.Hours())))
+	w.Header().Set("Profile-Title", "base64:"+base64.StdEncoding.EncodeToString([]byte(h.st.Setting("sub_title", "Vega"))))
 	// clash / mihomo 读这个头在节点列表里显示用量
 	w.Header().Set("Subscription-Userinfo", h.userinfo(user))
-	_, _ = w.Write([]byte(body))
+	if r.Method != http.MethodHead {
+		_, _ = w.Write([]byte(body))
+	}
 }
 
 // blocked 返回空串表示放行，否则返回给客户端看的原因。
@@ -273,7 +283,7 @@ func contentTypeFor(format string) string {
 	switch format {
 	case "clash", "mihomo", "yaml":
 		return "text/yaml; charset=utf-8"
-	case "nowhere", "nw3":
+	case "nowhere", "nw3", "plain", "base64":
 		// 纯文本 URI 列表，不是 YAML 也不是 JSON
 		return "text/plain; charset=utf-8"
 	default:

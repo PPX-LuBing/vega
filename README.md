@@ -5,6 +5,7 @@
 名字取自织女星——与北极星同属亮星，都是「导航」的意象。
 
 最近一次自有模块审核、修复验证与升级注意见 [`AUDIT-2026-11-01.md`](AUDIT-2026-11-01.md)。
+本轮订阅修复、北极星功能对照及隐私边界见 [`AUDIT-2026-11-02.md`](AUDIT-2026-11-02.md)。
 
 ```
 vega/
@@ -63,7 +64,7 @@ go test -race -tags with_v2ray_api ./protocol/nowhere/... ./experimental/v2rayap
 vega check -c config.json     # 任何合法 sing-box 配置都能跑
 ```
 
-`panel/` 目前只**管理**其中 6 种（`nowhere` / `anytls` / `hysteria2` / `vless` / `trojan` / `shadowsocks`）——其余协议手写配置即可，内核照样支持。
+`panel/` 目前**管理**其中 7 种（`nowhere` / `anytls` / `hysteria2` / `vless` / `vmess` / `trojan` / `shadowsocks`）。VMess/VLESS/Trojan 支持 TCP、WS、gRPC、HTTPUpgrade；REALITY 限 VLESS TCP。其余协议手写配置即可，能力取决于内核编译标签。**不实现 XHTTP，不扩展非 Nowhere 的内核热更新接口，不做 Web UI。**
 
 ## 自有扩展
 
@@ -114,7 +115,7 @@ Authorization: Bearer <control_secret>
 
 ```sh
 cd panel
-go build -o vega-panel .
+go build -trimpath -o vega-panel .
 ./vega-panel                      # TUI
 ./vega-panel apply                # 下发到所有机器并重启
 ./vega-panel user sync            # 运行期改用户（不重启，仅 nowhere）
@@ -122,6 +123,10 @@ go build -o vega-panel .
 ./vega-panel status               # 全部机器内核运行状态
 ./vega-panel enforce              # 采集并执行配额/到期，配置变化的机器会重启
 ./vega-panel enforce --watch --interval 30s  # 持续轮询，Ctrl+C 或 SIGTERM 停止
+./vega-panel doctor               # 验证节点参数及本机内核配置，不部署/重启
+./vega-panel traffic --hours 24 --json
+./vega-panel events --limit 50
+./vega-panel selftest --user alice --node hk-vmess  # 显式发起经代理的 HTTP 204 探测
 ```
 
 五个页面：**概览 / 节点 / 用户 / 流量 / 机器**。按键 `1-5` 切页、`a` 新增、`e` 编辑、`d` 删除、`空格` 启停、`r` 下发全部、`c` 采集全部、`s` 改用户、`x` 采集后执行配额、`u` 刷新全部状态。下发/采集/同步/探测均在后台执行；运行中可切页或退出，重复写操作会被阻止。
@@ -135,6 +140,60 @@ go build -o vega-panel .
 | 多机编排 | 登记多台机器，`apply` 逐台 scp + 校验 + 原子替换 + 重启 |
 | 可观测性 | 全机读取 clash_api，概览汇总已成功机器，机器页逐台显示版本与服务状态；本机直连、远端通过 SSH |
 
+### 节点、订阅与编辑
+
+```sh
+vega-panel node add hk-vmess --proto vmess --port 8443 --tls tls \
+  --cert /etc/ssl/vega/fullchain.pem --key /etc/ssl/vega/private.key \
+  --sni proxy.example.com --transport ws --path /proxy --host proxy.example.com
+vega-panel node set hk-vmess --entry-host 'relay.example.com,192.0.2.10' --entry-port 443
+vega-panel user add alice --quota 100 --days 30
+vega-panel user grant alice hk-vmess
+vega-panel user set alice --remark 'updated'  # 仅改显式字段，不改期限或凭据
+vega-panel setting set sub_host proxy.example.com
+vega-panel setting set sub_base https://sub.example.com
+vega-panel setting set sub_title Vega
+vega-panel user link alice
+vega-panel user qr alice --format singbox
+```
+
+`node add` / `user add` 不覆盖已有记录，修改请用 `set`。TUI 节点表单支持证书、REALITY 目标、传输与中转字段，长表单随光标滚动。REALITY 密钥用本机标准库生成；普通 TLS 必须填写证书和私钥路径，实际文件由 `doctor` / `apply` 的内核校验检查。
+
+入口地址优先于 `sub_host`，逗号分隔时展开多个入口；未填入口端口则沿用节点端口。`--entry-sni` 只覆盖客户端 SNI。`--fingerprint` 用于 TCP TLS；Hysteria2 的 QUIC TLS 不使用 uTLS 指纹。新增字段随数据库打开自动迁移，升级前仍应备份。
+
+订阅支持 `/clash`、`/singbox`、`/nowhere`、`/plain`、`/base64`。Clash 会明确跳过 Nowhere、HTTPUpgrade 和无 TLS 的 Trojan 节点；Nowhere 需要本仓库内核或兼容的官方客户端。sing-box 配置带 `127.0.0.1:2080` mixed 入口，节点备注重名与保留名会确定性去重。通用分享 URI 的导入能力因客户端而异，以原生 JSON/YAML 订阅为准。**订阅 URL、分享链接、二维码、`show`、`user show` 输出均是敏感凭据，不要公开。**
+
+sing-box 使用原生 SRS/JSON 规则，不再把 MRS 当作 SRS。`cn_additional` 使用 [YiXuanZX 的同源转换 SRS](https://raw.githubusercontent.com/YiXuanZX/sing-box-geosite/main/rule/cn-additional-list-clash.srs)，已恢复与 Clash 预设对应的 UDP/443 封禁条件：只在不命中国内域名或国内 IP 规则集时拒绝，TCP 不受此规则影响。此策略按端口匹配，不保证所有 UDP/443 都是 QUIC；它是预设策略，不是协议限制。转换仓库每日更新，与原作者可能有同步延迟。sing-box 广告规则直接执行 reject，不能像 Clash 的 AdBlock 组一样临时切到直连。外部规则来源可见于 `panel/internal/sub/rules.go`，需要信任并能访问这些第三方服务；它们会看到下载请求的公网 IP，但请求不包含用户代理密钥。
+
+订阅可以在反代后使用 HTTP，也可以自行提供证书：
+
+```sh
+vega-panel serve --tls-cert /etc/ssl/vega/fullchain.pem --tls-key /etc/ssl/vega/private.key --acme-tls :8443
+# 自动签发（公网域名和挑战端口必须可达）
+vega-panel serve --acme-domain sub.example.com --acme-cache /var/lib/sbx-panel/acme --acme-tls :443
+```
+
+TLS 模式由 `--acme-tls` 指定监听地址；明文模式使用 `--listen`。自备证书与 ACME 不能同时启用。反向代理必须隐藏 `/sub/<token>` 访问日志，避免订阅令牌被记录。
+
+### 计费、历史与告警
+
+```sh
+vega-panel setting set traffic_rate 1.5
+vega-panel setting set quota_reset_day 1
+vega-panel setting set alert_webhook https://alerts.example.com/vega
+vega-panel alert --test
+vega-panel traffic --hours 168 --json
+vega-panel events --limit 100 --json
+```
+
+- 倍率默认 1，范围 `(0,1000]`，最多六位小数，只计入新采样差额；使用定点整数和小数余量，不重新计算历史账单。小时历史显示**计费流量**，不是网卡原始流量，按采集时间归入小时；保留最近 30 天，不会回填升级前小时数据。
+- 月度重置默认关闭，`quota_reset_day=1..28` 启用，`0` 关闭；由 `collect` / `enforce` 触发，按面板进程本地时区。首次启用或更改重置日只建立基线，不立即清账；之后每周期只清一次配额用量，不清原始采样点和小时历史，不启用被手工停用或到期的用户。
+- 轮询不是精确账期边界：跨界的未采样增量记到新周期；长期离线无法从累计计数还原真实发生时间。只运行订阅服务不触发重置，持续运营应显式启用 enforce watcher。
+- 80% 用量、超额、到期、停用及恢复等状态变化写入事件，重复轮询不刷屏。配置 webhook 后发送 JSON `{text, events}`，包含面板用户名和用量，**不包含代理密码、订阅 token 或共享密钥**。仅配置你信任的接收端，推荐 HTTPS；未配置不发送。发送超时/失败记为 `alert_error`，当前是尽力发送，不提供持久重试或送达保证；失败不阻断计费和配额执行。事件保留 90 天，由采集清理。
+- `doctor` 不校验远端主机上的证书和内核，明确输出 SKIP；`selftest` 启动带随机 SOCKS 凭据的临时本地客户端，通过指定用户/节点的第一个入口探测，结束时清理，不重启服务端。它验证连通性与耗时，不验证匿名性、出口 IP 或全部入口；请求会产生实际代理流量。
+
+设置项现在拒绝未知键，避免“保存成功但功能未实现”。支持 `sub_host`、`sub_base`、`sub_title`、`extra_config`、`traffic_rate`、`quota_reset_day`、`alert_webhook`。`setting get` 仍是管理员的原始值读取命令，不要把含 webhook 凭据或 extra_config 的输出公开。
+
 ### 配额执行与运维边界
 
 `collect` 只入库，不改认证或中断连接。`enforce` 先采集所有管理机器的用量，再按全局共享配额生成各机器配置；只有配置内容变化时才校验、替换和重启对应机器。**重启会断开那台机器的所有用户连接，不只超额用户**。`user sync` 则不重启，只影响 Nowhere 新认证，已建立连接不受影响。
@@ -147,7 +206,7 @@ go build -o vega-panel .
 
 ```sh
 # 内核（需要 Go 1.26+）
-go build -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_v2ray_api" \
+go build -trimpath -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0,with_v2ray_api" \
   -o vega ./cmd/sing-box
 ```
 
@@ -162,6 +221,17 @@ go build -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_ac
 ```
 
 统计工具也需要单独构建：`(cd tools/sbstats && go build -o sb-stats .)`。
+
+### Linux 安装（显式执行，不自动启动）
+
+```sh
+# 在目标系统上准备好三个二进制，再运行：
+sudo sh deploy/install.sh ./vega ./panel/vega-panel ./tools/sbstats/sb-stats
+```
+
+配套安装路径使用面板默认的 `/usr/local/bin/sbx`、`sbx-panel`、`sb-stats` 与 `/usr/local/etc/sbx/config.json`；安装 `sbx.service`、`sbx-sub.service`、`sbx-enforce.service`，不覆盖数据库和配置，不启动或启用服务。升级已有部署时先采集、备份并停止相应服务，再替换二进制。
+
+创建节点/用户/授权和订阅设置，完成 `sbx-panel doctor`、`sbx-panel apply` 后，再按需显式执行 `sudo systemctl enable --now sbx sbx-sub sbx-enforce`。默认订阅仅监听回环 HTTP，公网使用前须配置 HTTPS 反代或覆盖订阅服务的 ExecStart 使用证书。安装器支持 `DESTDIR` 暂存打包；`sh deploy/install_test.sh` 验证不会覆盖现有配置/数据库或自动启用服务。继承上游的 `release/local/install.sh` 仍是 sing-box 原路径安装器，不是面板全组件安装器。
 
 面板首次运行会创建数据库父目录，数据库权限设为 `0600`。本机和远端下发都先校验临时配置，再替换；重启失败时恢复旧配置并尝试重启旧服务。流量按稳定机器名及内核实例的累计计数计算差额，流量与采样点一起事务提交，失败重试不会重复计费。重启前请先执行 `collect`，避免丢失尚未采集的内存计数；断电或崩溃仍可能丢失末次采样后尚未入库的流量。不要另用 `sb-stats -reset` 清零正在由面板采集的内核，也不要随意删除重建机器记录来更换计费来源名。
 
@@ -198,7 +268,7 @@ Vega 站在这些项目的肩膀上：
 `LICENSE` 放的是 GPL-3.0 的标准正文（不放自定义声明，这样 GitHub 能正确识别许可类型）；
 各方的版权署名与完整致谢在 [`NOTICE`](NOTICE)。
 
-    Vega                Copyright (C) 2026 PPX-LuBing <1711958652@qq.com>
+    Vega                Copyright (C) 2026 PPX-LuBing
     sing-box            Copyright (C) 2022 nekohasekai <contact-sagernet@sekai.icu>
     nowhere-go          Copyright (C) 2026 ohmycggk
 

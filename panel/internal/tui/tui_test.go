@@ -110,6 +110,40 @@ func TestInvalidFormLimitsDoNotBecomeUnlimited(t *testing.T) {
 	}
 }
 
+func TestNodeFormCanCreateTLSAndRealityNodes(t *testing.T) {
+	m := testModel(t)
+	for _, n := range []store.Node{
+		{Tag: "tls-form", Proto: store.ProtoNowhere, Port: 8443, TLSMode: "tls", CertPath: "cert.pem", KeyPath: "key.pem", Machine: store.LocalMachine},
+		{Tag: "reality-form", Proto: store.ProtoVLESS, Port: 8444, TLSMode: "reality", SNI: "example.com", Dest: "example.com:443", Machine: store.LocalMachine},
+	} {
+		fields := nodeFields(n)
+		values := make([]string, len(fields))
+		for i, f := range fields {
+			values[i] = f.def
+		}
+		if err := m.submitNodeForm(values); err != nil {
+			t.Fatal(err)
+		}
+		saved, err := m.store.Node(n.Tag)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ValidateNode(saved); err != nil {
+			t.Fatal(err)
+		}
+		if n.TLSMode == "reality" && (saved.PrivKey == "" || saved.PubKey == "") {
+			t.Fatal("REALITY keys not generated")
+		}
+	}
+	m.height = 24
+	m.form = newForm("node", nodeFields(store.Node{}), nil)
+	m.form.cursor = len(m.form.fields) - 1
+	view := m.viewForm()
+	if !strings.Contains(view, "18") || strings.Count(view, "\n") > 18 {
+		t.Fatal("form does not scroll to last field")
+	}
+}
+
 func TestEditRemarkPreservesExpiry(t *testing.T) {
 	for _, delta := range []time.Duration{-time.Hour, time.Hour, 30 * 24 * time.Hour} {
 		m := testModel(t)

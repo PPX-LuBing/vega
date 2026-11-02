@@ -485,14 +485,7 @@ func (m *Model) startDelete() (tea.Model, tea.Cmd) {
 func (m *Model) startAdd() (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabNodes:
-		m.form = newForm("新增节点", []field{
-			{label: "tag", hint: "唯一标识，如 hk-nowhere"},
-			{label: "协议", hint: "nowhere/anytls/hysteria2/vless/trojan/shadowsocks", def: store.ProtoNowhere},
-			{label: "端口", hint: "1-65535"},
-			{label: "TLS 模式", hint: "tls/reality/none", def: "tls"},
-			{label: "SNI", hint: "证书域名或 REALITY 伪装域名"},
-			{label: "备注", hint: "给人看的名字"},
-		}, m.submitNodeForm)
+		m.form = newForm("新增节点", nodeFields(store.Node{Proto: store.ProtoNowhere, TLSMode: "tls", Machine: store.LocalMachine, Transport: "tcp", Path: "/", Fingerprint: "chrome"}), m.submitNodeForm)
 		m.mode = modeForm
 	case tabUsers:
 		m.form = newForm("新增用户", []field{
@@ -512,17 +505,18 @@ func (m *Model) startEdit() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		node := m.nodes[m.cursor]
-		m.form = newForm("编辑节点 "+node.Tag, []field{
-			{label: "端口", def: strconv.Itoa(node.Port)},
-			{label: "TLS 模式", def: node.TLSMode},
-			{label: "SNI", def: node.SNI},
-			{label: "备注", def: node.Remark},
-		}, func(values []string) error {
-			node.Port, _ = strconv.Atoi(strings.TrimSpace(values[0]))
-			node.TLSMode = strings.TrimSpace(values[1])
-			node.SNI = strings.TrimSpace(values[2])
-			node.Remark = strings.TrimSpace(values[3])
-			return m.store.SaveNode(node)
+		m.form = newForm("编辑节点 "+node.Tag, nodeFields(node), func(values []string) error {
+			edited, err := parseNodeForm(values, node)
+			if err != nil {
+				return err
+			}
+			if edited.Tag != node.Tag {
+				return fmt.Errorf("节点 tag 不可修改")
+			}
+			if err = store.PrepareNode(&edited); err != nil {
+				return err
+			}
+			return m.store.SaveNode(edited)
 		})
 		m.mode = modeForm
 	case tabUsers:
@@ -556,27 +550,51 @@ func (m *Model) startEdit() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *Model) submitNodeForm(values []string) error {
-	tag := strings.TrimSpace(values[0])
-	proto := strings.TrimSpace(values[1])
-	port, err := strconv.Atoi(strings.TrimSpace(values[2]))
+func nodeFields(n store.Node) []field {
+	return []field{
+		{label: "tag", def: n.Tag}, {label: "协议", def: n.Proto, hint: "nowhere/anytls/hysteria2/vless/vmess/trojan/shadowsocks"},
+		{label: "端口", def: strconv.Itoa(n.Port)}, {label: "TLS 模式", def: n.TLSMode}, {label: "SNI", def: n.SNI}, {label: "备注", def: n.Remark},
+		{label: "证书路径", def: n.CertPath}, {label: "私钥路径", def: n.KeyPath}, {label: "REALITY dest", def: n.Dest},
+		{label: "机器", def: n.Machine}, {label: "接入地址", def: n.EntryHost, hint: "多个地址以逗号分隔"}, {label: "接入端口", def: strconv.Itoa(n.EntryPort)},
+		{label: "入口 SNI", def: n.EntrySNI}, {label: "传输", def: n.Transport, hint: "tcp/ws/grpc/httpupgrade"},
+		{label: "路径", def: n.Path}, {label: "Host", def: n.Host}, {label: "gRPC service", def: n.GRPCService}, {label: "TLS 指纹", def: n.Fingerprint},
+	}
+}
+
+func parseNodeForm(v []string, n store.Node) (store.Node, error) {
+	if len(v) != 18 {
+		return n, fmt.Errorf("节点表单不完整")
+	}
+	for i := range v {
+		v[i] = strings.TrimSpace(v[i])
+	}
+	port, err := strconv.Atoi(v[2])
 	if err != nil {
-		return fmt.Errorf("端口不是数字")
+		return n, fmt.Errorf("端口不是数字")
 	}
-	node := store.Node{
-		Tag: tag, Proto: proto, Port: port,
-		TLSMode: strings.TrimSpace(values[3]),
-		SNI:     strings.TrimSpace(values[4]),
-		Remark:  strings.TrimSpace(values[5]),
-		Listen:  "0.0.0.0",
-		Enabled: true,
-		Morph:   true,
+	entryPort, err := strconv.Atoi(v[11])
+	if err != nil {
+		return n, fmt.Errorf("接入端口不是数字")
 	}
-	if node.Remark == "" {
-		node.Remark = tag
+	n.Tag, n.Proto, n.Port, n.TLSMode, n.SNI, n.Remark = v[0], v[1], port, v[3], v[4], v[5]
+	n.CertPath, n.KeyPath, n.Dest, n.Machine, n.EntryHost, n.EntryPort = v[6], v[7], v[8], v[9], v[10], entryPort
+	n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint = v[12], v[13], v[14], v[15], v[16], v[17]
+	if n.Remark == "" {
+		n.Remark = n.Tag
 	}
-	if proto == store.ProtoShadowsocks && node.SSPassword == "" {
-		node.SSPassword = store.NewSecret()
+	return n, nil
+}
+
+func (m *Model) submitNodeForm(values []string) error {
+	node, err := parseNodeForm(values, store.Node{Enabled: true, Morph: true, Listen: "0.0.0.0"})
+	if err != nil {
+		return err
+	}
+	if _, err = m.store.Node(node.Tag); err == nil {
+		return fmt.Errorf("节点已存在，请编辑")
+	}
+	if err = store.PrepareNode(&node); err != nil {
+		return err
 	}
 	return m.store.SaveNode(node)
 }
@@ -598,6 +616,9 @@ func (m *Model) submitUserForm(values []string) error {
 	}
 	if user.Name == "" {
 		return fmt.Errorf("用户名不能为空")
+	}
+	if _, err := m.store.User(user.Name); err == nil {
+		return fmt.Errorf("用户已存在，请编辑")
 	}
 	return m.store.SaveUser(user)
 }
@@ -940,7 +961,13 @@ func (m *Model) viewForm() string {
 	var b strings.Builder
 	b.WriteString(styleTitle.Render("  " + f.title))
 	b.WriteString("\n\n")
-	for i, fd := range f.fields {
+	visible := len(f.fields)
+	if m.height > 0 {
+		visible = min(visible, max(3, m.height-12))
+	}
+	start := min(max(0, f.cursor-visible/2), len(f.fields)-visible)
+	for i := start; i < start+visible; i++ {
+		fd := f.fields[i]
 		label := fmt.Sprintf("  %-12s", fd.label)
 		value := f.values[i]
 		if i == f.cursor {
@@ -952,6 +979,9 @@ func (m *Model) viewForm() string {
 			b.WriteString(styleHelp.Render("  " + fd.hint))
 		}
 		b.WriteString("\n")
+	}
+	if visible < len(f.fields) {
+		b.WriteString(styleDim.Render(fmt.Sprintf("  %d-%d / %d (Tab / Shift+Tab)", start+1, start+visible, len(f.fields))) + "\n")
 	}
 	if f.message != "" {
 		b.WriteString("\n" + styleErr.Render("  "+f.message) + "\n")

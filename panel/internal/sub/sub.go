@@ -28,6 +28,7 @@ type endpoint struct {
 	// 有中转时这里是接入点（前置），直连时就是节点自己的地址。
 	Host string
 	Port int
+	name string
 }
 
 // Name 是订阅里这个节点的显示名。
@@ -35,6 +36,9 @@ type endpoint struct {
 // 用「用户可读的中文名」而不是 tag：客户端列表里 tag 看不出是什么，
 // 而按国家/机房命名一眼就知道选哪个。备注为空时退回 tag。
 func (e endpoint) Name() string {
+	if e.name != "" {
+		return e.name
+	}
 	if e.Node.Remark != "" {
 		return e.Node.Remark
 	}
@@ -77,40 +81,45 @@ func Endpoints(st *store.Store, u store.User) ([]endpoint, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	var (
-		out    []endpoint
-		skip   []string
-		hostOf = map[string]string{}
-	)
+	var out []endpoint
+	var skip []string
+	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Tag < nodes[j].Tag })
+	usedNames := map[string]bool{"proxy": true, "auto": true, "direct": true, "PROXY": true, "AUTO": true, "DIRECT": true, "REJECT": true}
+	for _, g := range presetGroups {
+		usedNames[g.Name] = true
+	}
 	for _, n := range nodes {
 		if !n.Enabled || !granted[n.Tag] {
 			continue
 		}
-		host, ok := hostOf[n.Machine]
-		if !ok {
+		host := strings.TrimSpace(n.EntryHost)
+		if host == "" {
 			host, err = SubHost(st, n)
 			if err != nil {
-				// 地址缺一个不影响其它节点，但要如实报出来
 				skip = append(skip, fmt.Sprintf("%s: %v", n.Tag, err))
-				hostOf[n.Machine] = ""
 				continue
 			}
-			hostOf[n.Machine] = host
-		}
-		if host == "" {
-			skip = append(skip, n.Tag+": 该机器的地址解析不到")
-			continue
 		}
 		// 有接入点就用接入点：客户端连前置，由前置转到中转再落到本机。
 		// 发直连地址会让客户端绕开中转，延迟从几十毫秒涨到几百毫秒。
 		port := n.Port
-		if n.EntryHost != "" && n.EntryPort > 0 {
-			host = n.EntryHost
+		if n.EntryPort > 0 {
 			port = n.EntryPort
 		}
-		out = append(out, endpoint{Node: n, User: u, Host: host, Port: port})
+		for _, h := range strings.Split(host, ",") {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			e := endpoint{Node: n, User: u, Host: h, Port: port}
+			base, name := e.Name(), e.Name()
+			for suffix := 2; usedNames[name]; suffix++ {
+				name = fmt.Sprintf("%s [%s-%d]", base, n.Tag, suffix)
+			}
+			e.name, usedNames[name] = name, true
+			out = append(out, e)
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Node.Tag < out[j].Node.Tag })
 	return out, skip, nil
 }
 
@@ -166,7 +175,6 @@ func Clash(st *store.Store, u store.User) (string, []string, error) {
 		for _, m := range g.Members {
 			b.WriteString("      - " + yamlQuote(m) + "\n")
 		}
-		b.WriteString("      - PROXY\n")
 	}
 
 	b.WriteString("\nrule-providers:\n")
@@ -189,10 +197,12 @@ func Clash(st *store.Store, u store.User) (string, []string, error) {
 	return b.String(), skipped, nil
 }
 
-
 // clashProxy 把单个节点渲染成 clash 的 proxy 条目。不支持的协议返回 false。
 func clashProxy(e endpoint) (string, bool) {
 	n, u := e.Node, e.User
+	if n.EntrySNI != "" {
+		n.SNI = n.EntrySNI
+	}
 	var b strings.Builder
 	line := func(k, v string) {
 		b.WriteString("    " + k + ": " + v + "\n")
@@ -200,7 +210,7 @@ func clashProxy(e endpoint) (string, bool) {
 	head := func(kind string) {
 		b.WriteString("  - name: " + yamlQuote(e.Name()) + "\n")
 		line("type", kind)
-		line("server", e.Host)
+		line("server", yamlQuote(e.Host))
 		line("port", fmt.Sprint(e.Port))
 	}
 
@@ -221,17 +231,24 @@ func clashProxy(e endpoint) (string, bool) {
 		if n.DownMbps > 0 {
 			line("down", yamlQuote(fmt.Sprintf("%d Mbps", n.DownMbps)))
 		}
-		line("skip-cert-verify", "false")
 		line("udp", "true")
 
-	case store.ProtoVLESS:
-		head("vless")
+	case store.ProtoVLESS, store.ProtoVMess:
+		head(n.Proto)
+		if n.Proto == store.ProtoVMess {
+			line("alterId", "0")
+			line("cipher", "auto")
+		}
 		line("uuid", yamlQuote(u.UUID))
 		line("udp", "true")
 		if n.TLSMode == "reality" {
 			line("tls", "true")
 			line("servername", yamlQuote(n.SNI))
-			line("client-fingerprint", "chrome")
+			fingerprint := n.Fingerprint
+			if fingerprint == "" {
+				fingerprint = "chrome"
+			}
+			line("client-fingerprint", yamlQuote(fingerprint))
 			b.WriteString("    reality-opts:\n")
 			b.WriteString("      public-key: " + yamlQuote(n.PubKey) + "\n")
 			b.WriteString("      short-id: " + yamlQuote(n.ShortID) + "\n")
@@ -241,6 +258,9 @@ func clashProxy(e endpoint) (string, bool) {
 		}
 
 	case store.ProtoTrojan:
+		if n.TLSMode == "none" {
+			return "", false // Mihomo's Trojan client always uses TLS.
+		}
 		head("trojan")
 		line("password", yamlQuote(u.Password))
 		clashTLS(&b, n)
@@ -267,6 +287,21 @@ func clashProxy(e endpoint) (string, bool) {
 	default:
 		return "", false
 	}
+	if n.Transport != "" && n.Transport != "tcp" {
+		if n.Transport == "httpupgrade" {
+			return "", false
+		}
+		line("network", yamlQuote(n.Transport))
+		if n.Transport == "ws" {
+			b.WriteString("    ws-opts:\n      path: " + yamlQuote(n.Path) + "\n")
+			if n.Host != "" {
+				b.WriteString("      headers:\n        Host: " + yamlQuote(n.Host) + "\n")
+			}
+		}
+		if n.Transport == "grpc" {
+			b.WriteString("    grpc-opts:\n      grpc-service-name: " + yamlQuote(n.GRPCService) + "\n")
+		}
+	}
 	return b.String(), true
 }
 
@@ -274,9 +309,16 @@ func clashProxy(e endpoint) (string, bool) {
 func clashForceTLS(b *strings.Builder, n store.Node) {
 	b.WriteString("    tls: true\n")
 	if n.SNI != "" {
-		b.WriteString("    sni: " + yamlQuote(n.SNI) + "\n")
+		key := "sni"
+		if n.Proto == store.ProtoVLESS || n.Proto == store.ProtoVMess {
+			key = "servername"
+		}
+		b.WriteString("    " + key + ": " + yamlQuote(n.SNI) + "\n")
 	}
 	b.WriteString("    skip-cert-verify: false\n")
+	if n.Fingerprint != "" && n.Proto != store.ProtoHysteria2 {
+		b.WriteString("    client-fingerprint: " + yamlQuote(n.Fingerprint) + "\n")
+	}
 }
 
 // clashTLS 补上 tls / sni / 跳过校验等公共字段。
@@ -286,9 +328,16 @@ func clashTLS(b *strings.Builder, n store.Node) {
 	}
 	b.WriteString("    tls: true\n")
 	if n.SNI != "" {
-		b.WriteString("    sni: " + yamlQuote(n.SNI) + "\n")
+		key := "sni"
+		if n.Proto == store.ProtoVLESS || n.Proto == store.ProtoVMess {
+			key = "servername"
+		}
+		b.WriteString("    " + key + ": " + yamlQuote(n.SNI) + "\n")
 	}
 	b.WriteString("    skip-cert-verify: false\n")
+	if n.Fingerprint != "" {
+		b.WriteString("    client-fingerprint: " + yamlQuote(n.Fingerprint) + "\n")
+	}
 }
 
 // yamlQuote 给 YAML 标量加双引号。
@@ -331,8 +380,8 @@ func Singbox(st *store.Store, u store.User) (string, []string, error) {
 
 	selector := map[string]any{
 		"type": "selector", "tag": "proxy",
-		"outbounds": append(append([]string{}, names...), "direct"),
-		"default":   names[0],
+		"outbounds": append(append([]string{"auto"}, names...), "direct"),
+		"default":   "auto",
 	}
 	urltest := map[string]any{
 		"type": "urltest", "tag": "auto",
@@ -346,6 +395,9 @@ func Singbox(st *store.Store, u store.User) (string, []string, error) {
 	// 规则里引用到的策略组（AI/Streaming/CDN）必须真的存在出站，
 	// 否则内核加载时报 "outbound not found"。
 	for _, g := range presetGroups {
+		if g.Name == "AdBlock" {
+			continue // sing-box rejects ads with a route action, not a selector member.
+		}
 		members := make([]string, 0, len(g.Members))
 		for _, m := range g.Members {
 			if tag, reject := outboundTag(m); !reject {
@@ -361,6 +413,7 @@ func Singbox(st *store.Store, u store.User) (string, []string, error) {
 
 	cfg := map[string]any{
 		"log":       map[string]any{"level": "info", "timestamp": true},
+		"inbounds":  []any{map[string]any{"type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080}},
 		"outbounds": outbounds,
 		"route": map[string]any{
 			"rules": singboxRouteRules(),
@@ -397,6 +450,9 @@ func Singbox(st *store.Store, u store.User) (string, []string, error) {
 // singboxOutbound 把单个节点渲染成 sing-box 的出站。
 func singboxOutbound(e endpoint) (map[string]any, bool) {
 	n, u := e.Node, e.User
+	if n.EntrySNI != "" {
+		n.SNI = n.EntrySNI
+	}
 	ob := map[string]any{
 		"tag":         e.Name(),
 		"server":      e.Host,
@@ -429,8 +485,12 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 		// hysteria2 跑在 QUIC 上，TLS 是协议的一部分，不给会报 "TLS required"
 		ob["tls"] = forceTLS(n)
 
-	case store.ProtoVLESS:
-		ob["type"] = "vless"
+	case store.ProtoVLESS, store.ProtoVMess:
+		ob["type"] = n.Proto
+		if n.Proto == store.ProtoVMess {
+			ob["security"] = "auto"
+			ob["alter_id"] = 0
+		}
 		ob["uuid"] = u.UUID
 		if n.TLSMode == "reality" {
 			ob["tls"] = map[string]any{
@@ -464,6 +524,12 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 
 	default:
 		return nil, false
+	}
+	if transport := n.TransportConfig(); transport != nil {
+		ob["transport"] = transport
+	}
+	if tls, ok := ob["tls"].(map[string]any); ok && n.Fingerprint != "" && n.Proto != store.ProtoHysteria2 {
+		tls["utls"] = map[string]any{"enabled": true, "fingerprint": n.Fingerprint}
 	}
 	return ob, true
 }
@@ -539,6 +605,9 @@ func Nowhere(st *store.Store, u store.User) (string, []string, error) {
 // nowhereURI 把一条节点记录拼成 vector:// URI。
 func nowhereURI(e endpoint) (string, error) {
 	n := e.Node
+	if n.EntrySNI != "" {
+		n.SNI = n.EntrySNI
+	}
 	key := strings.TrimSpace(e.User.SharedKey)
 	if key == "" {
 		return "", fmt.Errorf("用户没有 nowhere 共享密钥")

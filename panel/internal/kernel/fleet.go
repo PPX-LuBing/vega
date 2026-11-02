@@ -21,6 +21,9 @@ type CollectResult struct {
 
 // CollectAll keeps machine checkpoints independent even when API addresses match.
 func CollectAll(ctx context.Context, st *store.Store, paths Paths) []CollectResult {
+	if _, err := st.ResetMonthly(time.Now()); err != nil {
+		return []CollectResult{{Err: err}}
+	}
 	machines, err := ManagedMachines(st, paths)
 	if err != nil {
 		return []CollectResult{{Err: err}}
@@ -39,6 +42,7 @@ func CollectAll(ctx context.Context, st *store.Store, paths Paths) []CollectResu
 		}
 		results[i] = r
 	})
+	notifyUsage(ctx, st)
 	return results
 }
 

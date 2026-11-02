@@ -1,0 +1,17 @@
+[Unit]
+Description=Vega usage collection and quota enforcement
+After=network-online.target sbx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sbx-panel enforce --watch --interval 30s
+WorkingDirectory=/var/lib/sbx-panel
+StateDirectory=sbx-panel
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

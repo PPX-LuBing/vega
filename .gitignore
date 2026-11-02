@@ -14,3 +14,17 @@
 .idea/
 .vscode/
 .DS_Store
+
+# Local credentials and panel state (never publish).
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+/config.json
+/config.local.json

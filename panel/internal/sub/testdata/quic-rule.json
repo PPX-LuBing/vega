@@ -1,0 +1,9 @@
+{
+  "type": "logical",
+  "mode": "and",
+  "action": "reject",
+  "rules": [
+    {"network": "udp", "port": [443]},
+    {"rule_set": ["cn_additional", "cn_ip"], "invert": true}
+  ]
+}

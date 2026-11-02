@@ -6,8 +6,8 @@
 //	sbx-panel apply                    生成配置并重启内核（可脚本化）
 //	sbx-panel collect                  采集一次流量
 //	sbx-panel enforce [--watch]        采集并执行配额（变化机器会重启）
-//	sbx-panel node add|list|del        节点管理
-//	sbx-panel user add|list|del|grant  用户与授权
+//	sbx-panel node add|set|list|del        节点管理
+//	sbx-panel user add|set|list|del|grant  用户与授权
 //	sbx-panel show                     打印生成的配置（排错用）
 //	sbx-panel status                   内核运行状态（可观测性）
 //	sbx-panel machine add|list|del     多机编排
@@ -168,8 +168,12 @@ func run(args []string) error {
 		return runServe(dbPath, args[1:])
 	case "setting":
 		return runSetting(dbPath, args[1:])
+	case "traffic", "events", "alert", "doctor":
+		return runOperations(dbPath, paths, args)
+	case "selftest":
+		return runSelftest(dbPath, paths, args[1:])
 	default:
-		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / serve / setting / show）", args[0])
+		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / serve / setting / show / traffic / events / alert / doctor）", args[0])
 	}
 }
 
@@ -365,7 +369,7 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 	}
 	defer st.Close()
 	if len(args) == 0 {
-		return fmt.Errorf("用法: node add|list|del")
+		return fmt.Errorf("用法: node add|set|list|del")
 	}
 
 	switch args[0] {
@@ -391,8 +395,8 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		}
 		return nil
 
-	case "add":
-		fs := flag.NewFlagSet("node add", flag.ContinueOnError)
+	case "add", "set":
+		fs := flag.NewFlagSet("node "+args[0], flag.ContinueOnError)
 		proto := fs.String("proto", store.ProtoNowhere, "协议")
 		port := fs.Int("port", 0, "端口")
 		tlsMode := fs.String("tls", "tls", "tls/reality/none")
@@ -408,7 +412,16 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		shortID := fs.String("short-id", "", "REALITY short id")
 		morph := fs.Bool("morph", true, "Nowhere Morph")
 		entryHost := fs.String("entry-host", "", "客户端接入地址（有中转时填，留空=直连本机）")
-		entryPort := fs.Int("entry-port", 0, "客户端接入端口（有中转时填）")
+		entryPort := fs.Int("entry-port", 0, "客户端接入端口，0 跟随监听端口")
+		entrySNI := fs.String("entry-sni", "", "入口 SNI")
+		transport := fs.String("transport", "tcp", "tcp/ws/grpc/httpupgrade")
+		path := fs.String("path", "/", "传输路径")
+		host := fs.String("host", "", "传输 Host")
+		grpcService := fs.String("grpc-service", "", "gRPC service name")
+		fingerprint := fs.String("fingerprint", "", "TCP TLS client fingerprint (REALITY defaults to chrome)")
+		enabled := fs.Bool("enabled", true, "启用节点")
+		up := fs.Int("up-mbps", 0, "Hysteria2 upload Mbps")
+		down := fs.Int("down-mbps", 0, "Hysteria2 download Mbps")
 		if err := fs.Parse(reorderArgs(fs, args[1:])); err != nil {
 			return err
 		}
@@ -416,40 +429,53 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 			return fmt.Errorf("用法: node add <tag> --proto --port")
 		}
 		tag := fs.Arg(0)
-		if (*entryHost == "") != (*entryPort == 0) {
-			return fmt.Errorf("--entry-host 与 --entry-port 要么都给，要么都不给（只给一个说明配置漏了）")
-		}
+
 		node := store.Node{
 			Tag: tag, Proto: *proto, Port: *port, TLSMode: *tlsMode, SNI: *sni,
 			Remark: *remark, Listen: *listen, Enabled: true, Morph: *morph,
 			Dest: *dest, PrivKey: *privKey, PubKey: *pubKey, ShortID: *shortID,
 			CertPath: *cert, KeyPath: *key, Machine: *machineName,
-			EntryHost: *entryHost, EntryPort: *entryPort,
+			EntryHost: *entryHost, EntryPort: *entryPort, EntrySNI: *entrySNI, Transport: *transport, Path: *path, Host: *host, GRPCService: *grpcService, Fingerprint: *fingerprint, UpMbps: *up, DownMbps: *down,
+		}
+		node.Enabled = *enabled
+		if args[0] == "set" {
+			previous, err := st.Node(tag)
+			if err != nil {
+				return err
+			}
+			values := map[string]func(){
+				"proto": func() { previous.Proto = node.Proto }, "port": func() { previous.Port = node.Port }, "tls": func() { previous.TLSMode = node.TLSMode },
+				"sni": func() { previous.SNI = node.SNI }, "cert": func() { previous.CertPath = node.CertPath }, "key": func() { previous.KeyPath = node.KeyPath },
+				"machine": func() { previous.Machine = node.Machine }, "listen": func() { previous.Listen = node.Listen }, "remark": func() { previous.Remark = node.Remark },
+				"dest": func() { previous.Dest = node.Dest }, "priv-key": func() { previous.PrivKey = node.PrivKey }, "pub-key": func() { previous.PubKey = node.PubKey },
+				"short-id": func() { previous.ShortID = node.ShortID }, "morph": func() { previous.Morph = node.Morph }, "enabled": func() { previous.Enabled = node.Enabled },
+				"entry-host": func() { previous.EntryHost = node.EntryHost }, "entry-port": func() { previous.EntryPort = node.EntryPort }, "entry-sni": func() { previous.EntrySNI = node.EntrySNI },
+				"transport": func() { previous.Transport = node.Transport }, "path": func() { previous.Path = node.Path }, "host": func() { previous.Host = node.Host },
+				"grpc-service": func() { previous.GRPCService = node.GRPCService }, "fingerprint": func() { previous.Fingerprint = node.Fingerprint },
+				"up-mbps": func() { previous.UpMbps = node.UpMbps }, "down-mbps": func() { previous.DownMbps = node.DownMbps },
+			}
+			fs.Visit(func(f *flag.Flag) {
+				if apply := values[f.Name]; apply != nil {
+					apply()
+				}
+			})
+			node = previous
+		} else if _, err := st.Node(tag); err == nil {
+			return fmt.Errorf("node already exists; use node set")
 		}
 		if node.Remark == "" {
 			node.Remark = tag
 		}
-		if *proto == store.ProtoShadowsocks && node.SSPassword == "" {
-			node.SSPassword = store.NewSecret()
+		if err := store.PrepareNode(&node); err != nil {
+			return err
 		}
-		// REALITY 密钥对由内核自己生成，避免手填出错格式
-		if node.TLSMode == "reality" && node.PrivKey == "" {
-			priv, pub, err := kernel.GenerateRealityKeypair(paths)
-			if err != nil {
-				return err
-			}
-			node.PrivKey, node.PubKey = priv, pub
-		}
+
 		if err := st.SaveNode(node); err != nil {
 			return err
 		}
-		fmt.Printf("已保存节点 %s（%s，端口 %d）\n", tag, *proto, *port)
+		fmt.Printf("已保存节点 %s（%s，端口 %d）\n", tag, node.Proto, node.Port)
 		if node.PubKey != "" {
 			fmt.Printf("  REALITY 公钥: %s\n", node.PubKey)
-		}
-		if *proto == store.ProtoShadowsocks {
-			saved, _ := st.Node(tag)
-			fmt.Printf("  SS2022 服务端 PSK: %s\n", saved.SSPassword)
 		}
 		return nil
 
@@ -475,13 +501,30 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 	}
 	defer st.Close()
 	if len(args) == 0 {
-		return fmt.Errorf("用法: user add|list|del|grant|revoke|reset|sub|rotate-sub")
+		return fmt.Errorf("用法: user add|set|list|del|grant|revoke|reset|sub|rotate-sub")
 	}
 
 	switch args[0] {
 	case "sub", "rotate-sub":
 		return runUserSub(st, args[0] == "rotate-sub", args[1:])
 
+	case "link":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: user link <name>")
+		}
+		u, err := st.User(args[1])
+		if err != nil {
+			return err
+		}
+		body, skipped, err := sub.Links(st, u, false)
+		if err != nil {
+			return err
+		}
+		fmt.Print(body)
+		for _, message := range skipped {
+			fmt.Fprintln(os.Stderr, message)
+		}
+		return nil
 	case "qr":
 		return runUserQR(st, args[1:])
 
@@ -506,11 +549,12 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 		}
 		return nil
 
-	case "add":
-		fs := flag.NewFlagSet("user add", flag.ContinueOnError)
+	case "add", "set":
+		fs := flag.NewFlagSet("user "+args[0], flag.ContinueOnError)
 		quotaGB := fs.String("quota", "0", "配额 GB，0 不限")
 		days := fs.String("days", "0", "有效天数，0 永久")
 		remark := fs.String("remark", "", "备注")
+		enabled := fs.Bool("enabled", true, "启用用户")
 		if err := fs.Parse(reorderArgs(fs, args[1:])); err != nil {
 			return err
 		}
@@ -530,14 +574,32 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 			Name: name, Remark: *remark, Enabled: true,
 			QuotaBytes: quota, ExpiresAt: expires,
 		}
+		user.Enabled = *enabled
+		if args[0] == "set" {
+			old, err := st.User(name)
+			if err != nil {
+				return err
+			}
+			fs.Visit(func(f *flag.Flag) {
+				switch f.Name {
+				case "quota":
+					old.QuotaBytes = user.QuotaBytes
+				case "days":
+					old.ExpiresAt = user.ExpiresAt
+				case "remark":
+					old.Remark = user.Remark
+				case "enabled":
+					old.Enabled = user.Enabled
+				}
+			})
+			user = old
+		} else if _, err := st.User(name); err == nil {
+			return fmt.Errorf("user already exists; use user set")
+		}
 		if err := st.SaveUser(user); err != nil {
 			return err
 		}
-		saved, _ := st.User(name)
-		fmt.Printf("已创建用户 %s\n", name)
-		fmt.Printf("  UUID:       %s\n", saved.UUID)
-		fmt.Printf("  口令:       %s\n", saved.Password)
-		fmt.Printf("  Nowhere 密钥: %s\n", saved.SharedKey)
+		fmt.Printf("已保存用户 %s（用 user link / user sub 导出凭据）\n", name)
 		return nil
 
 	case "del":
@@ -635,7 +697,9 @@ func runServe(dbPath string, args []string) error {
 	acmeEmail := fs.String("acme-email", "", "ACME 账号邮箱（Let's Encrypt 到期提醒用）")
 	acmeCache := fs.String("acme-cache", "", "ACME 证书缓存目录（启用 ACME 时必填）")
 	acmeHTTP := fs.String("acme-http", ":80", "ACME HTTP-01 挑战与跳转的监听地址")
-	acmeTLS := fs.String("acme-tls", ":443", "ACME 模式下的 HTTPS 监听地址")
+	acmeTLS := fs.String("acme-tls", ":443", "HTTPS 监听地址")
+	certFile := fs.String("tls-cert", "", "订阅证书文件")
+	keyFile := fs.String("tls-key", "", "订阅私钥文件")
 	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
 		return err
 	}
@@ -672,7 +736,7 @@ func runServe(dbPath string, args []string) error {
 		ACMEEmail:    strings.TrimSpace(*acmeEmail),
 		ACMECacheDir: strings.TrimSpace(*acmeCache),
 		ACMEHTTPAddr: *acmeHTTP,
-		ACMETLSAddr:  *acmeTLS,
+		ACMETLSAddr:  *acmeTLS, CertFile: *certFile, KeyFile: *keyFile,
 	})
 }
 
@@ -696,11 +760,14 @@ func runSetting(dbPath string, args []string) error {
 			return fmt.Errorf("用法: setting set <key> <value>")
 		}
 		// 订阅地址相关的键顺手去掉尾部斜杠，避免拼出 //sub/...
-		value := strings.TrimRight(strings.TrimSpace(args[2]), "/")
+		value := strings.TrimSpace(args[2])
+		if args[1] == "sub_base" {
+			value = strings.TrimRight(value, "/")
+		}
 		if err := st.SetSetting(args[1], value); err != nil {
 			return err
 		}
-		fmt.Printf("已设置 %s = %s\n", args[1], value)
+		fmt.Printf("已设置 %s\n", args[1])
 		return nil
 	default:
 		return fmt.Errorf("用法: setting get <key> | setting set <key> <value>")
@@ -751,6 +818,7 @@ func runUserSub(st *store.Store, rotate bool, args []string) error {
 		fmt.Printf("%-12s %s/sub/%s/clash    (clash/mihomo)\n", "", base, token)
 		fmt.Printf("%-12s %s/sub/%s/singbox  (sing-box，含 nowhere)\n", "", base, token)
 		fmt.Printf("%-12s %s/sub/%s/nowhere  (nowhere 官方客户端)\n", "", base, token)
+		fmt.Printf("%-12s %s/sub/%s/base64  (通用链接)\n", "", base, token)
 	}
 	if rotate {
 		fmt.Println("\n旧地址已失效。客户端需要重新拉取。")
@@ -760,27 +828,38 @@ func runUserSub(st *store.Store, rotate bool, args []string) error {
 
 // runUserQR 把订阅地址打成二维码，方便手机扫码导入。
 //
-// 打的是 clash 格式的地址：手机上的客户端绝大多数是 clash 系。
+// Default to sing-box so Nowhere-only users receive a usable subscription.
 // 用终端半块字符渲染，比用 ASCII 双字符紧凑一半。
 func runUserQR(st *store.Store, args []string) error {
 	base := strings.TrimRight(strings.TrimSpace(st.Setting("sub_base", "")), "/")
 	if base == "" {
 		return fmt.Errorf("还没配 sub_base，先执行: setting set sub_base https://你的订阅域名")
 	}
-	if len(args) != 1 {
-		return fmt.Errorf("用法: user qr <name>")
+	fs := flag.NewFlagSet("user qr", flag.ContinueOnError)
+	format := fs.String("format", "singbox", "clash/singbox/nowhere/base64/plain")
+	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
+		return err
 	}
-	token, err := st.SubToken(args[0])
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: user qr <name> [--format singbox]")
+	}
+	switch *format {
+	case "clash", "singbox", "nowhere", "base64", "plain":
+	default:
+		return fmt.Errorf("invalid QR format")
+	}
+	name := fs.Arg(0)
+	token, err := st.SubToken(name)
 	if err != nil {
 		return err
 	}
-	url := base + "/sub/" + token + "/clash"
+	url := base + "/sub/" + token + "/" + *format
 
 	qr, err := qrcode.New(url, qrcode.Medium)
 	if err != nil {
 		return fmt.Errorf("生成二维码失败: %w", err)
 	}
-	fmt.Printf("%s 的订阅地址：\n%s\n\n", args[0], url)
+	fmt.Printf("%s 的订阅地址：\n%s\n\n", name, url)
 	fmt.Print(qr.ToSmallString(false))
 	fmt.Println()
 	return nil

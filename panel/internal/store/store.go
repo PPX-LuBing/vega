@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,13 +25,14 @@ const (
 	ProtoAnyTLS      = "anytls"
 	ProtoHysteria2   = "hysteria2"
 	ProtoVLESS       = "vless"
+	ProtoVMess       = "vmess"
 	ProtoTrojan      = "trojan"
 	ProtoShadowsocks = "shadowsocks"
 )
 
 // Protocols 是面板支持的协议白名单。
 var Protocols = []string{
-	ProtoNowhere, ProtoAnyTLS, ProtoHysteria2, ProtoVLESS, ProtoTrojan, ProtoShadowsocks,
+	ProtoNowhere, ProtoAnyTLS, ProtoHysteria2, ProtoVLESS, ProtoVMess, ProtoTrojan, ProtoShadowsocks,
 }
 
 // Machine 是一台被面板编排的机器。
@@ -72,11 +74,17 @@ type Node struct {
 	// Listen/Port 是两回事。
 	//
 	// 典型场景是中转：内核在香港监听 30002，但客户端要连的是前置
-	// 123.207.1.101:23334，由前置转到中转再落到香港。订阅里必须发接入点，
+	// 192.0.2.10:23334，由前置转到中转再落到香港。订阅里必须发接入点，
 	// 发直连地址会让客户端绕开中转，延迟从几十毫秒涨到几百毫秒。
 	// 留空表示没有中转，客户端直连 Listen/Port。
-	EntryHost string `json:"entry_host"`
-	EntryPort int    `json:"entry_port"`
+	EntryHost   string `json:"entry_host"`
+	EntryPort   int    `json:"entry_port"`
+	EntrySNI    string `json:"entry_sni"`
+	Transport   string `json:"transport"`
+	Path        string `json:"path"`
+	Host        string `json:"host"`
+	GRPCService string `json:"grpc_service"`
+	Fingerprint string `json:"fingerprint"`
 
 	// TLS：mode 为 tls / reality / none
 	TLSMode  string `json:"tls_mode"`
@@ -245,6 +253,13 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err = s.ensureSubTokenColumn(); err != nil {
 		return err
 	}
+	for _, column := range []string{"entry_sni", "transport", "path", "host", "grpc_service", "fingerprint"} {
+		if !s.hasColumn("nodes", column) {
+			if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+	}
 	// 接入点两列：老库没有，补上
 	if err = s.ensureEntryColumns(); err != nil {
 		return err
@@ -264,7 +279,7 @@ CREATE TABLE IF NOT EXISTS settings (
 			}
 		}
 	}
-	return nil
+	return s.initAccounting()
 }
 
 // hasColumn 探测某表是否有某列。
@@ -442,14 +457,26 @@ func (s *Store) SaveNode(n Node) error {
 	if n.Port <= 0 || n.Port > 65535 {
 		return fmt.Errorf("端口非法: %d", n.Port)
 	}
+	if n.EntryPort < 0 || n.EntryPort > 65535 {
+		return errors.New("entry port must be 0..65535")
+	}
+	if n.EntryPort != 0 && strings.TrimSpace(n.EntryHost) == "" {
+		return errors.New("entry port requires entry host")
+	}
+	if n.Transport != "" && n.Transport != "tcp" && n.Transport != "ws" && n.Transport != "grpc" && n.Transport != "httpupgrade" {
+		return errors.New("transport must be tcp/ws/grpc/httpupgrade; XHTTP is not supported")
+	}
+	if n.Transport != "" && n.Transport != "tcp" && n.Proto != ProtoVMess && n.Proto != ProtoVLESS && n.Proto != ProtoTrojan {
+		return errors.New("transport is only supported for vmess/vless/trojan")
+	}
 	if n.Listen == "" {
 		n.Listen = "0.0.0.0"
 	}
 	_, err := s.db.Exec(`
 INSERT INTO nodes (tag, machine, proto, listen, port, remark, enabled, tls_mode, sni, cert_path, key_path,
                    dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps, ss_method, ss_password,
-                   entry_host, entry_port)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(tag) DO UPDATE SET
   machine=excluded.machine, proto=excluded.proto, listen=excluded.listen, port=excluded.port, remark=excluded.remark,
   enabled=excluded.enabled, tls_mode=excluded.tls_mode, sni=excluded.sni,
@@ -457,10 +484,10 @@ ON CONFLICT(tag) DO UPDATE SET
   priv_key=excluded.priv_key, pub_key=excluded.pub_key, short_id=excluded.short_id,
   morph=excluded.morph, up_mbps=excluded.up_mbps, down_mbps=excluded.down_mbps,
   ss_method=excluded.ss_method, ss_password=excluded.ss_password,
-  entry_host=excluded.entry_host, entry_port=excluded.entry_port`,
+  entry_host=excluded.entry_host, entry_port=excluded.entry_port, entry_sni=excluded.entry_sni, transport=excluded.transport, path=excluded.path, host=excluded.host, grpc_service=excluded.grpc_service, fingerprint=excluded.fingerprint`,
 		n.Tag, orLocal(n.Machine), n.Proto, n.Listen, n.Port, n.Remark, boolInt(n.Enabled), n.TLSMode, n.SNI,
 		n.CertPath, n.KeyPath, n.Dest, n.PrivKey, n.PubKey, n.ShortID, boolInt(n.Morph),
-		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort)
+		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort, n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint)
 	return err
 }
 
@@ -468,7 +495,7 @@ ON CONFLICT(tag) DO UPDATE SET
 func (s *Store) Nodes() ([]Node, error) {
 	rows, err := s.db.Query(`SELECT tag, machine, proto, listen, port, remark, enabled, tls_mode, sni,
         cert_path, key_path, dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps,
-        ss_method, ss_password, entry_host, entry_port
+        ss_method, ss_password, entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint
         FROM nodes ORDER BY port`)
 	if err != nil {
 		return nil, err
@@ -481,7 +508,7 @@ func (s *Store) Nodes() ([]Node, error) {
 		if err = rows.Scan(&n.Tag, &n.Machine, &n.Proto, &n.Listen, &n.Port, &n.Remark, &enabled, &n.TLSMode,
 			&n.SNI, &n.CertPath, &n.KeyPath, &n.Dest, &n.PrivKey, &n.PubKey, &n.ShortID,
 			&morph, &n.UpMbps, &n.DownMbps, &n.SSMethod, &n.SSPassword,
-			&n.EntryHost, &n.EntryPort); err != nil {
+			&n.EntryHost, &n.EntryPort, &n.EntrySNI, &n.Transport, &n.Path, &n.Host, &n.GRPCService, &n.Fingerprint); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled != 0
@@ -651,6 +678,9 @@ func (s *Store) DeleteUser(name string) error {
 	for _, q := range []string{
 		`DELETE FROM grants WHERE user_name=?`,
 		`DELETE FROM traffic WHERE user_name=?`,
+		`DELETE FROM traffic_hourly WHERE user_name=?`,
+		`DELETE FROM traffic_remainders WHERE user_name=?`,
+		`DELETE FROM usage_state WHERE user_name=?`,
 		`DELETE FROM users WHERE name=?`,
 	} {
 		if _, err = tx.Exec(q, name); err != nil {
@@ -745,6 +775,10 @@ func (s *Store) RecordTraffic(source, instance string, samples []TrafficSample) 
 	if instance == "" {
 		return 0, 0, errors.New("missing stats instance; upgrade kernel and sb-stats")
 	}
+	rate, err := trafficRate(s.Setting("traffic_rate", "1"))
+	if err != nil {
+		return 0, 0, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, 0, err
@@ -768,6 +802,38 @@ func (s *Store) RecordTraffic(source, instance string, samples []TrafficSample) 
 			sample.Up = max(sample.Up, oldUp)
 			sample.Down = max(sample.Down, oldDown)
 		}
+		var remainderUp, remainderDown int64
+		err = tx.QueryRow("SELECT up,down FROM traffic_remainders WHERE source=? AND user_name=?", source, sample.Name).Scan(&remainderUp, &remainderDown)
+		if err != nil && err != sql.ErrNoRows {
+			return 0, 0, err
+		}
+		up, remainderUp, err = scaledDelta(up, rate, remainderUp)
+		if err != nil {
+			return 0, 0, err
+		}
+		down, remainderDown, err = scaledDelta(down, rate, remainderDown)
+		if err != nil {
+			return 0, 0, err
+		}
+		var usedUp, usedDown int64
+		if err = tx.QueryRow("SELECT COALESCE(SUM(up),0),COALESCE(SUM(down),0) FROM traffic WHERE user_name=?", sample.Name).Scan(&usedUp, &usedDown); err != nil {
+			return 0, 0, err
+		}
+		if usedUp > math.MaxInt64-usedDown || up > math.MaxInt64-usedUp-usedDown || down > math.MaxInt64-usedUp-usedDown-up || up > math.MaxInt64-totalUp || down > math.MaxInt64-totalDown {
+			return 0, 0, errors.New("traffic overflow")
+		}
+		if _, err = tx.Exec("INSERT INTO traffic_remainders(source,user_name,up,down) VALUES(?,?,?,?) ON CONFLICT(source,user_name) DO UPDATE SET up=excluded.up,down=excluded.down", source, sample.Name, remainderUp, remainderDown); err != nil {
+			return 0, 0, err
+		}
+		if up != 0 || down != 0 {
+			result, writeErr := tx.Exec("INSERT INTO traffic_hourly(hour,user_name,up,down) VALUES(?,?,?,?) ON CONFLICT(hour,user_name) DO UPDATE SET up=up+excluded.up,down=down+excluded.down WHERE up<=? AND down<=?", time.Now().Truncate(time.Hour).Unix(), sample.Name, up, down, math.MaxInt64-up, math.MaxInt64-down)
+			if writeErr != nil {
+				return 0, 0, writeErr
+			}
+			if count, err := result.RowsAffected(); err != nil || count != 1 {
+				return 0, 0, errors.New("hourly traffic overflow")
+			}
+		}
 		if _, err = tx.Exec(`INSERT INTO traffic (user_name,day,up,down) VALUES (?,?,?,?)
 ON CONFLICT(user_name,day) DO UPDATE SET up=up+excluded.up,down=down+excluded.down`, sample.Name, day, up, down); err != nil {
 			return 0, 0, err
@@ -778,6 +844,9 @@ ON CONFLICT(source,user_name,instance) DO UPDATE SET up=excluded.up,down=exclude
 		}
 		totalUp += up
 		totalDown += down
+	}
+	if _, err = tx.Exec("DELETE FROM traffic_hourly WHERE hour<?", time.Now().AddDate(0, 0, -30).Unix()); err != nil {
+		return 0, 0, err
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, 0, err
@@ -815,8 +884,24 @@ func (s *Store) AllUsage() (map[string][2]int64, error) {
 
 // ResetTraffic 清空某用户的流量记录。
 func (s *Store) ResetTraffic(userName string) error {
-	_, err := s.db.Exec(`DELETE FROM traffic WHERE user_name=?`, userName)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("DELETE FROM traffic WHERE user_name=?", userName); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM usage_state WHERE user_name=?", userName); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("DELETE FROM traffic_remainders WHERE user_name=?", userName); err != nil {
+		return err
+	}
+	if _, err = tx.Exec("INSERT INTO events(at,kind,user_name,message) VALUES(?,?,?,?)", time.Now().Unix(), "reset", userName, "manual usage reset"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---------------------------------------------------------------- 设置
@@ -832,9 +917,32 @@ func (s *Store) Setting(key, fallback string) string {
 
 // SetSetting 写一个设置项。
 func (s *Store) SetSetting(key, value string) error {
-	_, err := s.db.Exec(`INSERT INTO settings (key,value) VALUES (?,?)
+	if err := validateSetting(key, value); err != nil {
+		return err
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if key == "quota_reset_day" {
+		var previous string
+		err = tx.QueryRow("SELECT value FROM settings WHERE key=?", key).Scan(&previous)
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		if previous != value {
+			if _, err = tx.Exec("DELETE FROM settings WHERE key='quota_last_reset'"); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = tx.Exec(`INSERT INTO settings (key,value) VALUES (?,?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ControlSecret is generated once and shared only with managed kernels.

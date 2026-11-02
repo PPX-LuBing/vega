@@ -562,7 +562,7 @@ func TestEveryRuleTypeIsConvertible(t *testing.T) {
 	}
 	for _, raw := range presetRules {
 		if raw == "MATCH,PROXY" || strings.HasPrefix(raw, "AND,(") {
-			continue // 分别由 final 和 quicBlockRule 处理
+			continue // MATCH maps to final; the QUIC policy uses a logical rule.
 		}
 		f := splitRule(raw)
 		if len(f) < 3 {
@@ -611,7 +611,7 @@ func TestGroupOutboundsExist(t *testing.T) {
 
 // 有中转时订阅必须发接入点，而不是节点自己的直连地址。
 //
-// 这是踩过的坑：内核在香港监听 30002，客户端要连的是前置 123.207.1.101:23334，
+// 这是踩过的坑：内核在香港监听 30002，客户端要连的是前置 192.0.2.10:23334，
 // 由前置转到中转再落到香港。订阅发了直连地址，客户端就绕开了中转，
 // 延迟从几十毫秒涨到三百多毫秒——而且表面上「能连上」，很难发现。
 func TestSubscriptionUsesEntryPoint(t *testing.T) {
@@ -623,7 +623,7 @@ func TestSubscriptionUsesEntryPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(before, "server: 203.0.113.9") {
+	if !strings.Contains(before, `server: "203.0.113.9"`) {
 		t.Fatalf("没有接入点时应当发直连地址:\n%s", before)
 	}
 
@@ -632,7 +632,7 @@ func TestSubscriptionUsesEntryPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	n.EntryHost = "123.207.1.101"
+	n.EntryHost = "192.0.2.10"
 	n.EntryPort = 23334
 	if err := st.SaveNode(n); err != nil {
 		t.Fatal(err)
@@ -642,7 +642,7 @@ func TestSubscriptionUsesEntryPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(after, "server: 123.207.1.101") {
+	if !strings.Contains(after, `server: "192.0.2.10"`) {
 		t.Fatalf("配了接入点后应当发接入点地址:\n%s", after)
 	}
 	if !strings.Contains(after, "port: 23334") {
@@ -650,7 +650,7 @@ func TestSubscriptionUsesEntryPoint(t *testing.T) {
 	}
 	// 只看 hk-ss 那一条：夹具里其它节点共用同一台机器，没配接入点，
 	// 它们照旧发直连地址是对的
-	if !strings.Contains(proxyBlock(after, "hk-ss"), "server: 123.207.1.101") {
+	if !strings.Contains(proxyBlock(after, "hk-ss"), `server: "192.0.2.10"`) {
 		t.Fatal("hk-ss 这一条应当发接入点地址")
 	}
 
@@ -659,13 +659,13 @@ func TestSubscriptionUsesEntryPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(sb, `"server":"123.207.1.101"`) && !strings.Contains(sb, `"server": "123.207.1.101"`) {
+	if !strings.Contains(sb, `"server":"192.0.2.10"`) && !strings.Contains(sb, `"server": "192.0.2.10"`) {
 		t.Fatalf("sing-box 订阅也应当发接入点:\n%s", sb)
 	}
 }
 
-// 只给 host 不给 port（或反过来）是配置漏了，必须拒绝而不是猜一个。
-func TestEntryPointRequiresBothFields(t *testing.T) {
+// An entry host without a port uses the listening port.
+func TestEntryHostDefaultsToNodePort(t *testing.T) {
 	st := testStore(t)
 	u := seed(t, st)
 	n, err := st.Node("hk-ss")
@@ -682,7 +682,7 @@ func TestEntryPointRequiresBothFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 只有 host 没有 port 时退回直连，不能发出一个端口为 0 的节点
+	// Host-only entries must never generate port zero.
 	if strings.Contains(body, "port: 0") {
 		t.Fatal("不能发出端口为 0 的节点")
 	}

@@ -399,10 +399,15 @@ func TestExtraConfigMergesAdditively(t *testing.T) {
 // 实际流量还在直连。
 func TestExtraConfigRejectsBadJSON(t *testing.T) {
 	st := testStore(t)
-	if err := st.SetSetting("extra_config", "{不是 JSON"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := BuildConfigFor(st, testPaths(), store.LocalMachine); err == nil {
+	if err := st.SetSetting("extra_config", "{不是 JSON"); err == nil {
 		t.Fatal("非法 extra_config 应当报错")
+	}
+}
+
+func TestRealityIPv6Handshake(t *testing.T) {
+	tls := buildTLS(store.Node{TLSMode: "reality", Dest: "[2001:db8::1]:8443", SNI: "example.com"})
+	handshake := tls["reality"].(map[string]any)["handshake"].(map[string]any)
+	if handshake["server"] != "2001:db8::1" || handshake["server_port"] != 8443 {
+		t.Fatalf("invalid IPv6 target: %#v", handshake)
 	}
 }

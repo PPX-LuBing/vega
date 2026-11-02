@@ -1,7 +1,6 @@
 package sub
 
 import (
-	"regexp"
 	"strings"
 )
 
@@ -11,8 +10,7 @@ import (
 // 两份规则手工维护迟早会漂移，出现「clash 走了代理但 sing-box 直连」这种
 // 谁也查不出来的问题。
 //
-// 规则源用的是 MetaCubeX/meta-rules-dat 的 .mrs，sing-box 与 mihomo 都认
-// 这个格式，所以同一批 URL 两边通用。
+// Mihomo uses MRS; sing-box needs its own SRS or source JSON assets.
 
 // ruleProvider 是一条远程规则源。
 type ruleProvider struct {
@@ -106,6 +104,8 @@ var presetGroups = []ruleGroup{
 // "DST-PORT,22,DIRECT"（默认 22）。**刻意去掉**：管理流量直连
 // 看着省事，但国内到境外的 SSH 经常又慢又断，穿代理反而稳定——
 // 这条规则一加上，上传大文件时特别明显。
+const quicPolicy = "AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((OR,((RULE-SET,cn_additional),(RULE-SET,cn_ip,no-resolve)))))),REJECT"
+
 var presetRules = []string{
 	"DOMAIN,cdn.jsdmirror.com,DIRECT",
 	"RULE-SET,private,DIRECT",
@@ -118,7 +118,7 @@ var presetRules = []string{
 	"DOMAIN,fsend.cn,DIRECT",
 	"DOMAIN,international-gfe.download.nvidia.com,DIRECT",
 	"DOMAIN-SUFFIX,ctaiot.com,DIRECT",
-	"AND,((NETWORK,UDP),(DST-PORT,443),(NOT,((OR,((RULE-SET,cn_additional),(RULE-SET,cn_ip,no-resolve)))))),REJECT",
+	quicPolicy,
 	"RULE-SET,category-ads,AdBlock",
 	"RULE-SET,googlefcm,FCM",
 	"RULE-SET,youtube,YouTube",
@@ -180,7 +180,7 @@ func outboundTag(clashName string) (tag string, reject bool) {
 		return "direct", false
 	case "PROXY":
 		return "proxy", false
-	case "REJECT":
+	case "REJECT", "AdBlock":
 		return "", true
 	}
 	return clashName, false
@@ -203,17 +203,37 @@ func splitRule(rule string) []string {
 
 // singboxRuleSets 把规则源渲染成 sing-box 的 rule_set。
 //
-// 用 remote + format binary：和 clash 的 rule-providers 指向同一批 URL，
-// 客户端只下载一份。
+// Each client uses its native rule-set format; changing only the suffix is not enough.
 func singboxRuleSets() []any {
 	sets := make([]any, 0, len(presetProviders))
 	for _, pr := range presetProviders {
+		url, format := singboxProvider(pr)
+		if url == "" {
+			continue
+		}
 		sets = append(sets, map[string]any{
-			"type": "remote", "tag": pr.Name, "format": "binary",
-			"url": pr.URL, "update_interval": "1d",
+			"type": "remote", "tag": pr.Name, "format": format,
+			"url": url, "update_interval": "1d",
 		})
 	}
 	return sets
+}
+
+func singboxProvider(pr ruleProvider) (string, string) {
+	switch pr.Name {
+	case "google":
+		// The mirror currently returns 403 for this asset; use its upstream.
+		return "https://cdn.jsdmirror.com/gh/appshubcc/bett-rules@sing/geo/geosite/google.srs", "binary"
+	case "emby":
+		return "https://cdn.jsdmirror.com/gh/666OS/rules@release/singbox/Emby.srs", "binary"
+	case "emos":
+		return "https://cdn.jsdmirror.com/gh/binaryu/emos-proxy-rule@main/rules/emos-sing-box.json", "source"
+	case "cn_additional":
+		// Same upstream Clash domain list, converted without additional sources.
+		return "https://cdn.jsdmirror.com/gh/YiXuanZX/sing-box-geosite@main/rule/cn-additional-list-clash.srs", "binary"
+	default:
+		return strings.TrimSuffix(strings.Replace(pr.URL, "@meta/", "@sing/", 1), ".mrs") + ".srs", "binary"
+	}
 }
 
 // singboxRules 把 clash 规则逐条翻译成 sing-box 路由规则，返回规则列表与
@@ -221,13 +241,8 @@ func singboxRuleSets() []any {
 func singboxRules() (rules []any, final string) {
 	final = "proxy"
 	for _, raw := range presetRules {
-		// 这条 QUIC 封禁规则是嵌套写法，机械拆字段拆不动，单独处理：
-		// 「UDP 443 且目标不在国内规则集里」→ 拒绝。目的是逼 HTTP/3
-		// 回落 TCP，否则 QUIC 走不了代理会漏出去（也可能被 QoS）。
-		if strings.HasPrefix(raw, "AND,(") {
-			if r := quicBlockRule(raw); r != nil {
-				rules = append(rules, r)
-			}
+		if raw == quicPolicy {
+			rules = append(rules, singboxQUICRule())
 			continue
 		}
 		f := splitRule(raw)
@@ -277,23 +292,14 @@ func singboxRules() (rules []any, final string) {
 	return rules, final
 }
 
-// quicBlockRule 把那条嵌套的 QUIC 封禁规则翻译成 sing-box 写法。
-func quicBlockRule(raw string) map[string]any {
-	// 从原文里抠出规则集名，避免和字符串里的逗号较劲
-	var sets []string
-	for _, m := range regexp.MustCompile(`RULE-SET,([A-Za-z0-9_\-!]+)`).FindAllStringSubmatch(raw, -1) {
-		sets = append(sets, m[1])
-	}
-	if len(sets) == 0 {
-		return nil
-	}
+func singboxQUICRule() map[string]any {
+	// Invert only the exemptions, never the UDP/443 condition.
 	return map[string]any{
-		"network":  "udp",
-		"port":     []int{443},
-		"rule_set": sets,
-		// 原文是 NOT(OR(规则集))，即「不在这些规则集里」才命中
-		"invert": true,
-		"action": "reject",
+		"type": "logical", "mode": "and", "action": "reject",
+		"rules": []any{
+			map[string]any{"network": "udp", "port": []int{443}},
+			map[string]any{"rule_set": []string{"cn_additional", "cn_ip"}, "invert": true},
+		},
 	}
 }
 

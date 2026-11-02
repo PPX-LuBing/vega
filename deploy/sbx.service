@@ -1,0 +1,19 @@
+[Unit]
+Description=Vega proxy kernel
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/usr/local/etc/sbx/config.json
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sbx run -c /usr/local/etc/sbx/config.json
+WorkingDirectory=/var/lib/sbx
+StateDirectory=sbx
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
