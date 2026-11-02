@@ -81,6 +81,10 @@ func ValidateNode(n Node) error {
 		if strings.ContainsAny(name, ", /\\\t\r\n") {
 			return fmt.Errorf("SNI must be a single hostname or IP")
 		}
+		// SNI 会被拼成 <cert_dir>/<SNI>/，"." 和 ".." 能跳出目录
+		if name == "." || name == ".." {
+			return fmt.Errorf("invalid SNI")
+		}
 	}
 	for _, host := range strings.Split(n.EntryHost, ",") {
 		host = strings.TrimSpace(host)
@@ -119,8 +123,13 @@ func ValidateNode(n Node) error {
 			return fmt.Errorf("invalid REALITY short ID")
 		}
 	} else if n.TLSMode == "tls" {
-		if n.CertPath == "" || n.KeyPath == "" {
-			return fmt.Errorf("TLS requires certificate and key paths")
+		if (n.CertPath == "") != (n.KeyPath == "") {
+			return fmt.Errorf("TLS requires both certificate and key paths")
+		}
+		// 不给 cert_path 表示「用面板自己签的证书」：内核会按 SNI 去
+		// <cert_dir>/<SNI>/ 找（见 kernel.buildTLS），所以 SNI 必须能给。
+		if n.CertPath == "" && strings.TrimSpace(n.SNI) == "" {
+			return fmt.Errorf("TLS without explicit cert/key requires SNI")
 		}
 	} else {
 		return fmt.Errorf("TLS mode must be tls/reality/none")

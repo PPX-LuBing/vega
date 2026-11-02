@@ -554,7 +554,7 @@ func nodeFields(n store.Node) []field {
 	return []field{
 		{label: "tag", def: n.Tag}, {label: "协议", def: n.Proto, hint: "nowhere/anytls/hysteria2/vless/vmess/trojan/shadowsocks"},
 		{label: "端口", def: strconv.Itoa(n.Port)}, {label: "TLS 模式", def: n.TLSMode}, {label: "SNI", def: n.SNI}, {label: "备注", def: n.Remark},
-		{label: "证书路径", def: n.CertPath}, {label: "私钥路径", def: n.KeyPath}, {label: "REALITY dest", def: n.Dest},
+		{label: "证书路径", def: n.CertPath, hint: "留空 = 用面板签发的证书（按 SNI 找目录）"}, {label: "私钥路径", def: n.KeyPath}, {label: "REALITY dest", def: n.Dest},
 		{label: "机器", def: n.Machine}, {label: "接入地址", def: n.EntryHost, hint: "多个地址以逗号分隔"}, {label: "接入端口", def: strconv.Itoa(n.EntryPort)},
 		{label: "入口 SNI", def: n.EntrySNI}, {label: "传输", def: n.Transport, hint: "tcp/ws/grpc/httpupgrade"},
 		{label: "路径", def: n.Path}, {label: "Host", def: n.Host}, {label: "gRPC service", def: n.GRPCService}, {label: "TLS 指纹", def: n.Fingerprint},

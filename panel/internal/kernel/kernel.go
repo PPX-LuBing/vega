@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PPX-LuBing/vega/panel/internal/cert"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
 
@@ -30,6 +31,9 @@ type Paths struct {
 	ClashAddr     string // clash_api 监听地址（可观测性数据源）
 	ControlAddr   string // nowhere 控制端点（运行期改用户）
 	ControlSecret string
+	// CertDir 是面板自己签发的证书目录。节点没显式给 cert_path 时按 SNI
+	// 去 <CertDir>/<SNI>/ 找，和订阅服务共用同一份文件（见 internal/cert）。
+	CertDir string
 }
 
 // DefaultPaths 返回默认路径，允许用环境变量覆盖。
@@ -45,6 +49,7 @@ func DefaultPaths() Paths {
 		APIAddr:     "127.0.0.1:10085",
 		ClashAddr:   "127.0.0.1:9090",
 		ControlAddr: "127.0.0.1:10087",
+		CertDir:     "/var/lib/sbx-panel/certs",
 	}
 	override(&paths.ControlAddr, "SBX_PANEL_CONTROL")
 	override(&paths.ClashAddr, "SBX_PANEL_CLASH")
@@ -53,6 +58,7 @@ func DefaultPaths() Paths {
 	override(&paths.Service, "SBX_PANEL_SERVICE")
 	override(&paths.StatsBin, "SBX_PANEL_STATS_BIN")
 	override(&paths.APIAddr, "SBX_PANEL_API")
+	override(&paths.CertDir, "SBX_PANEL_CERT_DIR")
 	return paths
 }
 
@@ -99,7 +105,7 @@ func buildConfigFromNodes(st *store.Store, paths Paths, nodes []store.Node) (map
 			// 没有可用用户就不监听，别开个没人能用的端口
 			continue
 		}
-		inbound, err := buildInbound(node, users)
+		inbound, err := buildInbound(node, users, paths)
 		if err != nil {
 			return nil, err
 		}
@@ -234,7 +240,7 @@ func activeUsers(st *store.Store, node store.Node) ([]store.User, error) {
 	return out, nil
 }
 
-func buildInbound(node store.Node, users []store.User) (map[string]any, error) {
+func buildInbound(node store.Node, users []store.User, paths Paths) (map[string]any, error) {
 	listen := node.Listen
 	if listen == "" {
 		listen = "0.0.0.0"
@@ -317,7 +323,7 @@ func buildInbound(node store.Node, users []store.User) (map[string]any, error) {
 	if transport := node.TransportConfig(); transport != nil {
 		inbound["transport"] = transport
 	}
-	if tlsBlock := buildTLS(node); tlsBlock != nil && node.Proto != store.ProtoShadowsocks {
+	if tlsBlock := buildTLS(node, paths); tlsBlock != nil && node.Proto != store.ProtoShadowsocks {
 		// TUIC 跑在 QUIC 上，服务端必须宣告 h3。不宣告的话客户端会以
 		// "CRYPTO_ERROR 0x178: server did not select an ALPN protocol"
 		// 直接握手失败——服务端日志里什么都看不到，很难查。
@@ -338,7 +344,7 @@ func passwordMembers(users []store.User) []any {
 }
 
 // buildTLS 生成 tls 段；mode 为 none 时返回 nil。
-func buildTLS(node store.Node) map[string]any {
+func buildTLS(node store.Node, paths Paths) map[string]any {
 	switch node.TLSMode {
 	case "none":
 		return nil
@@ -374,12 +380,19 @@ func buildTLS(node store.Node) map[string]any {
 		}
 	default:
 		block := map[string]any{"enabled": true}
-		if name := firstCSV(node.SNI); name != "" {
+		name := firstCSV(node.SNI)
+		if name != "" {
 			block["server_name"] = name
 		}
-		if node.CertPath != "" {
-			block["certificate_path"] = node.CertPath
-			block["key_path"] = node.KeyPath
+		certPath, keyPath := node.CertPath, node.KeyPath
+		if certPath == "" && paths.CertDir != "" && name != "" {
+			// 面板自己签的证书：订阅服务和节点共用同一份文件，
+			// 续期后由面板重启内核让它重新加载（见 internal/cert）。
+			certPath, keyPath = cert.PEMPaths(paths.CertDir, name)
+		}
+		if certPath != "" {
+			block["certificate_path"] = certPath
+			block["key_path"] = keyPath
 		}
 		return block
 	}

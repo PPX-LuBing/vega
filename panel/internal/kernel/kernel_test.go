@@ -405,9 +405,33 @@ func TestExtraConfigRejectsBadJSON(t *testing.T) {
 }
 
 func TestRealityIPv6Handshake(t *testing.T) {
-	tls := buildTLS(store.Node{TLSMode: "reality", Dest: "[2001:db8::1]:8443", SNI: "example.com"})
+	tls := buildTLS(store.Node{TLSMode: "reality", Dest: "[2001:db8::1]:8443", SNI: "example.com"}, Paths{})
 	handshake := tls["reality"].(map[string]any)["handshake"].(map[string]any)
 	if handshake["server"] != "2001:db8::1" || handshake["server_port"] != 8443 {
 		t.Fatalf("invalid IPv6 target: %#v", handshake)
+	}
+}
+
+// 节点不给 cert_path 时，证书要自动指向面板统一管理的目录（订阅和节点共用一份）。
+func TestBuildTLSUsesManagedCertDir(t *testing.T) {
+	paths := Paths{CertDir: "/var/lib/vega/certs"}
+	block := buildTLS(store.Node{TLSMode: "tls", SNI: "hk.example.com"}, paths)
+	if block["certificate_path"] != "/var/lib/vega/certs/hk.example.com/cert.pem" {
+		t.Fatalf("certificate_path = %v", block["certificate_path"])
+	}
+	if block["key_path"] != "/var/lib/vega/certs/hk.example.com/key.pem" {
+		t.Fatalf("key_path = %v", block["key_path"])
+	}
+
+	// 显式配的路径优先，不能被面板目录盖掉
+	block = buildTLS(store.Node{TLSMode: "tls", SNI: "hk.example.com", CertPath: "/etc/tls/c.pem", KeyPath: "/etc/tls/k.pem"}, paths)
+	if block["certificate_path"] != "/etc/tls/c.pem" || block["key_path"] != "/etc/tls/k.pem" {
+		t.Fatalf("显式路径被覆盖了: %#v", block)
+	}
+
+	// 没配证书目录（比如远端机器）时不能瞎指一个本地路径出来
+	block = buildTLS(store.Node{TLSMode: "tls", SNI: "hk.example.com"}, Paths{})
+	if _, ok := block["certificate_path"]; ok {
+		t.Fatalf("没有 cert_dir 却写了 certificate_path: %#v", block)
 	}
 }

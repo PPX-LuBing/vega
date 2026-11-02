@@ -14,8 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/acme/autocert"
-
+	"github.com/PPX-LuBing/vega/panel/internal/cert"
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
@@ -35,6 +34,12 @@ type Config struct {
 	ACMEDomain   string
 	ACMEEmail    string
 	ACMECacheDir string
+	// ACMECertDir 是面板统一管理的证书目录：签发/续期后会把稳定的 PEM 写到
+	// <ACMECertDir>/<域名>/{cert.pem,key.pem}，内核节点直接读同一份文件。
+	ACMECertDir string
+	// OnCertChange 在稳定证书文件内容变化后调用（同步），用来重启内核——
+	// sing-box 只在启动时读证书文件，不重启不生效。
+	OnCertChange func(cert.Change)
 	// ACMEHTTPAddr 是 HTTP-01 挑战与跳转用的地址，默认 :80。
 	ACMEHTTPAddr string
 	// ACMETLSAddr 是 HTTPS 监听地址，默认 :443。
@@ -71,9 +76,13 @@ func Serve(ctx context.Context, st *store.Store, cfg Config) error {
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 120 * time.Second}
 	var challenge *http.Server
 	var challengeListener net.Listener
+	var manager *cert.Manager
 	if cfg.ACMEDomain != "" {
 		if cfg.ACMECacheDir == "" {
 			return fmt.Errorf("ACME requires acme_cache")
+		}
+		if cfg.ACMECertDir == "" {
+			return fmt.Errorf("ACME requires cert_dir")
 		}
 		if err := os.MkdirAll(cfg.ACMECacheDir, 0700); err != nil {
 			return err
@@ -82,9 +91,17 @@ func Serve(ctx context.Context, st *store.Store, cfg Config) error {
 		if err != nil || base.Scheme != "https" || base.Hostname() != cfg.ACMEDomain || base.User != nil {
 			return fmt.Errorf("ACME base must be an HTTPS URL for the configured domain")
 		}
-		manager := &autocert.Manager{Prompt: autocert.AcceptTOS, HostPolicy: autocert.HostWhitelist(cfg.ACMEDomain), Cache: autocert.DirCache(cfg.ACMECacheDir), Email: cfg.ACMEEmail}
+		manager, err = cert.New(cert.Config{
+			Domain:   cfg.ACMEDomain,
+			Email:    cfg.ACMEEmail,
+			CacheDir: cfg.ACMECacheDir,
+			CertDir:  cfg.ACMECertDir,
+			OnChange: cfg.OnCertChange,
+		})
+		if err != nil {
+			return err
+		}
 		server.TLSConfig = manager.TLSConfig()
-		server.TLSConfig.MinVersion = tls.VersionTLS12
 		challenge = &http.Server{Handler: manager.HTTPHandler(httpsRedirect(base)), ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
 		httpAddr := cfg.ACMEHTTPAddr
 		if httpAddr == "" {
@@ -121,6 +138,20 @@ func Serve(ctx context.Context, st *store.Store, cfg Config) error {
 	if challenge != nil {
 		servers = append(servers, challenge)
 		go func() { failures <- challenge.Serve(challengeListener) }()
+	}
+	if manager != nil {
+		// 挑战监听起来之后再碰 ACME。顺序是：先把缓存里已有的证书落成稳定
+		// 文件（升级场景：证书是升级前签的，缓存里有、稳定文件没有），再走
+		// 一遍取证书流程，把 autocert 自己的续期定时器挂上——不挂的话，
+		// 证书到期前没人续。放 goroutine 是因为首次签发要等 ACME 来回。
+		go func() {
+			if _, err := manager.Sync(ctx); err != nil {
+				log.Printf("ACME: 同步稳定证书文件失败: %v", err)
+			}
+			if err := manager.Arm(); err != nil {
+				log.Printf("ACME: %v", err)
+			}
+		}()
 	}
 	useTLS := server.TLSConfig != nil
 	go func() {

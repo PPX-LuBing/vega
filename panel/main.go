@@ -14,6 +14,8 @@
 //	sbx-panel user sync                运行期改用户（不重启，仅 nowhere）
 //	sbx-panel serve                    起订阅服务（clash / sing-box）
 //	                                   加 --acme-domain 可自动签发证书
+//	sbx-panel cert status              看证书到期时间（订阅与节点共用一份）
+//	sbx-panel cert renew               证书快到期时触发一次续期
 //	sbx-panel user sub [name]          打印该用户的订阅地址
 //	sbx-panel user rotate-sub [name]   换一把订阅 token（地址泄露时用）
 //	sbx-panel user qr [name]           把订阅地址打成二维码（手机扫码导入）
@@ -26,6 +28,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strconv"
@@ -36,6 +39,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	qrcode "github.com/skip2/go-qrcode"
 
+	"github.com/PPX-LuBing/vega/panel/internal/cert"
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 	"github.com/PPX-LuBing/vega/panel/internal/sub"
@@ -165,7 +169,9 @@ func run(args []string) error {
 	case "user":
 		return runUser(dbPath, paths, args[1:])
 	case "serve":
-		return runServe(dbPath, args[1:])
+		return runServe(dbPath, paths, args[1:])
+	case "cert":
+		return runCert(paths, args[1:])
 	case "setting":
 		return runSetting(dbPath, args[1:])
 	case "traffic", "events", "alert", "doctor":
@@ -173,7 +179,7 @@ func run(args []string) error {
 	case "selftest":
 		return runSelftest(dbPath, paths, args[1:])
 	default:
-		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / serve / setting / show / traffic / events / alert / doctor）", args[0])
+		return fmt.Errorf("未知命令: %s（试 version / apply / collect / enforce / status / machine / node / user / serve / cert / setting / show / traffic / events / alert / doctor）", args[0])
 	}
 }
 
@@ -688,7 +694,7 @@ func runUser(dbPath string, paths kernel.Paths, args []string) error {
 //
 // 订阅地址里的主机名必须显式给（--base），因为面板不知道自己在公网叫什么；
 // 猜错的话所有客户端都会拿到连不上的地址。
-func runServe(dbPath string, args []string) error {
+func runServe(dbPath string, paths kernel.Paths, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := fs.String("listen", "127.0.0.1:8080", "监听地址；前面有反代时绑回环")
 	base := fs.String("base", "", "订阅地址前缀，如 https://sub.example.com")
@@ -698,6 +704,7 @@ func runServe(dbPath string, args []string) error {
 	acmeCache := fs.String("acme-cache", "", "ACME 证书缓存目录（启用 ACME 时必填）")
 	acmeHTTP := fs.String("acme-http", ":80", "ACME HTTP-01 挑战与跳转的监听地址")
 	acmeTLS := fs.String("acme-tls", ":443", "HTTPS 监听地址")
+	certDir := fs.String("cert-dir", paths.CertDir, "面板统一管理的证书目录（订阅与节点共用）")
 	certFile := fs.String("tls-cert", "", "订阅证书文件")
 	keyFile := fs.String("tls-key", "", "订阅私钥文件")
 	if err := fs.Parse(reorderArgs(fs, args)); err != nil {
@@ -735,9 +742,28 @@ func runServe(dbPath string, args []string) error {
 		ACMEDomain:   strings.TrimSpace(*acmeDomain),
 		ACMEEmail:    strings.TrimSpace(*acmeEmail),
 		ACMECacheDir: strings.TrimSpace(*acmeCache),
+		ACMECertDir:  strings.TrimSpace(*certDir),
+		OnCertChange: restartKernelOnCertChange(paths),
 		ACMEHTTPAddr: *acmeHTTP,
 		ACMETLSAddr:  *acmeTLS, CertFile: *certFile, KeyFile: *keyFile,
 	})
+}
+
+// restartKernelOnCertChange 在证书文件变化后重启内核。
+//
+// 内核只在启动时读 certificate_path，换了文件不重启就是白换——节点会一直用
+// 旧证书，直到旧证书过期、客户端全部握手失败。回调是在 TLS 握手/续期路径上
+// 同步调的，重启要几秒，所以必须丢后台。
+func restartKernelOnCertChange(paths kernel.Paths) func(cert.Change) {
+	return func(change cert.Change) {
+		go func() {
+			log.Printf("证书已更新（%s，%s 到期），重启 %s 让节点加载新证书",
+				change.Domain, change.NotAfter.Local().Format("2006-01-02 15:04"), paths.Service)
+			if err := kernel.Restart(paths); err != nil {
+				log.Printf("重启 %s 失败: %v（节点还在用旧证书，手动 systemctl restart %s）", paths.Service, err, paths.Service)
+			}
+		}()
+	}
 }
 
 // runSetting 读写面板设置。

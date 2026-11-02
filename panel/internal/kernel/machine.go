@@ -128,7 +128,7 @@ func httpReadJSON(req *http.Request) ([]byte, error) {
 
 // MachinePaths 把机器记录翻译成内核路径。
 func MachinePaths(m store.Machine) Paths {
-	return Paths{
+	paths := Paths{
 		Bin:         m.KernelPath,
 		Config:      m.ConfigPath,
 		Service:     m.Service,
@@ -137,6 +137,12 @@ func MachinePaths(m store.Machine) Paths {
 		ClashAddr:   m.ClashAddr,
 		ControlAddr: m.ControlAddr,
 	}
+	if orLocalName(m.Name) == store.LocalMachine {
+		// 本机节点的证书是面板自己签的，路径跟着面板的 SBX_PANEL_CERT_DIR 走。
+		// 远端机器的证书在远端，面板签不到也读不到，那边必须显式配 cert_path。
+		paths.CertDir = DefaultPaths().CertDir
+	}
+	return paths
 }
 
 // BuildConfigFor 生成「只含某台机器的节点」的配置。

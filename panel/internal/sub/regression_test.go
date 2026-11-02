@@ -299,14 +299,16 @@ func TestServeUsesTLSAddressAndStops(t *testing.T) {
 			addr := listener.Addr().String()
 			listener.Close()
 			cfg := Config{Listen: "invalid:address", ACMETLSAddr: addr, CertFile: certPath, KeyFile: keyPath}
+			certDir := ""
 			if mode == "acme" {
 				cache := t.TempDir()
+				certDir = t.TempDir()
 				// Preload an ECDSA certificate; this tests autocert without contacting a CA.
 				cached := append(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: pk}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
 				if err := os.WriteFile(filepath.Join(cache, "sub.example"), cached, 0600); err != nil {
 					t.Fatal(err)
 				}
-				cfg = Config{Listen: "invalid:address", ACMETLSAddr: addr, ACMEHTTPAddr: "127.0.0.1:0", ACMEDomain: "sub.example", Base: "https://sub.example", ACMECacheDir: cache}
+				cfg = Config{Listen: "invalid:address", ACMETLSAddr: addr, ACMEHTTPAddr: "127.0.0.1:0", ACMEDomain: "sub.example", Base: "https://sub.example", ACMECacheDir: cache, ACMECertDir: certDir}
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -344,6 +346,14 @@ func TestServeUsesTLSAddressAndStops(t *testing.T) {
 			if !ready {
 				t.Fatal("TLS listener never ready")
 			}
+			if mode == "acme" {
+				// 升级场景：证书本来只在 autocert 缓存里，服务起来后必须把它
+				// 搬成稳定文件，否则节点读不到证书。
+				stable := filepath.Join(certDir, "sub.example", "cert.pem")
+				if _, err := os.Stat(stable); err != nil {
+					t.Fatalf("稳定证书文件没写出来: %v", err)
+				}
+			}
 		})
 	}
 }
@@ -360,7 +370,7 @@ func TestACMETLSBindFailureClosesChallengeListener(t *testing.T) {
 	}
 	addr := probe.Addr().String()
 	probe.Close()
-	err = Serve(context.Background(), testStore(t), Config{ACMEDomain: "sub.example", Base: "https://sub.example", ACMECacheDir: t.TempDir(), ACMETLSAddr: occupied.Addr().String(), ACMEHTTPAddr: addr})
+	err = Serve(context.Background(), testStore(t), Config{ACMEDomain: "sub.example", Base: "https://sub.example", ACMECacheDir: t.TempDir(), ACMECertDir: t.TempDir(), ACMETLSAddr: occupied.Addr().String(), ACMEHTTPAddr: addr})
 	if err == nil {
 		t.Fatal("bind failure hidden")
 	}
