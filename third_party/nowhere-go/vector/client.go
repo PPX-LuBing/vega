@@ -116,6 +116,20 @@ func (c *Client) openTLS(ctx context.Context, kind wire.FlowKind, target wire.Ta
 	if err != nil {
 		return nil, err
 	}
+	// HandshakeContext only covers TLS, not Morph or the auth/setup exchange.
+	// Keep cancellation active until ownership passes to the caller.
+	setupConn := raw
+	setupCtx, finishSetup := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		<-setupCtx.Done()
+		if ctx.Err() != nil {
+			_ = setupConn.Close()
+		}
+	}()
+	stop := func() { finishSetup(); <-stopped }
+	defer stop()
 	if c.keys != nil {
 		wrapped, wrapErr := morph.WrapTCPClient(raw, *c.keys)
 		if wrapErr != nil {
@@ -155,11 +169,16 @@ func (c *Client) openTLS(ctx context.Context, kind wire.FlowKind, target wire.Ta
 		_ = tlsConn.Close()
 		return nil, wire.SetupError{Result: result}
 	}
+	stop()
+	if err := ctx.Err(); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
 	var conn net.Conn = tlsConn
 	if kind == wire.FlowUDP {
 		conn = &uotConn{Conn: tlsConn}
 	}
-	return &limitedConn{Conn: conn, up: c.up, down: c.down}, nil
+	return newLimitedConn(conn, c.up, c.down), nil
 }
 
 func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.Target) (net.Conn, error) {
@@ -202,7 +221,7 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 	}
 	rw := &streamConn{Reader: br, Stream: st, local: addr("quic-local"), remote: conn.RemoteAddr()}
 	if kind == wire.FlowTCP {
-		return &limitedConn{Conn: rw, up: c.up, down: c.down}, nil
+		return newLimitedConn(rw, c.up, c.down), nil
 	}
 	id, err := wire.UDPFlowID(st.ID(), false)
 	if err != nil {
@@ -217,7 +236,7 @@ func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.T
 		_, _ = br.Read(b[:])
 		_ = pc.Close()
 	}()
-	return &limitedConn{Conn: pc, up: c.up, down: c.down}, nil
+	return newLimitedConn(pc, c.up, c.down), nil
 }
 
 func (c *Client) session(ctx context.Context) (qio.Conn, *dgram.Router, error) {
@@ -285,18 +304,32 @@ func (c *streamConn) RemoteAddr() net.Addr       { return c.remote }
 type limitedConn struct {
 	net.Conn
 	up, down *flowio.Limiter
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+func newLimitedConn(conn net.Conn, up, down *flowio.Limiter) *limitedConn {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &limitedConn{Conn: conn, up: up, down: down, ctx: ctx, cancel: cancel}
+}
+
+func (c *limitedConn) Close() error {
+	c.cancel()
+	return c.Conn.Close()
 }
 
 func (c *limitedConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		_ = c.down.WaitN(context.Background(), n)
+		if waitErr := c.down.WaitN(c.ctx, n); waitErr != nil {
+			return n, waitErr
+		}
 	}
 	return n, err
 }
 
 func (c *limitedConn) Write(p []byte) (int, error) {
-	if err := c.up.WaitN(context.Background(), len(p)); err != nil {
+	if err := c.up.WaitN(c.ctx, len(p)); err != nil {
 		return 0, err
 	}
 	return c.Conn.Write(p)

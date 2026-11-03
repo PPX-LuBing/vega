@@ -1,0 +1,9 @@
+[Unit]
+Description=Vega managed certificate health check (no restarts)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sbx-panel cert status --check
+WorkingDirectory=/var/lib/sbx-panel
+UMask=0077
+NoNewPrivileges=true

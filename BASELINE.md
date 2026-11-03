@@ -11,14 +11,14 @@
 
 ## 改动规模
 
-自有代码占上游约 **1.4%**（内核 187k 行，我们 1.5k 行），其中大部分是**新增文件**——新增文件在 rebase 时永远不会冲突。
+自有扩展主要位于新增文件；统计会随迭代变化，请用 `git diff --stat v1.14.4 HEAD` 查看当前规模。新增文件通常减少冲突，但上游同名新增或接口变化仍需处理。
 
 | 类别 | 数量 | rebase 影响 |
 |---|---|---|
-| 修改的上游文件 | **12 个** | 可能冲突 |
-| 新增文件 | **264 个** | 永不冲突 |
-| 内核自有代码 | 约 1,900 行（`option/nowhere.go` + `protocol/nowhere/`，含出站） | — |
-| 面板自有代码 | 5,730 行（`panel/`） | — |
+| 修改的上游文件 | **13 个**（截至 2026-11-04） | 可能冲突 |
+| 新增文件 | 以 Git diff 为准 | 上游同名新增或接口变化仍可能冲突 |
+| 内核自有代码 | `option/nowhere.go` + `protocol/nowhere/`（含出站） | — |
+| 面板自有代码 | `panel/`，独立 Go module | — |
 | 打补丁的第三方 | `third_party/nowhere-go/`（见下） | — |
 
 ### 修改的上游文件（按冲突风险排序）
@@ -26,6 +26,7 @@
 | 文件 | 改动 | 冲突风险 |
 |---|---|---|
 | `experimental/v2rayapi/stats.go` | +24 / −6 | **高**——改在函数中间（锁顺序、`RegisterUsers`、实例标识），上游一动这个文件就冲突 |
+| `common/tls/std_server.go` | 串行化证书文件重载、保护配置读取与发布 | 中——保留证书与私钥同时替换的竞态回归 |
 | `README.md` | +194 / −20 | 中——直接取我们的（`git checkout --ours README.md`） |
 | `go.mod` / `go.sum` | +4 | 中——上游升依赖时冲突，删掉冲突标记保留两边 |
 | `constant/proxy.go` | +1 | 低——加 `TypeNowhere` 常量 |
@@ -71,14 +72,15 @@ go build -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_ac
 
 基线是 [ohmycggk/nowhere-go](https://github.com/ohmycggk/nowhere-go) 的 `v3.2.0`（commit `6a8410c`）。
 
-补丁集中在两个文件：
+补丁集中在三个文件（详见 `third_party/nowhere-go/VEGA-PATCHES.md`）：
 
 | 文件 | 补丁 |
 |---|---|
 | `morph/morph.go` | `WrapTCPServerMulti` / `MatchedKeyIndex`——多密钥试解 prelude |
 | `portal/server.go` | `Config.Users` 多用户、双路径识别、`UpdateUsers` 运行期换名单、`UserCount`、`ContextWithUser` / `SourceFromContext`、沿用未变密钥的防重放状态、连接清理 |
+| `vector/client.go` | context 取消覆盖 Morph、认证与 setup；Close 取消限速等待；不改报文或协议状态机 |
 
-同步方式：合并新版与这两个文件的本地改动，保留对应测试（`portal/multiuser_test.go`、`portal/replay_update_test.go`），并运行整个独立 module 的竞态回归。
+同步方式：合并新版与这三个文件的本地改动，保留对应测试（`portal/multiuser_test.go`、`portal/replay_update_test.go`、`vector/cancel_test.go`），并运行整个独立 module 的竞态回归。不要因修复适配层而修改官方 wire/auth/Morph 算法。
 
 ## 判断改动是否完整
 

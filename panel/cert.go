@@ -13,12 +13,12 @@ import (
 )
 
 // defaultSubService 是订阅服务名。cert renew 靠重启它来触发续期。
-const defaultSubService = "vega-sub"
+const defaultSubService = "sbx-sub"
 
 // runCert 管理面板统一签发的证书。
 //
 // 订阅服务和节点共用 <cert-dir>/<域名>/{cert.pem,key.pem} 这一份文件：
-// 订阅服务负责签发和续期，节点只读（内核不重启不会重新加载）。
+// 订阅服务负责签发和续期，运行中的内核监视文件并热加载。
 func runCert(paths kernel.Paths, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("用法: cert status | cert renew")
@@ -27,11 +27,15 @@ func runCert(paths kernel.Paths, args []string) error {
 	domain := fs.String("domain", "", "证书域名；留空则从证书目录里推断")
 	certDir := fs.String("cert-dir", paths.CertDir, "证书目录（默认取 SBX_PANEL_CERT_DIR）")
 	wait := fs.Duration("wait", 3*time.Minute, "renew 等待续期完成的时长")
+	check := fs.Bool("check", false, "status 在证书缺失、无效或 14 天内到期时返回失败（供 timer 使用）")
 	if err := fs.Parse(reorderArgs(fs, args[1:])); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("用法: cert status | cert renew")
+	}
+	if *wait <= 0 || *wait > 10*time.Minute {
+		return fmt.Errorf("renew wait 必须在 0 到 10 分钟之间")
 	}
 	resolved, err := resolveCertDomain(*certDir, *domain)
 	if err != nil {
@@ -39,6 +43,9 @@ func runCert(paths kernel.Paths, args []string) error {
 	}
 	switch args[0] {
 	case "status":
+		if *check && cert.StatusOf(*certDir, resolved).Expiring() {
+			return fmt.Errorf("证书缺失、无效或 14 天内到期；请检查订阅服务续期日志")
+		}
 		return certStatus(*certDir, resolved)
 	case "renew":
 		return certRenew(*certDir, resolved, *wait)
@@ -70,7 +77,7 @@ func certStatus(certDir, domain string) error {
 //
 // 它自己不能签：ACME 的挑战端口（:80 / :8443）在订阅服务手里，另起进程抢不到
 // 端口，签发必然失败。所以走「重启订阅服务」——服务启动时会重新走一遍 autocert
-// 的取证书流程，快到期就立刻续，续完写稳定文件并重启内核。
+// 的取证书流程并挂上续期定时器，续完写稳定文件，由内核热加载。
 //
 // 只在 autocert 明显没动静时才动手（14 天内到期，或文件根本不在），免得跟它
 // 自己的续期抢端口、把挑战打断。

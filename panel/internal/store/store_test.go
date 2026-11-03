@@ -133,3 +133,36 @@ func TestDeleteUserRollsBackRelatedRowsOnFailure(t *testing.T) {
 		t.Fatal("usage not rolled back")
 	}
 }
+
+func TestSetUserNodesIsAtomic(t *testing.T) {
+	st, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err = st.SaveUser(User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	for _, tag := range []string{"one", "two"} {
+		if err = st.SaveNode(Node{Tag: tag, Proto: ProtoNowhere, Port: 8446}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = st.SetUserNodes("alice", []string{"one"}); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.SetUserNodes("alice", []string{"two", "missing"}); err == nil {
+		t.Fatal("accepted missing node")
+	}
+	tags, err := st.NodesForUser("alice")
+	if err != nil || len(tags) != 1 || tags[0] != "one" {
+		t.Fatalf("partial grants: %v %v", tags, err)
+	}
+	if err = st.SetUserNodes("alice", nil); err != nil {
+		t.Fatal(err)
+	}
+	tags, _ = st.NodesForUser("alice")
+	if len(tags) != 0 {
+		t.Fatal(tags)
+	}
+}

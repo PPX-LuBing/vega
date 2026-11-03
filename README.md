@@ -27,9 +27,10 @@ vega/
 | | `include/registry.go` | +2 行（import + 注册） |
 | | `go.mod` | +1 个依赖 |
 | | `experimental/v2rayapi/stats.go` | 热用户统计、并发保护、内核实例标识 |
+| | `common/tls/std_server.go` | 证书重载回调与配置发布的竞态保护 |
 | | `release/DEFAULT_BUILD_TAGS*` | 默认编入 `with_v2ray_api` |
 | | `.github/workflows/{test,lint}.yml` | `main` 分支与独立 module 的回归检查 |
-| **新增文件** | `option/nowhere.go`、`protocol/nowhere/*` | 新文件不会冲突 |
+| **新增文件** | `option/nowhere.go`、`protocol/nowhere/*` | 通常减少冲突，仍需核对上游接口 |
 
 ### 跟随上游
 
@@ -64,7 +65,7 @@ go test -race -tags with_v2ray_api ./protocol/nowhere/... ./experimental/v2rayap
 vega check -c config.json     # 任何合法 sing-box 配置都能跑
 ```
 
-`panel/` 目前**管理**其中 7 种（`nowhere` / `anytls` / `hysteria2` / `vless` / `vmess` / `trojan` / `shadowsocks`）。VMess/VLESS/Trojan 支持 TCP、WS、gRPC、HTTPUpgrade；REALITY 限 VLESS TCP。其余协议手写配置即可，能力取决于内核编译标签。**不实现 XHTTP，不扩展非 Nowhere 的内核热更新接口，不做 Web UI。**
+`panel/` 目前**管理**其中 8 种（`nowhere` / `anytls` / `tuic` / `hysteria2` / `vless` / `vmess` / `trojan` / `shadowsocks`）。VMess/VLESS/Trojan 支持 TCP、WS、gRPC、HTTPUpgrade；REALITY 限 VLESS TCP。其余协议手写配置即可，能力取决于内核编译标签。**不实现 XHTTP，不扩展非 Nowhere 的内核热更新接口，不做 Web UI。**
 
 ## 自有扩展
 
@@ -157,7 +158,7 @@ vega-panel user link alice
 vega-panel user qr alice --format singbox
 ```
 
-`node add` / `user add` 不覆盖已有记录，修改请用 `set`。TUI 节点表单支持证书、REALITY 目标、传输与中转字段，长表单随光标滚动。REALITY 密钥用本机标准库生成；普通 TLS 必须填写证书和私钥路径，实际文件由 `doctor` / `apply` 的内核校验检查。
+`node add` / `user add` 不覆盖已有记录，修改请用 `set`。TUI 节点表单支持证书、REALITY 目标、传输与中转字段，长表单随光标滚动。REALITY 密钥用本机标准库生成；普通 TLS 可填写证书和私钥路径，或留空并提供 SNI 使用面板已签发的证书；实际文件由 `doctor` / `apply` 的内核校验检查。
 
 入口地址优先于 `sub_host`，逗号分隔时展开多个入口；未填入口端口则沿用节点端口。`--entry-sni` 只覆盖客户端 SNI。`--fingerprint` 用于 TCP TLS；Hysteria2 的 QUIC TLS 不使用 uTLS 指纹。新增字段随数据库打开自动迁移，升级前仍应备份。
 
@@ -237,14 +238,15 @@ sudo sh deploy/install.sh ./vega ./panel/vega-panel ./tools/sbstats/sb-stats
 
 ## third_party/nowhere-go
 
-[nowhere-go](https://github.com/ohmycggk/nowhere-go) 的副本，基线是上游 **v3.2.0**（`6a8410c`），加了两处补丁：
+[nowhere-go](https://github.com/ohmycggk/nowhere-go) 的副本，基线是上游 **v3.2.0**（`6a8410c`），本地补丁如下：
 
 | 文件 | 补丁 |
 |---|---|
 | `morph/morph.go` | `WrapTCPServerMulti` / `MatchedKeyIndex`：多密钥试解 prelude |
 | `portal/server.go` | 多用户与热更新、沿用未变密钥的防重放状态、用户/来源上下文、连接关闭清理 |
+| `vector/client.go` | Morph/认证/setup 阶段的 context 取消，不改变线上协议 |
 
-同步上游：合并这两个文件的本地补丁与对应测试，尤其保留 `portal/replay_update_test.go` 的热更新防重放回归。
+同步上游：按 `third_party/nowhere-go/VEGA-PATCHES.md` 合并本地补丁与对应测试，尤其保留 `portal/replay_update_test.go` 的热更新防重放回归。
 
 ## 致谢
 
@@ -273,3 +275,14 @@ Vega 站在这些项目的肩膀上：
     nowhere-go          Copyright (C) 2026 ohmycggk
 
 因为上游是 GPL-3.0，这是**法律上必须**的：衍生作品不能换成更宽松的许可。
+## 2026-11-04 审核修复与操作注意
+
+- Nowhere 出站默认 Morph 开启（显式 false 仍可关闭），与入站及固定的官方 nw3 基线一致。UDP 保留来源地址，多目标回包独立接收；Close、context 和 deadline 能终止等待，目标缓存与接收队列均有界。协议线上格式不变。
+- TUI 删除只接受明确的 y/Y，Enter 默认取消。新增用户后进入节点勾选授权；用户页按 g 可修改/撤销授权，不默认开放全部节点。保存后按 r 下发，s 只热同步 Nowhere 新连接。
+- 列表随光标滚动，支持 PgUp/PgDn/Home/End，按 ? 查看帮助。表单支持光标编辑、Delete、Ctrl+U 和协议/传输枚举选择。长行按显示宽度裁切，机器页窄窗口隐藏内核路径。
+- Anywhere AJSON 不会用 SNI 替换客户端接入地址。Nowhere 入口与 SNI 不同时明确跳过并说明原因；请配置证书匹配的接入域名，或使用支持独立 SNI 的客户端格式。
+- 统一证书文件由运行中的 sing-box 热加载，续期不再自动重启整个内核。首次安装仍需证书准备好后执行 doctor/apply 并启用服务。文件更新日志不代表已确认内核加载成功；请检查内核的 reload certificate 日志。
+- `sbx-panel cert status --check` 在证书缺失、证钥不匹配或 14 天内到期时返回失败。安装器提供但不自动启用 `sbx-cert-check.timer`，配置好托管证书后可显式启用每日检查；它只检查，不重启、不直接发送通知。自定义证书目录/域名需用 systemd override 配置 ExecStart 与环境变量。
+- `cert renew` 的默认订阅服务名与安装器一致为 sbx-sub；手工安装使用其他名称时设置 `SBX_PANEL_SUB_SERVICE`。
+
+详细修复范围、回归和未验证事项见 `AUDIT-FIXES-2026-11-04.md`。

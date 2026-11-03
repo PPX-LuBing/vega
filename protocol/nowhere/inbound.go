@@ -165,6 +165,9 @@ func portalTLS(tlsConfig singtls.ServerConfig) (*tls.Config, error) {
 	if err = validateTLS(stdTLS); err != nil {
 		return nil, err
 	}
+	// The watcher publishes immutable configurations shared by handshakes.
+	// Install our callback on a private copy, not the server's cached config.
+	stdTLS = stdTLS.Clone()
 	wrapALPN(stdTLS)
 	return stdTLS, nil
 }

@@ -713,6 +713,34 @@ func (s *Store) Revoke(nodeTag, userName string) error {
 	return err
 }
 
+// SetUserNodes replaces grants atomically; a missing node must not leave a
+// partially saved selection. No nodes means explicitly revoke all grants.
+func (s *Store) SetUserNodes(userName string, tags []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var name string
+	if err = tx.QueryRow(`SELECT name FROM users WHERE name=?`, userName).Scan(&name); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if err = tx.QueryRow(`SELECT tag FROM nodes WHERE tag=?`, tag).Scan(&name); err != nil {
+			return fmt.Errorf("node %s: %w", tag, err)
+		}
+	}
+	if _, err = tx.Exec(`DELETE FROM grants WHERE user_name=?`, userName); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if _, err = tx.Exec(`INSERT OR IGNORE INTO grants (node_tag,user_name) VALUES (?,?)`, tag, userName); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // UsersForNode 返回某节点被授权的用户名。
 func (s *Store) UsersForNode(nodeTag string) ([]string, error) {
 	rows, err := s.db.Query(`SELECT user_name FROM grants WHERE node_tag=? ORDER BY user_name`, nodeTag)

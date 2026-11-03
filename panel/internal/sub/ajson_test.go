@@ -49,6 +49,14 @@ func securityOf(t *testing.T, proxy map[string]any) map[string]any {
 func TestAJSONCoversEverySupportedProtocol(t *testing.T) {
 	st := testStore(t)
 	u := seed(t, st)
+	n, err := st.Node("hk-nw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.EntryHost = n.SNI
+	if err := st.SaveNode(n); err != nil {
+		t.Fatal(err)
+	}
 
 	body, skipped, err := AJSON(st, u)
 	if err != nil {
@@ -136,6 +144,15 @@ func TestAJSONCoversEverySupportedProtocol(t *testing.T) {
 func TestAJSONSkipsUnsupportedProtocols(t *testing.T) {
 	st := testStore(t)
 	u := seed(t, st)
+	n, err := st.Node("hk-nw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.EntryHost = n.SNI
+	if err := st.SaveNode(n); err != nil {
+		t.Fatal(err)
+	}
+
 	for _, n := range []store.Node{
 		{Tag: "hk-vmess", Proto: store.ProtoVMess, Port: 8448, Enabled: true, TLSMode: "tls", SNI: "d.example.com"},
 		{Tag: "hk-tuic", Proto: store.ProtoTUIC, Port: 8449, Enabled: true, TLSMode: "tls", SNI: "e.example.com"},
@@ -227,5 +244,38 @@ func TestWantsAJSON(t *testing.T) {
 		if got := wantsAJSON(req); got != want {
 			t.Errorf("X-Anywhere-Format=%q: wantsAJSON=%t，想要 %t", header, got, want)
 		}
+	}
+}
+
+func TestAJSONNeverReplacesEntryWithSNI(t *testing.T) {
+	for _, tc := range []struct {
+		host, sni, entrySNI string
+		reject              bool
+	}{
+		{"edge.example.net", "origin.example.com", "", true},
+		{"192.0.2.1", "origin.example.com", "", true},
+		{"edge.example.net", "origin.example.com", "edge.example.net", false},
+		{"edge.example.net", "EDGE.EXAMPLE.NET.", "", false},
+		{"edge.example.net", "", "", false},
+	} {
+		t.Run(tc.host+tc.sni+tc.entrySNI, func(t *testing.T) {
+			e := endpoint{Host: tc.host, Port: 8446, Node: store.Node{Tag: "relay", Proto: store.ProtoNowhere, SNI: tc.sni, EntrySNI: tc.entrySNI}, User: store.User{SharedKey: "0123456789abcdef0123456789abcdef"}}
+			p, err := ajsonProxy(e)
+			if tc.reject {
+				if err == nil {
+					t.Fatalf("silently changed or accepted incompatible entry: %v", p)
+				}
+				return
+			}
+			if err != nil || p["server"] != tc.host || p["port"] != 8446 {
+				t.Fatalf("entry changed: %v %v", p, err)
+			}
+		})
+	}
+	st := testStore(t)
+	u := seed(t, st)
+	_, skipped, err := AJSON(st, u)
+	if err != nil || !strings.Contains(strings.Join(skipped, " "), "hk-nw") {
+		t.Fatalf("missing explicit skip: %v %v", skipped, err)
 	}
 }

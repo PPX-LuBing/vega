@@ -17,6 +17,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
@@ -54,6 +55,7 @@ const (
 	modeBrowse mode = iota
 	modeForm
 	modeConfirm
+	modeGrants
 )
 
 // Model 是 TUI 的状态。
@@ -82,9 +84,13 @@ type Model struct {
 	closed           bool
 
 	// 表单
-	form      *form
-	confirm   string
-	confirmFn func() error
+	form          *form
+	confirm       string
+	confirmFn     func() error
+	grantUser     string
+	grantCursor   int
+	grantSelected map[string]bool
+	showHelp      bool
 
 	status  string
 	isError bool
@@ -270,8 +276,18 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quit = true
 		return m, tea.Quit
 	}
-	if m.busy && (key == "a" || key == "e" || key == "d" || key == "space" || key == " " || key == "r" || key == "c" || key == "s" || key == "x") {
+	if m.showHelp && m.mode == modeBrowse {
+		switch key {
+		case "?", "esc", "q":
+			m.showHelp = false
+		}
 		return m, nil
+	}
+	if m.busy && (key == "a" || key == "e" || key == "g" || key == "d" || key == "space" || key == " " || key == "r" || key == "c" || key == "s" || key == "x") {
+		return m, nil
+	}
+	if m.mode == modeGrants {
+		return m.handleGrantKey(key)
 	}
 
 	// 表单模式独占按键
@@ -279,7 +295,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.Type == tea.KeyRunes {
 			text := string(msg.Runes)
 			if utf8.ValidString(text) && !strings.ContainsFunc(text, unicode.IsControl) {
-				m.form.values[m.form.cursor] += text
+				m.form.insert(text)
 			}
 			return m, nil
 		}
@@ -288,17 +304,19 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// 确认模式
 	if m.mode == modeConfirm {
 		switch key {
-		case "y", "Y", "enter":
+		case "y", "Y":
 			if m.confirmFn != nil {
 				if err := m.confirmFn(); err != nil {
 					m.setError("失败: %v", err)
 				} else {
-					m.setStatus("已完成。")
+					m.setStatus("已删除；按 r 下发后内核生效。")
 				}
 			}
 			m.reload()
-		case "n", "N", "esc", "q":
+		case "n", "N", "esc", "q", "enter":
 			m.setStatus("已取消。")
+		default:
+			return m, nil
 		}
 		m.mode = modeBrowse
 		m.confirmFn = nil
@@ -306,6 +324,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch key {
+	case "?":
+		m.showHelp = !m.showHelp
+	case "g":
+		if m.tab == tabUsers && m.cursor < len(m.users) {
+			m.startGrants(m.users[m.cursor].Name)
+		}
+	case "esc":
+		m.showHelp = false
 	case "q", "ctrl+c":
 		m.cancel()
 		m.quit = true
@@ -331,6 +357,14 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < m.rowCount()-1 {
 			m.cursor++
 		}
+	case "pgdown":
+		m.cursor = min(max(0, m.rowCount()-1), m.cursor+max(1, m.height-10))
+	case "pgup":
+		m.cursor = max(0, m.cursor-max(1, m.height-10))
+	case "home":
+		m.cursor = 0
+	case "end":
+		m.cursor = max(0, m.rowCount()-1)
 	case "a":
 		return m.startAdd()
 	case "e":
@@ -444,7 +478,7 @@ func (m *Model) toggleEnabled() (tea.Model, tea.Cmd) {
 			if err := m.store.SaveNode(node); err != nil {
 				m.setError("保存失败: %v", err)
 			} else {
-				m.setStatus("节点 %s 已%s。", node.Tag, enabledText(node.Enabled))
+				m.setStatus("节点 %s 已保存为%s；按 r 下发后生效。", node.Tag, enabledText(node.Enabled))
 			}
 		}
 	case tabUsers:
@@ -454,7 +488,7 @@ func (m *Model) toggleEnabled() (tea.Model, tea.Cmd) {
 			if err := m.store.SaveUser(user); err != nil {
 				m.setError("保存失败: %v", err)
 			} else {
-				m.setStatus("用户 %s 已%s。", user.Name, enabledText(user.Enabled))
+				m.setStatus("用户 %s 已保存为%s；按 r 下发后生效。", user.Name, enabledText(user.Enabled))
 			}
 		}
 	}
@@ -493,6 +527,7 @@ func (m *Model) startAdd() (tea.Model, tea.Cmd) {
 			{label: "配额(GB)", hint: "0 表示不限", def: "0"},
 			{label: "有效期(天)", hint: "0 表示永久", def: "0"},
 		}, m.submitUserForm)
+		m.form.after = func(values []string) { m.startGrants(strings.TrimSpace(values[0])) }
 		m.mode = modeForm
 	}
 	return m, nil
@@ -552,11 +587,11 @@ func (m *Model) startEdit() (tea.Model, tea.Cmd) {
 
 func nodeFields(n store.Node) []field {
 	return []field{
-		{label: "tag", def: n.Tag}, {label: "协议", def: n.Proto, hint: "nowhere/anytls/hysteria2/vless/vmess/trojan/shadowsocks"},
-		{label: "端口", def: strconv.Itoa(n.Port)}, {label: "TLS 模式", def: n.TLSMode}, {label: "SNI", def: n.SNI}, {label: "备注", def: n.Remark},
+		{label: "tag", def: n.Tag}, {label: "协议", def: n.Proto, hint: "左右键选择，含 TUIC", pick: store.Protocols},
+		{label: "端口", def: strconv.Itoa(n.Port)}, {label: "TLS 模式", def: n.TLSMode, pick: []string{"tls", "reality", "none"}}, {label: "SNI", def: n.SNI}, {label: "备注", def: n.Remark},
 		{label: "证书路径", def: n.CertPath, hint: "留空 = 用面板签发的证书（按 SNI 找目录）"}, {label: "私钥路径", def: n.KeyPath}, {label: "REALITY dest", def: n.Dest},
 		{label: "机器", def: n.Machine}, {label: "接入地址", def: n.EntryHost, hint: "多个地址以逗号分隔"}, {label: "接入端口", def: strconv.Itoa(n.EntryPort)},
-		{label: "入口 SNI", def: n.EntrySNI}, {label: "传输", def: n.Transport, hint: "tcp/ws/grpc/httpupgrade"},
+		{label: "入口 SNI", def: n.EntrySNI}, {label: "传输", def: n.Transport, pick: []string{"tcp", "ws", "grpc", "httpupgrade"}, hint: "左右键选择"},
 		{label: "路径", def: n.Path}, {label: "Host", def: n.Host}, {label: "gRPC service", def: n.GRPCService}, {label: "TLS 指纹", def: n.Fingerprint},
 	}
 }
@@ -629,15 +664,18 @@ type field struct {
 	label string
 	hint  string
 	def   string
+	pick  []string
 }
 
 type form struct {
-	title   string
-	fields  []field
-	values  []string
-	cursor  int
-	submit  func([]string) error
-	message string
+	title     string
+	fields    []field
+	values    []string
+	cursor    int
+	submit    func([]string) error
+	message   string
+	positions []int
+	after     func([]string)
 }
 
 func newForm(title string, fields []field, submit func([]string) error) *form {
@@ -645,11 +683,25 @@ func newForm(title string, fields []field, submit func([]string) error) *form {
 	for i, f := range fields {
 		values[i] = f.def
 	}
-	return &form{title: title, fields: fields, values: values, submit: submit}
+	positions := make([]int, len(fields))
+	for i, value := range values {
+		positions[i] = utf8.RuneCountInString(value)
+	}
+	return &form{title: title, fields: fields, values: values, positions: positions, submit: submit}
+}
+
+func (f *form) insert(text string) {
+	runes := []rune(f.values[f.cursor])
+	pos := min(f.positions[f.cursor], len(runes))
+	f.values[f.cursor] = string(runes[:pos]) + text + string(runes[pos:])
+	f.positions[f.cursor] = pos + utf8.RuneCountInString(text)
 }
 
 func (m *Model) handleFormKey(key string) (tea.Model, tea.Cmd) {
 	f := m.form
+	runes := []rune(f.values[f.cursor])
+	pos := min(f.positions[f.cursor], len(runes))
+	f.positions[f.cursor] = pos
 	switch key {
 	case "esc":
 		m.mode = modeBrowse
@@ -670,18 +722,54 @@ func (m *Model) handleFormKey(key string) (tea.Model, tea.Cmd) {
 		m.mode = modeBrowse
 		m.form = nil
 		m.reload()
-		m.setStatus("已保存。")
+		m.setStatus("已保存；按 r 下发后内核生效。")
+		if f.after != nil {
+			f.after(f.values)
+		}
 		return m, nil
 	case "backspace":
-		if len(f.values[f.cursor]) > 0 {
-			_, size := utf8.DecodeLastRuneInString(f.values[f.cursor])
-			f.values[f.cursor] = f.values[f.cursor][:len(f.values[f.cursor])-size]
+		if pos > 0 {
+			f.values[f.cursor] = string(runes[:pos-1]) + string(runes[pos:])
+			f.positions[f.cursor]--
+		}
+		return m, nil
+	case "delete":
+		if pos < len(runes) {
+			f.values[f.cursor] = string(runes[:pos]) + string(runes[pos+1:])
+		}
+		return m, nil
+	case "ctrl+u":
+		f.values[f.cursor], f.positions[f.cursor] = "", 0
+		return m, nil
+	case "home", "end":
+		f.positions[f.cursor] = 0
+		if key == "end" {
+			f.positions[f.cursor] = len(runes)
+		}
+		return m, nil
+	case "left", "right":
+		delta := 1
+		if key == "left" {
+			delta = -1
+		}
+		if choices := f.fields[f.cursor].pick; len(choices) > 0 {
+			index := 0
+			for i, value := range choices {
+				if value == f.values[f.cursor] {
+					index = i
+					break
+				}
+			}
+			f.values[f.cursor] = choices[(index+delta+len(choices))%len(choices)]
+			f.positions[f.cursor] = utf8.RuneCountInString(f.values[f.cursor])
+		} else {
+			f.positions[f.cursor] = max(0, min(len(runes), pos+delta))
 		}
 		return m, nil
 	}
 	// 可打印字符直接进当前字段
 	if key == " " {
-		f.values[f.cursor] += key
+		f.insert(key)
 	}
 	return m, nil
 }
@@ -697,7 +785,11 @@ func (m *Model) View() string {
 	b.WriteString(m.viewHeader())
 	b.WriteString("\n\n")
 
-	if m.mode == modeForm && m.form != nil {
+	if m.mode == modeGrants {
+		b.WriteString(m.viewGrants())
+	} else if m.showHelp && m.mode == modeBrowse {
+		b.WriteString("  管理：a 新增 / e 编辑 / d 删除（仅 y 确认）\n  用户页：g 节点授权；新增用户后自动进入授权\n  列表：↑↓ / PgUp/PgDn / Home/End\n  r 下发全部机器（重启，断开现有连接）\n  c 采集 / x 执行配额（可能重启）\n  s 仅热同步 Nowhere 新连接 / u 刷新\n  保存与启停只改数据库，须下发后内核生效。\n  订阅和二维码：CLI user sub / user qr\n  ? 或 Esc 关闭帮助\n")
+	} else if m.mode == modeForm && m.form != nil {
 		b.WriteString(m.viewForm())
 	} else {
 		switch m.tab {
@@ -722,7 +814,7 @@ func (m *Model) View() string {
 	b.WriteString(m.viewStatus())
 	b.WriteString("\n")
 	b.WriteString(m.viewHelp())
-	return b.String()
+	return m.fitView(b.String())
 }
 
 func (m *Model) viewHeader() string {
@@ -749,7 +841,10 @@ func (m *Model) viewHeader() string {
 	if m.snapErr != nil {
 		stateText = styleErr.Render(state)
 	}
-	return styleTitle.Render("sbx-panel") + styleDim.Render("  内核 ") + stateText +
+	if m.width > 0 && m.width < 90 {
+		return styleTitle.Render("Vega") + " " + stateText + "\n" + strings.Join(tabs, " ")
+	}
+	return styleTitle.Render("Vega") + styleDim.Render("  内核 ") + stateText +
 		styleDim.Render("  ") + strings.Join(tabs, " ")
 }
 
@@ -765,10 +860,13 @@ func (m *Model) viewStatus() string {
 }
 
 func (m *Model) viewHelp() string {
-	if m.mode == modeForm {
-		return styleHelp.Render("  Tab/↑↓ 切换字段 · Enter 保存 · Esc 取消 · 直接打字输入")
+	if m.mode == modeGrants {
+		return styleHelp.Render("  ↑↓ 选择 · 空格 勾选 · Enter 保存 · Esc 取消")
 	}
-	return styleHelp.Render("  1-5/Tab 切页 · ↑↓ 选择 · a 新增 · e 编辑 · d 删除 · 空格 启停 · r 下发 · c 采集 · s 热同步 · x 执行配额(可能重启) · u 刷新 · q 退出")
+	if m.mode == modeForm {
+		return styleHelp.Render("  Tab/↑↓ 字段 · ←→ 编辑/选择 · Ctrl+U 清空 · Enter 保存 · Esc 取消")
+	}
+	return styleHelp.Render("  1-5/Tab 切页 · ↑↓ 选择 · a/e/d 管理 · g 授权 · ? 帮助 · q 退出")
 }
 
 func (m *Model) viewOverview() string {
@@ -837,16 +935,17 @@ func (m *Model) viewNodes() string {
 		return styleDim.Render("  还没有节点。按 a 新增。") + "\n"
 	}
 	var b strings.Builder
-	b.WriteString(styleDim.Render(fmt.Sprintf("  %-18s %-13s %-7s %-9s %-7s %s",
-		"TAG", "协议", "端口", "TLS", "用户", "状态")))
+	b.WriteString(styleDim.Render("  " + cell("TAG", 18) + " " + cell("协议", 13) + " " + cell("端口", 7) + " " + cell("TLS", 9) + " " + cell("用户", 7) + " 状态"))
 	b.WriteString("\n")
-	for i, node := range m.nodes {
+	start, end := m.rowWindow(len(m.nodes), m.cursor)
+	for i := start; i < end; i++ {
+		node := m.nodes[i]
 		state := styleOK.Render("启用")
 		if !node.Enabled {
 			state = styleDim.Render("停用")
 		}
-		line := fmt.Sprintf("  %-18s %-13s %-7d %-9s %-7d ",
-			truncate(node.Tag, 18), node.Proto, node.Port, node.TLSMode, m.nodeUsers[node.Tag])
+		line := fmt.Sprintf("  %s %-13s %-7d %-9s %-7d ",
+			cell(node.Tag, 18), node.Proto, node.Port, node.TLSMode, m.nodeUsers[node.Tag])
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸") + styleSelected.Render(line[1:]) + state + "\n")
 		} else {
@@ -861,10 +960,11 @@ func (m *Model) viewUsers() string {
 		return styleDim.Render("  还没有用户。按 a 新增。") + "\n"
 	}
 	var b strings.Builder
-	b.WriteString(styleDim.Render(fmt.Sprintf("  %-16s %-11s %-11s %-12s %-6s %s",
-		"用户", "已用", "配额", "到期", "节点", "状态")))
+	b.WriteString(styleDim.Render("  " + cell("用户", 16) + " " + cell("已用", 11) + " " + cell("配额", 11) + " " + cell("到期", 12) + " " + cell("节点", 6) + " 状态"))
 	b.WriteString("\n")
-	for i, user := range m.users {
+	start, end := m.rowWindow(len(m.users), m.cursor)
+	for i := start; i < end; i++ {
+		user := m.users[i]
 		usage := m.usage[user.Name]
 		used := usage[0] + usage[1]
 		quota := "不限"
@@ -883,9 +983,9 @@ func (m *Model) viewUsers() string {
 			stateStyle = styleWarn
 		}
 
-		line := fmt.Sprintf("  %-16s %-11s %-11s %-12s %-6d ",
-			truncate(user.Name, 16), kernel.HumanBytes(used), quota,
-			expiryText(user.ExpiresAt), m.userNodes[user.Name])
+		line := fmt.Sprintf("  %s %-11s %s %s %-6d ",
+			cell(user.Name, 16), kernel.HumanBytes(used), cell(quota, 11),
+			cell(expiryText(user.ExpiresAt), 12), m.userNodes[user.Name])
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸") + styleSelected.Render(line[1:]) + stateStyle.Render(state) + "\n")
 		} else {
@@ -902,12 +1002,14 @@ func (m *Model) viewTraffic() string {
 	var b strings.Builder
 	b.WriteString(styleDim.Render(fmt.Sprintf("  %-16s %-11s %-11s %s", "用户", "上行", "下行", "配额占用")))
 	b.WriteString("\n")
-	for i, user := range m.users {
+	start, end := m.rowWindow(len(m.users), m.cursor)
+	for i := start; i < end; i++ {
+		user := m.users[i]
 		usage := m.usage[user.Name]
 		used := usage[0] + usage[1]
 		bar := progressBar(used, user.QuotaBytes, 24)
-		line := fmt.Sprintf("  %-16s %-11s %-11s %s",
-			truncate(user.Name, 16), kernel.HumanBytes(usage[0]), kernel.HumanBytes(usage[1]), bar)
+		line := fmt.Sprintf("  %s %-11s %-11s %s",
+			cell(user.Name, 16), kernel.HumanBytes(usage[0]), kernel.HumanBytes(usage[1]), bar)
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸") + styleSelected.Render(line[1:]) + "\n")
 		} else {
@@ -922,10 +1024,16 @@ func (m *Model) viewMachines() string {
 		return styleDim.Render("  只管理本机。用 `sbx-panel machine add` 登记其它机器。") + "\n"
 	}
 	var b strings.Builder
-	b.WriteString(styleDim.Render(fmt.Sprintf("  %-12s %-22s %-6s %-24s %-6s %s",
-		"NAME", "HOST", "SSH", "内核路径", "节点", "状态")))
+	narrow := m.width > 0 && m.width < 100
+	if narrow {
+		b.WriteString(styleDim.Render("  " + cell("NAME", 12) + " " + cell("HOST", 22) + " " + cell("节点", 6) + " 状态"))
+	} else {
+		b.WriteString(styleDim.Render("  " + cell("NAME", 12) + " " + cell("HOST", 22) + " " + cell("SSH", 6) + " " + cell("内核路径", 24) + " " + cell("节点", 6) + " 状态"))
+	}
 	b.WriteString("\n")
-	for i, machine := range m.machines {
+	start, end := m.rowWindow(len(m.machines), m.cursor)
+	for i := start; i < end; i++ {
+		machine := m.machines[i]
 		host := machine.Host
 		sshPort := strconv.Itoa(machine.SSHPort)
 		if machine.Name == store.LocalMachine || host == "" {
@@ -944,9 +1052,12 @@ func (m *Model) viewMachines() string {
 				state, stateStyle = "读取失败", styleErr
 			}
 		}
-		line := fmt.Sprintf("  %-12s %-22s %-6s %-24s %-6d ",
-			truncate(machine.Name, 12), truncate(host, 22), sshPort,
-			truncate(machine.KernelPath, 24), nodeCount)
+		line := fmt.Sprintf("  %s %s %-6s %s %-6d ",
+			cell(machine.Name, 12), cell(host, 22), sshPort,
+			cell(machine.KernelPath, 24), nodeCount)
+		if narrow {
+			line = fmt.Sprintf("  %s %s %-6d ", cell(machine.Name, 12), cell(host, 22), nodeCount)
+		}
 		if i == m.cursor {
 			b.WriteString(styleCursor.Render("▸") + styleSelected.Render(line[1:]) + stateStyle.Render(state) + "\n")
 		} else {
@@ -971,7 +1082,14 @@ func (m *Model) viewForm() string {
 		label := fmt.Sprintf("  %-12s", fd.label)
 		value := f.values[i]
 		if i == f.cursor {
-			b.WriteString(styleSelected.Render(label) + styleCursor.Render("["+value+"_]"))
+			runes := []rune(value)
+			pos := min(f.positions[i], len(runes))
+			before, after := string(runes[:pos]), string(runes[pos:])
+			if m.width > 0 {
+				before = ansi.TruncateLeft(before, max(0, ansi.StringWidth(before)-max(1, m.width-24)), "")
+				after = ansi.Truncate(after, max(0, m.width-24-ansi.StringWidth(before)), "")
+			}
+			b.WriteString(styleSelected.Render(label) + styleCursor.Render("["+before+"_"+after+"]"))
 		} else {
 			b.WriteString(styleDim.Render(label) + "[" + value + "]")
 		}

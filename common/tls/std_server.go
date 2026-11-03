@@ -95,6 +95,7 @@ func getACMENextProtos(provider adapter.CertificateProvider) []string {
 }
 
 type STDServerConfig struct {
+	reloadAccess          sync.Mutex
 	ctx                   context.Context
 	access                sync.RWMutex
 	config                *tls.Config
@@ -139,7 +140,7 @@ func (c *STDServerConfig) SetNextProtos(nextProto []string) {
 	defer c.access.Unlock()
 	config := c.config.Clone()
 	if c.hasACMEALPN() && len(c.config.NextProtos) > 1 && c.config.NextProtos[0] == C.ACMETLS1Protocol {
-		config.NextProtos = append(c.config.NextProtos[:1], nextProto...)
+		config.NextProtos = append([]string{C.ACMETLS1Protocol}, nextProto...)
 	} else {
 		config.NextProtos = nextProto
 	}
@@ -171,18 +172,26 @@ func (c *STDServerConfig) hasACMEALPN() bool {
 }
 
 func (c *STDServerConfig) STDConfig() (*STDConfig, error) {
+	c.access.RLock()
+	defer c.access.RUnlock()
 	return c.config, nil
 }
 
 func (c *STDServerConfig) Client(conn net.Conn) (Conn, error) {
+	c.access.RLock()
+	defer c.access.RUnlock()
 	return tls.Client(conn, c.config), nil
 }
 
 func (c *STDServerConfig) Server(conn net.Conn) (Conn, error) {
+	c.access.RLock()
+	defer c.access.RUnlock()
 	return tls.Server(conn, c.config), nil
 }
 
 func (c *STDServerConfig) Clone() Config {
+	c.access.RLock()
+	defer c.access.RUnlock()
 	return &STDServerConfig{
 		config:           c.config.Clone(),
 		handshakeTimeout: c.handshakeTimeout,
@@ -263,6 +272,10 @@ func (c *STDServerConfig) startWatcher() error {
 }
 
 func (c *STDServerConfig) certificateUpdated(path string) error {
+	// fswatch can deliver certificate/key callbacks concurrently. Keep the
+	// cached PEM pair consistent before publishing a new immutable TLS config.
+	c.reloadAccess.Lock()
+	defer c.reloadAccess.Unlock()
 	if path == c.certificatePath || path == c.keyPath {
 		switch path {
 		case c.certificatePath:

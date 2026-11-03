@@ -743,27 +743,17 @@ func runServe(dbPath string, paths kernel.Paths, args []string) error {
 		ACMEEmail:    strings.TrimSpace(*acmeEmail),
 		ACMECacheDir: strings.TrimSpace(*acmeCache),
 		ACMECertDir:  strings.TrimSpace(*certDir),
-		OnCertChange: restartKernelOnCertChange(paths),
+		OnCertChange: logCertChange,
 		ACMEHTTPAddr: *acmeHTTP,
 		ACMETLSAddr:  *acmeTLS, CertFile: *certFile, KeyFile: *keyFile,
 	})
 }
 
-// restartKernelOnCertChange 在证书文件变化后重启内核。
-//
-// 内核只在启动时读 certificate_path，换了文件不重启就是白换——节点会一直用
-// 旧证书，直到旧证书过期、客户端全部握手失败。回调是在 TLS 握手/续期路径上
-// 同步调的，重启要几秒，所以必须丢后台。
-func restartKernelOnCertChange(paths kernel.Paths) func(cert.Change) {
-	return func(change cert.Change) {
-		go func() {
-			log.Printf("证书已更新（%s，%s 到期），重启 %s 让节点加载新证书",
-				change.Domain, change.NotAfter.Local().Format("2006-01-02 15:04"), paths.Service)
-			if err := kernel.Restart(paths); err != nil {
-				log.Printf("重启 %s 失败: %v（节点还在用旧证书，手动 systemctl restart %s）", paths.Service, err, paths.Service)
-			}
-		}()
-	}
+// sing-box watches certificate_path/key_path; restarting would drop active
+// connections and uncollected usage, including unrelated protocols.
+func logCertChange(change cert.Change) {
+	log.Printf("证书文件已更新（%s，%s 到期）；运行中的内核自动热加载，请检查内核 reload certificate 日志；未重启服务",
+		change.Domain, change.NotAfter.Local().Format("2006-01-02 15:04"))
 }
 
 // runSetting 读写面板设置。

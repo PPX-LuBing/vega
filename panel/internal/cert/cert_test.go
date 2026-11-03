@@ -314,3 +314,27 @@ func TestNewRejectsBadConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusRejectsMismatchedKey(t *testing.T) {
+	manager := newTestManager(t, nil)
+	ctx := context.Background()
+	if err := manager.cache.Put(ctx, "hk.example.com", selfSigned(t, "hk.example.com", time.Now().Add(90*24*time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	otherKey, _, err := splitPEM(selfSigned(t, "hk.example.com", time.Now().Add(90*24*time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(manager.KeyFile(), otherKey, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Status().Exists {
+		t.Fatal("mismatched key considered valid")
+	}
+	if _, err = manager.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.Status().Exists {
+		t.Fatal("cache sync did not repair key")
+	}
+}

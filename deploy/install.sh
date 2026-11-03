@@ -21,7 +21,7 @@ install -d -m 700 "$root/var/lib/sbx" "$root/var/lib/sbx-panel"
 install -m 755 "$1" "$root/usr/local/bin/sbx"
 install -m 755 "$2" "$root/usr/local/bin/sbx-panel"
 install -m 755 "$3" "$root/usr/local/bin/sb-stats"
-for unit in sbx.service sbx-sub.service sbx-enforce.service; do
+for unit in sbx.service sbx-sub.service sbx-enforce.service sbx-cert-check.service sbx-cert-check.timer; do
     install -m 644 "$here/$unit" "$root/etc/systemd/system/$unit"
 done
 if [ -z "$root" ]; then

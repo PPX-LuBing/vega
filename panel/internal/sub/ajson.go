@@ -3,7 +3,6 @@ package sub
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"strings"
 
 	"github.com/PPX-LuBing/vega/panel/internal/store"
@@ -87,9 +86,11 @@ func ajsonProxy(e endpoint) (map[string]any, error) {
 		// morph 显式写出来：官方默认值是 true，但服务端关掉而客户端默认开着
 		// 就会握手失败，靠默认值迟早出事。
 		proxy["morph"] = n.Morph
-		// nowhere 的 TLS 是固定的、没有 sni 字段，客户端只能拿 server 当 SNI。
-		// 填 IP 会让证书校验直接失败，所以这里必须用证书上的域名。
-		proxy["server"] = preferDomain(n.SNI, e.Host)
+		// AJSON Nowhere uses server for certificate verification. Never replace
+		// an entry with its SNI: that could bypass a relay or use the wrong port.
+		if n.SNI != "" && !strings.EqualFold(strings.TrimSuffix(n.SNI, "."), strings.TrimSuffix(e.Host, ".")) {
+			return nil, fmt.Errorf("Anywhere Nowhere 不支持独立 SNI；接入地址 %s 与 SNI %s 不同，请配置证书匹配的接入域名", e.Host, n.SNI)
+		}
 
 	case store.ProtoVLESS:
 		proxy["protocol"] = "vless"
@@ -200,15 +201,4 @@ func ajsonTransport(n store.Node) map[string]any {
 		transport["host"] = n.Host
 	}
 	return transport
-}
-
-// preferDomain 在证书名和接入地址之间挑一个能当 SNI 用的域名。
-//
-// 两者都是 IP 时只能照发地址——那种情况下证书校验本来就过不去，
-// 得让运维去节点上补 SNI，而不是在这里悄悄换成别的值。
-func preferDomain(sni, host string) string {
-	if sni = strings.TrimSpace(sni); sni != "" && net.ParseIP(sni) == nil {
-		return sni
-	}
-	return host
 }

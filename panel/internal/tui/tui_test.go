@@ -11,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
 	"github.com/PPX-LuBing/vega/panel/internal/store"
@@ -284,8 +285,8 @@ func TestAddUserThroughForm(t *testing.T) {
 	model, _ = m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = model.(*Model)
 
-	if m.mode != modeBrowse {
-		t.Fatalf("提交后应回到浏览模式，实际 %v", m.mode)
+	if m.mode != modeGrants {
+		t.Fatalf("提交后应进入授权模式，实际 %v", m.mode)
 	}
 	user, err := m.store.User("carol")
 	if err != nil {
@@ -444,7 +445,7 @@ func TestTableRowsAligned(t *testing.T) {
 			if strings.TrimSpace(line) == "" {
 				break
 			}
-			widths = append(widths, len([]rune(strings.TrimRight(line, " "))))
+			widths = append(widths, lipgloss.Width(strings.TrimRight(line, " ")))
 		}
 		if len(widths) < 2 {
 			t.Fatalf("第 %d 页表格行不足: %v", tc.tab, widths)
@@ -455,5 +456,135 @@ func TestTableRowsAligned(t *testing.T) {
 					tc.tab, i, w, widths[0])
 			}
 		}
+	}
+}
+
+func TestDeleteEnterMeansNo(t *testing.T) {
+	for _, tab := range []int{tabNodes, tabUsers} {
+		m := testModel(t)
+		m.tab = tab
+		m.startDelete()
+		m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.mode != modeBrowse {
+			t.Fatal("confirmation remained open")
+		}
+		if tab == tabNodes {
+			if _, err := m.store.Node(m.nodes[0].Tag); err != nil {
+				t.Fatal("Enter deleted node")
+			}
+		} else {
+			if _, err := m.store.User(m.users[0].Name); err != nil {
+				t.Fatal("Enter deleted user")
+			}
+		}
+	}
+}
+
+func TestUserGrantWorkflow(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabUsers
+	m.startAdd()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("new-user")})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.mode != modeGrants {
+		t.Fatal("new user did not enter grants")
+	}
+	tags, _ := m.store.NodesForUser("new-user")
+	if len(tags) != 0 {
+		t.Fatal("implicit grants")
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	tags, err := m.store.NodesForUser("new-user")
+	if err != nil || len(tags) != 1 || tags[0] != m.nodes[0].Tag {
+		t.Fatalf("grants: %v %v", tags, err)
+	}
+	m.startGrants("new-user")
+	m.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	tags, _ = m.store.NodesForUser("new-user")
+	if len(tags) != 1 {
+		t.Fatal("cancel changed grants")
+	}
+	m.startGrants("new-user")
+	m.handleKey(tea.KeyMsg{Type: tea.KeySpace})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	tags, _ = m.store.NodesForUser("new-user")
+	if len(tags) != 0 {
+		t.Fatal("revoke failed")
+	}
+}
+
+func TestViewFitsAndSelectionStaysVisible(t *testing.T) {
+	m := testModel(t)
+	for i := 0; i < 40; i++ {
+		m.nodes = append(m.nodes, store.Node{Tag: fmt.Sprintf("node-%02d", i), Proto: "nowhere", Port: 8446, TLSMode: "tls", Enabled: true})
+		m.users = append(m.users, store.User{Name: fmt.Sprintf("user-%02d", i)})
+		m.machines = append(m.machines, store.Machine{Name: fmt.Sprintf("host-%02d", i)})
+	}
+	for _, size := range [][2]int{{80, 24}, {120, 36}, {40, 16}} {
+		m.width, m.height = size[0], size[1]
+		for tab := 0; tab < tabCount; tab++ {
+			m.tab = tab
+			m.cursor = 30
+			out := m.View()
+			if lipgloss.Width(out) > m.width || lipgloss.Height(out) > m.height {
+				t.Fatalf("tab %d size=%v rendered %dx%d", tab, size, lipgloss.Width(out), lipgloss.Height(out))
+			}
+			if tab != tabOverview && !strings.Contains(out, "▸") {
+				t.Fatal("selected row invisible")
+			}
+		}
+	}
+	m.tab = tabUsers
+	m.showHelp = false
+	before := m.View()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	if before == m.View() {
+		t.Fatal("help did nothing")
+	}
+}
+
+func TestFormCursorEditingAndEnums(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabUsers
+	m.startAdd()
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("香港")})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyLeft})
+	m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("新")})
+	if m.form.values[0] != "香新港" {
+		t.Fatal(m.form.values[0])
+	}
+	m.handleFormKey("delete")
+	m.handleFormKey("backspace")
+	if m.form.values[0] != "香" {
+		t.Fatal(m.form.values[0])
+	}
+	m.handleFormKey("ctrl+u")
+	if m.form.values[0] != "" {
+		t.Fatal("clear failed")
+	}
+	m.tab = tabNodes
+	m.startAdd()
+	m.form.cursor = 1
+	m.handleFormKey("right")
+	if m.form.values[1] != store.ProtoAnyTLS {
+		t.Fatal("protocol picker failed")
+	}
+}
+
+func TestHelpBlocksHiddenActions(t *testing.T) {
+	m := testModel(t)
+	m.tab = tabNodes
+	m.showHelp = true
+	for _, key := range []string{"d", "a", "e", "r", " "} {
+		_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(key)})
+		if cmd != nil || m.mode != modeBrowse || !m.showHelp {
+			t.Fatalf("help allowed hidden action %q", key)
+		}
+	}
+	m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.showHelp {
+		t.Fatal("help did not close")
 	}
 }

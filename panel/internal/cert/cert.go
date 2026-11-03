@@ -5,8 +5,8 @@
 // 缓存里拆文件，续期之后节点证书悄悄过期——订阅还能用，节点全挂。
 //
 // 做法：把 autocert 的 Cache 包一层，Put 时除了写它自己的缓存，再额外落一份稳定
-// 的 PEM（<cert_dir>/<域名>/{cert.pem,key.pem}）。内核只读这份稳定文件，面板负责
-// 在内容变化后重启内核（sing-box 只在启动时读证书，不重启不生效）。
+// 的 PEM（<cert_dir>/<域名>/{cert.pem,key.pem}）。运行中的 sing-box 监视并
+// 热加载这份稳定文件，无需因续期重启内核。
 //
 // 不用 sing-box 自带的 certificate_provider：它用 certmagic 的私有目录结构
 // （certificates/<ca>/<域名>/<域名>.crt），订阅服务读不了，做不到一份证书两处用。
@@ -194,6 +194,9 @@ func (m *Manager) materialize(data []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return false, fmt.Errorf("invalid certificate/key pair: %w", err)
+	}
 	// 缓存里可能躺着别的域名的证书（改过域名、或者手动塞过），
 	// 落到这个目录就等于给内核发了张用不了的证书，宁可报错。
 	if err := leaf.VerifyHostname(m.cfg.Domain); err != nil {
@@ -231,12 +234,12 @@ type Status struct {
 	Domain   string
 	CertFile string
 	KeyFile  string
-	// Exists 表示证书和私钥两个文件都在、且证书能解析。
+	// Exists 表示证钥匹配、域名正确且已到生效时间；到期另由 Expiring 判断。
 	Exists   bool
 	NotAfter time.Time
 	// DaysLeft 是距到期还有几天，已过期就是负数。
 	DaysLeft int
-	// SHA256 是 cert.pem 的内容指纹，用来判断「内核加载的是不是这一份」。
+	// SHA256 是磁盘 cert.pem 的内容指纹，不代表已确认内核加载。
 	SHA256 string
 }
 
@@ -254,7 +257,8 @@ func (s Status) Expiring() bool {
 func StatusOf(certDir, domain string) Status {
 	certFile, keyFile := PEMPaths(certDir, domain)
 	status := Status{Domain: domain, CertFile: certFile, KeyFile: keyFile}
-	if _, err := os.Stat(keyFile); err != nil {
+	key, err := os.ReadFile(keyFile)
+	if err != nil {
 		return status
 	}
 	data, err := os.ReadFile(certFile)
@@ -263,6 +267,12 @@ func StatusOf(certDir, domain string) Status {
 	}
 	leaf, err := parseLeaf(data)
 	if err != nil {
+		return status
+	}
+	if _, err := tls.X509KeyPair(data, key); err != nil {
+		return status
+	}
+	if leaf.VerifyHostname(domain) != nil || time.Now().Before(leaf.NotBefore) {
 		return status
 	}
 	sum := sha256.Sum256(data)
