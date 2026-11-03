@@ -40,7 +40,7 @@ func TestUserSyncPreservesReplayProtection(t *testing.T) {
 		t.Fatal("missing client first flight")
 	}
 	accept := func() error {
-		_, keys, _ := s.snapshotUsers()
+		_, keys, _, _ := s.snapshotUsers()
 		a, b := net.Pipe()
 		defer a.Close()
 		defer b.Close()

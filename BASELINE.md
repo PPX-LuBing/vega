@@ -70,17 +70,19 @@ go build -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_ac
 
 ## third_party/nowhere-go
 
-基线是 [ohmycggk/nowhere-go](https://github.com/ohmycggk/nowhere-go) 的 `v3.2.0`（commit `6a8410c`）。
+基线是 [ohmycggk/nowhere-go](https://github.com/ohmycggk/nowhere-go) 的 `v3.3.0`（commit `6b9ec08`）。
 
 补丁集中在三个文件（详见 `third_party/nowhere-go/VEGA-PATCHES.md`）：
 
 | 文件 | 补丁 |
 |---|---|
 | `morph/morph.go` | `WrapTCPServerMulti` / `MatchedKeyIndex`——多密钥试解 prelude |
-| `portal/server.go` | `Config.Users` 多用户、双路径识别、`UpdateUsers` 运行期换名单、`UserCount`、`ContextWithUser` / `SourceFromContext`、沿用未变密钥的防重放状态、连接清理 |
+| `portal/server.go` | `Config.Users` 多用户、双路径识别、热更新与防重放状态保留、身份/来源上下文、3.3 握手超时适配、连接清理与 TLS Egress 所有权交接 |
 | `vector/client.go` | context 取消覆盖 Morph、认证与 setup；Close 取消限速等待；不改报文或协议状态机 |
 
 同步方式：合并新版与这三个文件的本地改动，保留对应测试（`portal/multiuser_test.go`、`portal/replay_update_test.go`、`vector/cancel_test.go`），并运行整个独立 module 的竞态回归。不要因修复适配层而修改官方 wire/auth/Morph 算法。
+
+v3.3.0 的 `UPSTREAM.lock` 另有一处元数据修正：按官方固定提交重算协议源码哈希，未改动 nw2 锁。此次升级与官方 Rust 双向互通记录见 `NOWHERE-UPGRADE-3.3.0.md`。
 
 ## 判断改动是否完整
 

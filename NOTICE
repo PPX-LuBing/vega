@@ -33,7 +33,7 @@ Vega 站在下面这些项目的肩膀上。它们各自的版权与许可如下
 
 <https://github.com/ohmycggk/nowhere-go>
 
-`third_party/nowhere-go/` 是该库的副本（基线 v3.2.0，commit `6a8410c`），
+`third_party/nowhere-go/` 是该库的副本（基线 v3.3.0，commit `6b9ec08`），
 我们加了多密钥试解、多用户与运行期换名单，以及 Vector 建连取消修复。
 补丁范围与升级检查见 `third_party/nowhere-go/VEGA-PATCHES.md`。
 Nowhere 协议的握手、Morph 伪装、FLOW 与 UoT 等全部实现来自这个库。

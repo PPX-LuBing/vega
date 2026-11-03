@@ -238,7 +238,7 @@ sudo sh deploy/install.sh ./vega ./panel/vega-panel ./tools/sbstats/sb-stats
 
 ## third_party/nowhere-go
 
-[nowhere-go](https://github.com/ohmycggk/nowhere-go) 的副本，基线是上游 **v3.2.0**（`6a8410c`），本地补丁如下：
+[nowhere-go](https://github.com/ohmycggk/nowhere-go) 的副本，基线是上游 **v3.3.0**（`6b9ec08`），本地补丁如下：
 
 | 文件 | 补丁 |
 |---|---|
@@ -275,6 +275,7 @@ Vega 站在这些项目的肩膀上：
     nowhere-go          Copyright (C) 2026 ohmycggk
 
 因为上游是 GPL-3.0，这是**法律上必须**的：衍生作品不能换成更宽松的许可。
+
 ## 2026-11-04 审核修复与操作注意
 
 - Nowhere 出站默认 Morph 开启（显式 false 仍可关闭），与入站及固定的官方 nw3 基线一致。UDP 保留来源地址，多目标回包独立接收；Close、context 和 deadline 能终止等待，目标缓存与接收队列均有界。协议线上格式不变。
@@ -286,3 +287,7 @@ Vega 站在这些项目的肩膀上：
 - `cert renew` 的默认订阅服务名与安装器一致为 sbx-sub；手工安装使用其他名称时设置 `SBX_PANEL_SUB_SERVICE`。
 
 详细修复范围、回归和未验证事项见 `AUDIT-FIXES-2026-11-04.md`。
+
+后续已在 main 将 nowhere-go 更新到 v3.3.0，并重新核验官方源码锁。
+升级范围与互通验证见 `NOWHERE-UPGRADE-3.3.0.md`；Vega 仍使用 TCP+TLS
+carrier 承载 TCP/UDP，不因库升级自动启用 QUIC carrier 或 Egress。

@@ -46,6 +46,8 @@ jobs:
         working-directory: third_party/nowhere-go
       - run: go run ./cmd/nowhere-check -vectors
         working-directory: third_party/nowhere-go
+      - run: go test -race ./... && go vet ./...
+        working-directory: third_party/nowhere-go/cmd/nowhere
       - run: go test ./... && go vet ./...
         working-directory: tools/sbstats
       - run: go build -trimpath -o /tmp/vega -tags 'with_clash_api,with_v2ray_api,with_quic,with_utls' ./cmd/sing-box

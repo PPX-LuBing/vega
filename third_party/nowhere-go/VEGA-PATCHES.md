@@ -1,8 +1,9 @@
 # Vega downstream patches
 
-Go implementation baseline: `ohmycggk/nowhere-go v3.2.0`, commit `6a8410c`.
-Official wire baseline: `NodePassProject/Nowhere 3.2.0`, commit
-`00000e23a0a131dd04fd7aec340b8d523a13ae51` (see `UPSTREAM.lock`).
+Go implementation baseline: `ohmycggk/nowhere-go v3.3.0`, commit
+`6b9ec0879e54d1ee52fe28f4cbffa8631333bc4d` (Go 1.21 minimum).
+Official wire baseline: `NodePassProject/Nowhere 3.3.0`, commit
+`000007b2482b8acf3a609888921fd847cad56c33` (see `UPSTREAM.lock`).
 
 Keep the original copyright/license notices. This is a vendored third-party
 implementation, not an independently authored protocol or an official Rust port.
@@ -10,13 +11,30 @@ implementation, not an independently authored protocol or an official Rust port.
 | File | Local change | Required regression |
 | --- | --- | --- |
 | `morph/morph.go` | Multi-key prelude admission, without a new wire format | Morph vectors/admission tests, Portal multiuser tests |
-| `portal/server.go` | User identity, source metadata, user updates, replay-state preservation and cleanup | `portal/multiuser_test.go`, `portal/replay_update_test.go` |
+| `portal/server.go` | User identity, source metadata, user updates, replay-state preservation, multiuser handshake budget and cleanup/ownership transfer | `portal/multiuser_test.go`, `portal/replay_update_test.go`, `portal/runtime_multiuser_test.go`, upstream `TestTLSEgressEcho` |
 | `vector/client.go` | Cancel TCP during Morph/auth/setup, then transfer ownership; Close also releases rate-limiter waits | `vector/cancel_test.go`, Vega outbound integration tests |
+| `UPSTREAM.lock` | Recompute the stale upstream protocol source hash against the exact official 3.3.0 commit | Upstream lock generator; upstream vectors compared modulo their four provenance keys |
 
-The 2026-11-04 fixes do not change `wire/`, key derivation, ALPN, authentication,
-Morph bytes, protocol vectors, or the upstream locks. UDP source addresses,
+Vega adds no local changes to `wire/`, key derivation, ALPN, authentication,
+Morph bytes or protocol vectors beyond the upstream v3.3.0 update. UDP source addresses,
 multi-target reply queues and deadlines belong to Vega's `protocol/nowhere/`
 adapter, not the Nowhere wire protocol.
+
+Official Nowhere has one Shared Key per Portal. Before a multiuser connection
+authenticates, Vega cannot know which key's derived handshake timeout applies.
+It uses the maximum official derived timeout of the current user snapshot;
+hot updates recompute it. An explicit `NOW_HANDSHAKE_TIMEOUT` takes precedence.
+Single-key behavior is unchanged. Multiuser Egress remains explicitly rejected
+to avoid sharing exits across identities without an accounting/routing design.
+
+The TCP cleanup patch transfers ownership of a claimed TLS Egress connection
+instead of closing it when registration returns. The upstream TLS Egress test
+is kept intact to catch regressions; this does not expose Egress in Vega.
+
+Upstream v3.3.0 retained a 3.2 protocol-source hash, as its changelog notes.
+Only `UPSTREAM.lock` (nw3) was regenerated using its own tool against the official
+3.3.0 checkout; the nw2 lock is untouched. The corrected source hash is
+`fdd1b17df596d529edee3705246be6aed005083b4792ed71a051cb746feb6b4f`.
 
 ## Updating
 
@@ -31,5 +49,13 @@ adapter, not the Nowhere wire protocol.
    invalid keys, replay rejection, cancellation and reconnects.
 
 Vectors and Go-to-Go loopbacks do not replace official-client interoperability
-tests. This patch set retains the pinned 3.2.0 baseline; it does not claim full
-3.3.0 support or add QUIC/Egress to the Vega adapter.
+tests. Run Vega's opt-in `TestOfficialRustInterop` with `VEGA_TEST_NOWHERE_RUST`
+pointing to an independently built official 3.3.0 binary. It exercises both
+directions, TLS TCP/UDP payloads, multi-target UDP sources, Morph on/off and
+reconnects. QUIC/Egress are not exposed by the Vega adapter; a library update
+does not imply full feature parity. See `../../NOWHERE-UPGRADE-3.3.0.md`.
+
+Retain upstream's documented Silent PreHello limitation (`morph/prehello.go`):
+Go crypto/tls may emit alerts on some structurally valid but semantically invalid
+ClientHellos that Rust rejects silently in its Acceptor. Do not describe normal
+wire interoperability as proof of identical anti-probing behavior.

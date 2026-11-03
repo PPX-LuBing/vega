@@ -52,7 +52,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 
 	// Nowhere 建立在 TLS 之上，没有 TLS 就没有 Portal。
 	if options.Egress {
-		return nil, E.New("nowhere: egress requires QUIC, which this inbound does not support")
+		return nil, E.New("nowhere: egress is not integrated with Vega routing and user accounting")
 	}
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, E.New("nowhere: TLS is required")
