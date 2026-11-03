@@ -580,12 +580,17 @@ func singboxTLS(ob map[string]any, n store.Node) {
 
 // ---------------------------------------------------------------- nowhere
 
-// Nowhere 生成 nowhere 官方客户端的订阅：每行一条 vector:// URI。
+// Nowhere 生成**桌面 Vector CLI** 用的订阅：每行一条 vector:// URI。
 //
-// 为什么需要单独一种格式：nowhere 客户端既不读 clash YAML 也不读 sing-box
-// JSON，它只认 URI。没有这个端点的话，用 nowhere 协议的人得自己拼 URI
-// （服务端地址、共享密钥、morph 开关、SNI 一个都不能错），很容易拼错还
-// 查不出原因。
+// 注意别把它当成「官方客户端通用格式」：vector:// 是 CLI 的本地运行格式，
+// 它带 in=<本地 SOCKS 监听>，只有跑在本机的 CLI 用得上。官方 Apple 客户端
+// Anywhere 根本不认 vector://（也不认 clash 里的 nowhere），它要的是 AJSON，
+// 见 ajson.go。两者并存是有意的：CLI 要 vector:// 才能直接跑起来，
+// App 要 AJSON 才能导入。
+//
+// 为什么需要单独一种格式：CLI 既不读 clash YAML 也不读 sing-box JSON，它只认
+// URI。没有这个端点的话，用 nowhere 协议的人得自己拼 URI（服务端地址、共享
+// 密钥、morph 开关、SNI 一个都不能错），很容易拼错还查不出原因。
 //
 // in= 是客户端自己的 SOCKS 监听地址，属于客户端的事，这里给一个默认值；
 // 多条同时跑要自己改成不同端口。

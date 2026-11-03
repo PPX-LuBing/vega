@@ -222,6 +222,11 @@ func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if format == "" && wantsAJSON(r) {
+		// Anywhere 会主动带这个头来要它自己的格式。裸地址按 UA 猜是猜不出来的：
+		// 它带过来的 UA 也叫 Anywhere，而老版本不带这个头、只看得懂别的格式。
+		format = "ajson"
+	}
 	if format == "" {
 		format = formatFor(r.UserAgent())
 	}
@@ -239,8 +244,10 @@ func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
 		body, skipped, err = Links(h.st, user, format == "base64")
 	case "nowhere", "nw3":
 		body, skipped, err = Nowhere(h.st, user)
+	case "ajson", "anywhere":
+		body, skipped, err = AJSON(h.st, user)
 	default:
-		http.Error(w, "未知格式 "+format+"，用 clash、singbox 或 nowhere", http.StatusNotFound)
+		http.Error(w, "未知格式 "+format+"，用 clash、singbox、nowhere 或 ajson", http.StatusNotFound)
 		return
 	}
 	if err != nil {
@@ -308,6 +315,15 @@ func formatFor(ua string) string {
 		// 它是这个生态里兼容面最广的
 		return "clash"
 	}
+}
+
+// wantsAJSON 判断客户端是不是在要 Anywhere 的 AJSON 格式。
+//
+// 官方约定：请求带 X-Anywhere-Format: ajson/1 时服务端「可以」回 AJSON 文档；
+// 老版本 Anywhere 不带这个头，就继续给它看得懂的格式（Clash / link-list），
+// 所以这里只认这个头，不去猜 User-Agent。
+func wantsAJSON(r *http.Request) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(r.Header.Get("X-Anywhere-Format"))), "ajson")
 }
 
 func contentTypeFor(format string) string {
