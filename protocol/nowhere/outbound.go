@@ -66,11 +66,11 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 
 	portalAddr := options.ServerOptions.Build().String()
 	client, err := vector.New(vector.Config{
-		SharedKey:    options.SharedKey,
-		Morph:        common.PtrValueOrDefault(options.Morph),
-		PortalAddr:   portalAddr,
-		TLS:          tlsConfig,
-		DialTCP:      func(dialCtx context.Context, addr string) (net.Conn, error) {
+		SharedKey:  options.SharedKey,
+		Morph:      common.PtrValueOrDefault(options.Morph),
+		PortalAddr: portalAddr,
+		TLS:        tlsConfig,
+		DialTCP: func(dialCtx context.Context, addr string) (net.Conn, error) {
 			return outboundDialer.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddr(addr))
 		},
 		UploadMbps:   options.UploadMbps,
@@ -116,7 +116,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "nowhere packet connection")
-	return &packetConn{ctx: ctx, outbound: h}, nil
+	return &packetConn{ctx: ctx, outbound: h, ready: make(chan struct{})}, nil
 }
 
 func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -150,6 +150,15 @@ type packetConn struct {
 	mu    sync.Mutex
 	flows map[string]net.Conn
 	order []string
+	// ready 在第一条 flow 建好时关闭，readyDone 防止重复关闭。
+	//
+	// 为什么需要它：sing-box 的 packet 下载循环是**立刻**启动的，所以第一次
+	// ReadFrom 必然早于第一次 WriteTo（WriteTo 才会建 flow）。那时候如果
+	// ReadFrom 返回错误，route/conn.go 的 packetConnectionCopy 会
+	// `common.Close(source, destination)` 把整个 UDP 会话两个方向一起关掉，
+	// 表现就是 UDP 静默不通、而且服务端日志里什么都没有。所以这里必须**等**。
+	ready     chan struct{}
+	readyDone bool
 }
 
 // maxCachedFlows 限制缓存的目标数。
@@ -174,6 +183,11 @@ func (c *packetConn) flowFor(destination M.Socksaddr) (net.Conn, error) {
 	}
 	c.flows[key] = conn
 	c.order = append(c.order, key)
+	if !c.readyDone {
+		// 第一条 flow 建好了，唤醒可能正阻塞在 ReadFrom 的下载循环
+		c.readyDone = true
+		close(c.ready)
+	}
 	if len(c.order) > maxCachedFlows {
 		oldest := c.order[0]
 		c.order = c.order[1:]
@@ -189,23 +203,41 @@ func (c *packetConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	// nw3 的 flow 是单向绑定的，读回来的数据不带来源地址。
 	// 这里只能返回一个空地址，调用方（内核的 UDP 会话）本来就按
 	// 自己记录的目标来配，不会依赖它。
-	c.mu.Lock()
-	var conn net.Conn
-	for _, key := range c.order {
-		if candidate := c.flows[key]; candidate != nil {
-			conn = candidate
-			break
+	conn := c.firstFlow()
+	if conn == nil {
+		// 还没写过任何目标。**必须等第一条 flow 建起来**，不能返回错误：
+		// 读方向的 error 会被 route/conn.go 当成会话结束，连写方向一起关掉，
+		// 结果就是 UDP 完全不通（详见 packetConn.ready 的注释）。
+		select {
+		case <-c.ready:
+			conn = c.firstFlow()
+		case <-c.ctx.Done():
+			return 0, nil, c.ctx.Err()
 		}
 	}
-	c.mu.Unlock()
 	if conn == nil {
-		return 0, nil, E.New("nowhere: packet connection 还没有目标")
+		// ready 已关却还是没有 flow：只可能是缓存淘汰时刚好清空。
+		// 这里再等 ctx 结束，避免空转刷 CPU。
+		<-c.ctx.Done()
+		return 0, nil, c.ctx.Err()
 	}
 	n, err := conn.Read(p)
 	if err != nil {
 		return 0, nil, err
 	}
 	return n, M.Socksaddr{}, nil
+}
+
+// firstFlow 返回缓存里最早的那条 flow，没有就返回 nil。
+func (c *packetConn) firstFlow() net.Conn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, key := range c.order {
+		if candidate := c.flows[key]; candidate != nil {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func (c *packetConn) WriteTo(p []byte, addr net.Addr) (int, error) {
