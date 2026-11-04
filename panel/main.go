@@ -417,6 +417,8 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		pubKey := fs.String("pub-key", "", "REALITY 公钥")
 		shortID := fs.String("short-id", "", "REALITY short id")
 		morph := fs.Bool("morph", true, "Nowhere Morph")
+		carrier := fs.String("nowhere-carrier", "", "Nowhere tcp/quic/both (default tcp)")
+		egress := fs.Bool("nowhere-egress", false, "Route Nowhere users through their registered Egress exits")
 		entryHost := fs.String("entry-host", "", "客户端接入地址（有中转时填，留空=直连本机）")
 		entryPort := fs.Int("entry-port", 0, "客户端接入端口，0 跟随监听端口")
 		entrySNI := fs.String("entry-sni", "", "入口 SNI")
@@ -438,7 +440,7 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 
 		node := store.Node{
 			Tag: tag, Proto: *proto, Port: *port, TLSMode: *tlsMode, SNI: *sni,
-			Remark: *remark, Listen: *listen, Enabled: true, Morph: *morph,
+			Remark: *remark, Listen: *listen, Enabled: true, Morph: *morph, NowhereCarrier: *carrier, NowhereEgress: *egress,
 			Dest: *dest, PrivKey: *privKey, PubKey: *pubKey, ShortID: *shortID,
 			CertPath: *cert, KeyPath: *key, Machine: *machineName,
 			EntryHost: *entryHost, EntryPort: *entryPort, EntrySNI: *entrySNI, Transport: *transport, Path: *path, Host: *host, GRPCService: *grpcService, Fingerprint: *fingerprint, UpMbps: *up, DownMbps: *down,
@@ -456,6 +458,7 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 				"dest": func() { previous.Dest = node.Dest }, "priv-key": func() { previous.PrivKey = node.PrivKey }, "pub-key": func() { previous.PubKey = node.PubKey },
 				"short-id": func() { previous.ShortID = node.ShortID }, "morph": func() { previous.Morph = node.Morph }, "enabled": func() { previous.Enabled = node.Enabled },
 				"entry-host": func() { previous.EntryHost = node.EntryHost }, "entry-port": func() { previous.EntryPort = node.EntryPort }, "entry-sni": func() { previous.EntrySNI = node.EntrySNI },
+				"nowhere-carrier": func() { previous.NowhereCarrier = node.NowhereCarrier }, "nowhere-egress": func() { previous.NowhereEgress = node.NowhereEgress },
 				"transport": func() { previous.Transport = node.Transport }, "path": func() { previous.Path = node.Path }, "host": func() { previous.Host = node.Host },
 				"grpc-service": func() { previous.GRPCService = node.GRPCService }, "fingerprint": func() { previous.Fingerprint = node.Fingerprint },
 				"up-mbps": func() { previous.UpMbps = node.UpMbps }, "down-mbps": func() { previous.DownMbps = node.DownMbps },

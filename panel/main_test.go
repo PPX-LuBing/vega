@@ -9,6 +9,26 @@ import (
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
 
+func TestNowhereCLIOptionsPreserved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "panel.db")
+	paths := kernel.Paths{}
+	if err := runNode(path, paths, []string{"add", "nw", "--proto", "nowhere", "--port", "8446", "--sni", "node.example", "--nowhere-carrier", "both", "--nowhere-egress"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runNode(path, paths, []string{"set", "nw", "--remark", "updated"}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	n, err := s.Node("nw")
+	if err != nil || n.NowhereCarrier != "both" || !n.NowhereEgress {
+		t.Fatalf("%+v: %v", n, err)
+	}
+}
+
 func TestUserAddRejectsInvalidLimits(t *testing.T) {
 	for _, args := range [][]string{{"--quota", "NaN"}, {"--quota", "+Inf"}, {"--quota", "-1"}, {"--days", "-1"}, {"--days", "365001"}} {
 		path := filepath.Join(t.TempDir(), "panel.db")

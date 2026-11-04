@@ -86,6 +86,10 @@ func ajsonProxy(e endpoint) (map[string]any, error) {
 		// morph 显式写出来：官方默认值是 true，但服务端关掉而客户端默认开着
 		// 就会握手失败，靠默认值迟早出事。
 		proxy["morph"] = n.Morph
+		proxy["network"] = "tcp"
+		if n.NowhereClientCarrier() == "quic" {
+			proxy["network"] = "udp"
+		}
 		// AJSON Nowhere uses server for certificate verification. Never replace
 		// an entry with its SNI: that could bypass a relay or use the wrong port.
 		if n.SNI != "" && !strings.EqualFold(strings.TrimSuffix(n.SNI, "."), strings.TrimSuffix(e.Host, ".")) {

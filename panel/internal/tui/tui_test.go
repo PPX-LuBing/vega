@@ -140,7 +140,7 @@ func TestNodeFormCanCreateTLSAndRealityNodes(t *testing.T) {
 	m.form = newForm("node", nodeFields(store.Node{}), nil)
 	m.form.cursor = len(m.form.fields) - 1
 	view := m.viewForm()
-	if !strings.Contains(view, "18") || strings.Count(view, "\n") > 18 {
+	if !strings.Contains(view, "Nowhere Egress") || strings.Count(view, "\n") > 18 {
 		t.Fatal("form does not scroll to last field")
 	}
 }

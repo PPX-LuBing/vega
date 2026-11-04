@@ -519,7 +519,7 @@ func (m *Model) startDelete() (tea.Model, tea.Cmd) {
 func (m *Model) startAdd() (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabNodes:
-		m.form = newForm("新增节点", nodeFields(store.Node{Proto: store.ProtoNowhere, TLSMode: "tls", Machine: store.LocalMachine, Transport: "tcp", Path: "/", Fingerprint: "chrome"}), m.submitNodeForm)
+		m.form = newForm("新增节点", nodeFields(store.Node{Proto: store.ProtoNowhere, TLSMode: "tls", Machine: store.LocalMachine, Transport: "tcp", Path: "/"}), m.submitNodeForm)
 		m.mode = modeForm
 	case tabUsers:
 		m.form = newForm("新增用户", []field{
@@ -593,11 +593,13 @@ func nodeFields(n store.Node) []field {
 		{label: "机器", def: n.Machine}, {label: "接入地址", def: n.EntryHost, hint: "多个地址以逗号分隔"}, {label: "接入端口", def: strconv.Itoa(n.EntryPort)},
 		{label: "入口 SNI", def: n.EntrySNI}, {label: "传输", def: n.Transport, pick: []string{"tcp", "ws", "grpc", "httpupgrade"}, hint: "左右键选择"},
 		{label: "路径", def: n.Path}, {label: "Host", def: n.Host}, {label: "gRPC service", def: n.GRPCService}, {label: "TLS 指纹", def: n.Fingerprint},
+		{label: "Nowhere carrier", def: n.NowhereCarrier, pick: []string{"", "tcp", "quic", "both"}, hint: "其他协议留空"},
+		{label: "Nowhere Egress", def: strconv.FormatBool(n.NowhereEgress), pick: []string{"false", "true"}, hint: "按用户密钥选择远端出口；需先运行 Egress"},
 	}
 }
 
 func parseNodeForm(v []string, n store.Node) (store.Node, error) {
-	if len(v) != 18 {
+	if len(v) != 20 {
 		return n, fmt.Errorf("节点表单不完整")
 	}
 	for i := range v {
@@ -614,6 +616,11 @@ func parseNodeForm(v []string, n store.Node) (store.Node, error) {
 	n.Tag, n.Proto, n.Port, n.TLSMode, n.SNI, n.Remark = v[0], v[1], port, v[3], v[4], v[5]
 	n.CertPath, n.KeyPath, n.Dest, n.Machine, n.EntryHost, n.EntryPort = v[6], v[7], v[8], v[9], v[10], entryPort
 	n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint = v[12], v[13], v[14], v[15], v[16], v[17]
+	n.NowhereCarrier = v[18]
+	n.NowhereEgress, err = strconv.ParseBool(v[19])
+	if err != nil {
+		return n, fmt.Errorf("invalid Egress selection")
+	}
 	if n.Remark == "" {
 		n.Remark = n.Tag
 	}

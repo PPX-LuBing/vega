@@ -261,7 +261,14 @@ func (h *handler) subscription(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentTypeFor(format))
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Profile-Update-Interval", fmt.Sprint(int(h.cfg.Interval.Hours())))
-	w.Header().Set("Profile-Title", "base64:"+base64.StdEncoding.EncodeToString([]byte(h.st.Setting("sub_title", "Vega"))))
+	title := h.st.Setting("sub_title", "Vega")
+	w.Header().Set("Profile-Title", "base64:"+base64.StdEncoding.EncodeToString([]byte(title)))
+	// FlClash 之类客户端**不读 Profile-Title**，只认 Content-Disposition 的
+	// filename*（见 FlClash lib/models/profile.dart 的 update()：
+	// getFileNameForDisposition(disposition) 取不到就退回 defaultLabel，
+	// 也就是订阅 URL 的域名）。polarisx 一直发这个头，所以从 polarisx 迁过来
+	// 的人会觉得「订阅名怎么变成域名了」。格式照抄 polarisx。
+	w.Header().Set("Content-Disposition", contentDisposition(title, format))
 	// clash / mihomo 读这个头在节点列表里显示用量
 	w.Header().Set("Subscription-Userinfo", h.userinfo(user))
 	if r.Method != http.MethodHead {
@@ -336,4 +343,25 @@ func contentTypeFor(format string) string {
 	default:
 		return "application/json; charset=utf-8"
 	}
+}
+
+// contentDisposition 拼出客户端用来给订阅命名的 Content-Disposition。
+//
+// 两个 filename 都写是有原因的：
+//   - filename* 是 RFC 5987 的 UTF-8 形式，FlClash 优先读它（先按 charset 与 value
+//     之间那两个单引号切开，再做 Uri.decodeComponent），中文标题靠它才能正确落地；
+//   - filename 是给不认 filename* 的老客户端看的 ASCII 兜底，只影响另存的文件名。
+//
+// 编码用 PathEscape 而不是 QueryEscape：后者把空格编成 "+"，而 decodeComponent
+// 不会把 "+" 还原成空格，标题里带空格就会多出一个加号。
+func contentDisposition(title, format string) string {
+	name := "custom.yaml"
+	switch format {
+	case "singbox", "ajson", "anywhere":
+		name = "custom.json"
+	case "nowhere", "nw3", "plain", "base64":
+		name = "custom.txt"
+	}
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`,
+		name, url.PathEscape(title))
 }

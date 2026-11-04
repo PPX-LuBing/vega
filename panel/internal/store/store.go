@@ -100,7 +100,9 @@ type Node struct {
 	ShortID string `json:"short_id"`
 
 	// Nowhere
-	Morph bool `json:"morph"`
+	Morph          bool   `json:"morph"`
+	NowhereCarrier string `json:"nowhere_carrier"`
+	NowhereEgress  bool   `json:"nowhere_egress"`
 
 	// Hysteria2
 	UpMbps   int `json:"up_mbps"`
@@ -254,11 +256,16 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err = s.ensureSubTokenColumn(); err != nil {
 		return err
 	}
-	for _, column := range []string{"entry_sni", "transport", "path", "host", "grpc_service", "fingerprint"} {
+	for _, column := range []string{"nowhere_carrier", "entry_sni", "transport", "path", "host", "grpc_service", "fingerprint"} {
 		if !s.hasColumn("nodes", column) {
 			if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"); err != nil {
 				return err
 			}
+		}
+	}
+	if !s.hasColumn("nodes", "nowhere_egress") {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN nowhere_egress INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
 		}
 	}
 	// 接入点两列：老库没有，补上
@@ -470,14 +477,17 @@ func (s *Store) SaveNode(n Node) error {
 	if n.Transport != "" && n.Transport != "tcp" && n.Proto != ProtoVMess && n.Proto != ProtoVLESS && n.Proto != ProtoTrojan {
 		return errors.New("transport is only supported for vmess/vless/trojan")
 	}
+	if err := validateNowhere(n); err != nil {
+		return err
+	}
 	if n.Listen == "" {
 		n.Listen = "0.0.0.0"
 	}
 	_, err := s.db.Exec(`
 INSERT INTO nodes (tag, machine, proto, listen, port, remark, enabled, tls_mode, sni, cert_path, key_path,
                    dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps, ss_method, ss_password,
-                   entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint, nowhere_carrier, nowhere_egress)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(tag) DO UPDATE SET
   machine=excluded.machine, proto=excluded.proto, listen=excluded.listen, port=excluded.port, remark=excluded.remark,
   enabled=excluded.enabled, tls_mode=excluded.tls_mode, sni=excluded.sni,
@@ -485,10 +495,10 @@ ON CONFLICT(tag) DO UPDATE SET
   priv_key=excluded.priv_key, pub_key=excluded.pub_key, short_id=excluded.short_id,
   morph=excluded.morph, up_mbps=excluded.up_mbps, down_mbps=excluded.down_mbps,
   ss_method=excluded.ss_method, ss_password=excluded.ss_password,
-  entry_host=excluded.entry_host, entry_port=excluded.entry_port, entry_sni=excluded.entry_sni, transport=excluded.transport, path=excluded.path, host=excluded.host, grpc_service=excluded.grpc_service, fingerprint=excluded.fingerprint`,
+  entry_host=excluded.entry_host, entry_port=excluded.entry_port, entry_sni=excluded.entry_sni, transport=excluded.transport, path=excluded.path, host=excluded.host, grpc_service=excluded.grpc_service, fingerprint=excluded.fingerprint, nowhere_carrier=excluded.nowhere_carrier, nowhere_egress=excluded.nowhere_egress`,
 		n.Tag, orLocal(n.Machine), n.Proto, n.Listen, n.Port, n.Remark, boolInt(n.Enabled), n.TLSMode, n.SNI,
 		n.CertPath, n.KeyPath, n.Dest, n.PrivKey, n.PubKey, n.ShortID, boolInt(n.Morph),
-		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort, n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint)
+		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort, n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint, n.NowhereCarrier, boolInt(n.NowhereEgress))
 	return err
 }
 
@@ -496,7 +506,7 @@ ON CONFLICT(tag) DO UPDATE SET
 func (s *Store) Nodes() ([]Node, error) {
 	rows, err := s.db.Query(`SELECT tag, machine, proto, listen, port, remark, enabled, tls_mode, sni,
         cert_path, key_path, dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps,
-        ss_method, ss_password, entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint
+        ss_method, ss_password, entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint, nowhere_carrier, nowhere_egress
         FROM nodes ORDER BY port`)
 	if err != nil {
 		return nil, err
@@ -505,15 +515,16 @@ func (s *Store) Nodes() ([]Node, error) {
 	var out []Node
 	for rows.Next() {
 		var n Node
-		var enabled, morph int
+		var enabled, morph, egress int
 		if err = rows.Scan(&n.Tag, &n.Machine, &n.Proto, &n.Listen, &n.Port, &n.Remark, &enabled, &n.TLSMode,
 			&n.SNI, &n.CertPath, &n.KeyPath, &n.Dest, &n.PrivKey, &n.PubKey, &n.ShortID,
 			&morph, &n.UpMbps, &n.DownMbps, &n.SSMethod, &n.SSPassword,
-			&n.EntryHost, &n.EntryPort, &n.EntrySNI, &n.Transport, &n.Path, &n.Host, &n.GRPCService, &n.Fingerprint); err != nil {
+			&n.EntryHost, &n.EntryPort, &n.EntrySNI, &n.Transport, &n.Path, &n.Host, &n.GRPCService, &n.Fingerprint, &n.NowhereCarrier, &egress); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled != 0
 		n.Morph = morph != 0
+		n.NowhereEgress = egress != 0
 		out = append(out, n)
 	}
 	return out, rows.Err()

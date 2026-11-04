@@ -473,6 +473,7 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 	switch n.Proto {
 	case store.ProtoNowhere:
 		ob["type"] = "nowhere"
+		ob["carrier"] = n.NowhereClientCarrier()
 		ob["shared_key"] = u.SharedKey
 		ob["morph"] = n.Morph
 		// 出站必带 TLS：载体就是 TLS1.3，没给会直接报错
@@ -660,6 +661,9 @@ func nowhereURI(e endpoint) (string, error) {
 	}
 	if n.SNI != "" {
 		params = append(params, "sni="+url.QueryEscape(n.SNI))
+	}
+	if n.NowhereClientCarrier() == "quic" {
+		return fmt.Sprintf("vector://%s@%s/udp:%d?%s", key, host, e.Port, strings.Join(params, "&")), nil
 	}
 	return fmt.Sprintf("vector://%s@%s:%d?%s", key, host, e.Port, strings.Join(params, "&")), nil
 }

@@ -189,6 +189,40 @@ func buildConfigFromNodes(st *store.Store, paths Paths, nodes []store.Node) (map
 		}
 		mergeConfig(config, extra)
 	}
+	for _, node := range nodes {
+		if !node.Enabled || !node.NowhereEgress || node.Proto != store.ProtoNowhere {
+			continue
+		}
+		found := false
+		for _, in := range inbounds {
+			if in.(map[string]any)["tag"] == node.Tag {
+				found = true
+			}
+		}
+		if !found {
+			continue
+		}
+		tag := "egress-" + node.Tag
+		outbounds, ok := config["outbounds"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("Egress requires an outbounds array")
+		}
+		for _, value := range outbounds {
+			if ob, ok := value.(map[string]any); ok && ob["tag"] == tag {
+				return nil, fmt.Errorf("Egress outbound tag %q conflicts with extra_config", tag)
+			}
+		}
+		route, ok := config["route"].(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("Egress requires a route object")
+		}
+		rules, ok := route["rules"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("Egress requires a route.rules array")
+		}
+		config["outbounds"] = append(outbounds, map[string]any{"type": "nowhere-egress", "tag": tag, "portal": node.Tag})
+		route["rules"] = append(rules, map[string]any{"inbound": []string{node.Tag}, "action": "route", "outbound": tag})
+	}
 	return config, nil
 }
 
@@ -254,6 +288,8 @@ func buildInbound(node store.Node, users []store.User, paths Paths) (map[string]
 	switch node.Proto {
 	case store.ProtoNowhere:
 		inbound["type"] = "nowhere"
+		inbound["carrier"] = node.NowhereCarrier
+		inbound["egress"] = node.NowhereEgress
 		members := make([]any, 0, len(users))
 		for _, u := range users {
 			members = append(members, map[string]any{"name": u.Name, "shared_key": u.SharedKey})

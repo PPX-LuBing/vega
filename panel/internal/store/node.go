@@ -53,6 +53,9 @@ func PrepareNode(n *Node) error {
 }
 
 func ValidateNode(n Node) error {
+	if err := validateNowhere(n); err != nil {
+		return err
+	}
 	if !ValidProto(n.Proto) || n.Port < 1 || n.Port > 65535 || strings.TrimSpace(n.Tag) == "" {
 		return fmt.Errorf("invalid node protocol, tag or port")
 	}
@@ -164,4 +167,30 @@ func (n Node) TransportConfig() map[string]any {
 	default:
 		return nil
 	}
+}
+
+func validateNowhere(n Node) error {
+	if n.Proto != ProtoNowhere {
+		if n.NowhereCarrier != "" || n.NowhereEgress {
+			return fmt.Errorf("Nowhere options require a Nowhere node")
+		}
+		return nil
+	}
+	switch n.NowhereCarrier {
+	case "", "tcp", "quic", "both":
+	default:
+		return fmt.Errorf("Nowhere carrier must be tcp/quic/both")
+	}
+	if n.Fingerprint != "" {
+		return fmt.Errorf("Nowhere uses standard TLS 1.3 and does not support a uTLS fingerprint")
+	}
+	return nil
+}
+
+// Both listeners advertise TCP by default; use a QUIC-only node to publish UDP.
+func (n Node) NowhereClientCarrier() string {
+	if n.NowhereCarrier == "quic" {
+		return "quic"
+	}
+	return "tcp"
 }
