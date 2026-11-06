@@ -33,9 +33,7 @@
 | `include/registry.go` | +3 | 低——import + 入站/出站注册各一行 |
 | `release/DEFAULT_BUILD_TAGS` | +1 / −1 | 低——加了 `with_v2ray_api` |
 | `release/DEFAULT_BUILD_TAGS_OTHERS` | +1 / −1 | 低——同上 |
-| `.github/workflows/test.yml` | 新增 `vega` job；删掉上游那套 3 OS × 2 Go 的全量矩阵 | 低 |
-| `.github/workflows/lint.yml` | 10 目标矩阵缩成 linux/amd64 单目标 | 低 |
-| `.github/workflows/{build,docker,linux,stale}.yml` | **已删除**：前三个只在 `stable`/`testing`/`unstable` 或 `release` 触发，本仓库只有 `main`；`stale.yml` 是每日 cron 标记失效 issue，个人 fork 用不上 | — |
+| `.github/`（**整个目录已删除**） | 上游的 8 个 workflow、CI/发布辅助脚本、issue 模板、FUNDING（指向**上游作者**）、renovate 配置全部删除。原 `test.yml` 新增的 `vega` job 也随之删除——本仓库不再跑任何 CI，测试全在本地跑 | — |
 | `third_party/nowhere-go/.github/` | **已删除**：嵌套的 workflow 和 CODEOWNERS GitHub 都不会读（只读仓库根/`docs`/`.github`），而且 CODEOWNERS 指的是上游作者 | — |
 | `.gitignore` | 加构建产物规则 | 低 |
 | `LICENSE` | 换成 GPL-3.0 标准正文 | 低——上游改许可时才冲突 |

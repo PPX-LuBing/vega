@@ -29,7 +29,7 @@ vega/
 | | `experimental/v2rayapi/stats.go` | 热用户统计、并发保护、内核实例标识 |
 | | `common/tls/std_server.go` | 证书重载回调与配置发布的竞态保护 |
 | | `release/DEFAULT_BUILD_TAGS*` | 默认编入 `with_v2ray_api` |
-| | `.github/workflows/{test,lint}.yml` | `main` 分支与独立 module 的回归检查 |
+| | `.github/`（**整个目录已删除**） | 上游的 CI、发布构建、issue 模板、FUNDING 全部是死配置或指向上游，详见 `BASELINE.md` |
 | **新增文件** | `option/nowhere.go`、`protocol/nowhere/*` | 通常减少冲突，仍需核对上游接口 |
 
 ### 跟随上游

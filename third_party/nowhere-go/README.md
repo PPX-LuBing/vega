@@ -294,7 +294,7 @@ go run ./cmd/nowhere-check            # wire vectors + self-check
 go run ./cmd/nowhere-check -version
 ```
 
-GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.21.x / 1.26.x / stable** on push (`main`/`test`/tags), PR, and `workflow_dispatch`. The Portal CLI (`cmd/nowhere`) needs Go 1.26 because it vendors [quic-go](https://github.com/quic-go/quic-go) v0.62.0; the 1.21.x job tests the library only. A FreeBSD 15.1 amd64 job runs the same single-version test, vet, and CLI checks, and cross-builds `freebsd/arm64`. Race, fuzz, and benchmark jobs stay on Linux.
+这个 vendored 副本里**删掉了嵌套的 `.github/`**（包括 `workflows/ci.yml`、`workflows/release.yml` 和 `CODEOWNERS`）：GitHub 只执行**仓库根**的 workflow，也只读根、`docs/`、`.github/` 下的 `CODEOWNERS`，嵌套的永远不会生效。上游那份 CI 的内容（Go 1.21.x / 1.26.x / stable、FreeBSD 交叉构建、race/fuzz/benchmark）可以在上游仓库查到；在 vega 里这些检查靠本地跑上面的 `go test` / `go vet`。
 
 The standalone **Portal / Vector** binary lives in [`cmd/nowhere`](cmd/nowhere). It accepts the same `portal://` and `vector://` URLs as the Rust `nowhere` CLI, plus the `generate-key`, `fingerprint`, and `probe` toolbox subcommands (the TUI and `status` are not included).
 
@@ -311,7 +311,7 @@ verify the Portal certificate against the system roots and the endpoint host
 name unless `pin=<sha256>` is set — `fingerprint` prints the leaf certificate
 SHA-256 of a `nowhere://` share link to obtain one.
 
-Pushing a `v*.*.*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml): tests, then `nowhere` binaries for Linux, Windows, macOS, and FreeBSD (`amd64` and `arm64`) plus `SHA256SUMS`. The `nowhere-check` conformance tool is not released; build it locally with `make nowhere-check` when needed. Reproduce the release locally with `make dist`. Consume the library with `go get`.
+上游在推送 `v*.*.*` tag 时会跑 `release.yml`（测试，然后出 Linux/Windows/macOS/FreeBSD 的 `nowhere` 二进制和 `SHA256SUMS`）。这个 vendored 副本里该文件已删除，需要发布产物就本地 `make dist` 复现。`nowhere-check` 一致性工具不参与发布，用 `make nowhere-check` 本地构建。库本身用 `go get` 引入。
 
 ```bash
 go get github.com/ohmycggk/nowhere-go@v2.0.0
