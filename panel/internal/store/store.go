@@ -111,6 +111,17 @@ type Node struct {
 	// Shadowsocks 2022
 	SSMethod   string `json:"ss_method"`
 	SSPassword string `json:"ss_password"`
+
+	// ECH（Encrypted Client Hello）：把 ClientHello 里的 SNI 加密，被动观察者
+	// 看不到客户端要访问哪个域名。
+	//
+	// 只有**真 TLS 入站**能用：REALITY 的 public name 是伪装目标，我们不可能持有
+	// 它的 ECH 私钥；tls_mode=none 压根没有 TLS。
+	//
+	// ECHKey 是私钥（`ECH KEYS` PEM），只下发给内核；
+	// ECHConfig 是公钥（`ECH CONFIGS` PEM），要发给客户端。两者必须成对。
+	ECHKey    string `json:"ech_key"`
+	ECHConfig string `json:"ech_config"`
 }
 
 // User 是一个订阅用户。
@@ -256,7 +267,7 @@ CREATE TABLE IF NOT EXISTS settings (
 	if err = s.ensureSubTokenColumn(); err != nil {
 		return err
 	}
-	for _, column := range []string{"nowhere_carrier", "entry_sni", "transport", "path", "host", "grpc_service", "fingerprint"} {
+	for _, column := range []string{"nowhere_carrier", "entry_sni", "transport", "path", "host", "grpc_service", "fingerprint", "ech_key", "ech_config"} {
 		if !s.hasColumn("nodes", column) {
 			if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN " + column + " TEXT NOT NULL DEFAULT ''"); err != nil {
 				return err
@@ -486,8 +497,8 @@ func (s *Store) SaveNode(n Node) error {
 	_, err := s.db.Exec(`
 INSERT INTO nodes (tag, machine, proto, listen, port, remark, enabled, tls_mode, sni, cert_path, key_path,
                    dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps, ss_method, ss_password,
-                   entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint, nowhere_carrier, nowhere_egress)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint, nowhere_carrier, nowhere_egress, ech_key, ech_config)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(tag) DO UPDATE SET
   machine=excluded.machine, proto=excluded.proto, listen=excluded.listen, port=excluded.port, remark=excluded.remark,
   enabled=excluded.enabled, tls_mode=excluded.tls_mode, sni=excluded.sni,
@@ -495,10 +506,10 @@ ON CONFLICT(tag) DO UPDATE SET
   priv_key=excluded.priv_key, pub_key=excluded.pub_key, short_id=excluded.short_id,
   morph=excluded.morph, up_mbps=excluded.up_mbps, down_mbps=excluded.down_mbps,
   ss_method=excluded.ss_method, ss_password=excluded.ss_password,
-  entry_host=excluded.entry_host, entry_port=excluded.entry_port, entry_sni=excluded.entry_sni, transport=excluded.transport, path=excluded.path, host=excluded.host, grpc_service=excluded.grpc_service, fingerprint=excluded.fingerprint, nowhere_carrier=excluded.nowhere_carrier, nowhere_egress=excluded.nowhere_egress`,
+  entry_host=excluded.entry_host, entry_port=excluded.entry_port, entry_sni=excluded.entry_sni, transport=excluded.transport, path=excluded.path, host=excluded.host, grpc_service=excluded.grpc_service, fingerprint=excluded.fingerprint, nowhere_carrier=excluded.nowhere_carrier, nowhere_egress=excluded.nowhere_egress, ech_key=excluded.ech_key, ech_config=excluded.ech_config`,
 		n.Tag, orLocal(n.Machine), n.Proto, n.Listen, n.Port, n.Remark, boolInt(n.Enabled), n.TLSMode, n.SNI,
 		n.CertPath, n.KeyPath, n.Dest, n.PrivKey, n.PubKey, n.ShortID, boolInt(n.Morph),
-		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort, n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint, n.NowhereCarrier, boolInt(n.NowhereEgress))
+		n.UpMbps, n.DownMbps, n.SSMethod, n.SSPassword, n.EntryHost, n.EntryPort, n.EntrySNI, n.Transport, n.Path, n.Host, n.GRPCService, n.Fingerprint, n.NowhereCarrier, boolInt(n.NowhereEgress), n.ECHKey, n.ECHConfig)
 	return err
 }
 
@@ -506,7 +517,7 @@ ON CONFLICT(tag) DO UPDATE SET
 func (s *Store) Nodes() ([]Node, error) {
 	rows, err := s.db.Query(`SELECT tag, machine, proto, listen, port, remark, enabled, tls_mode, sni,
         cert_path, key_path, dest, priv_key, pub_key, short_id, morph, up_mbps, down_mbps,
-        ss_method, ss_password, entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint, nowhere_carrier, nowhere_egress
+        ss_method, ss_password, entry_host, entry_port, entry_sni, transport, path, host, grpc_service, fingerprint, nowhere_carrier, nowhere_egress, ech_key, ech_config
         FROM nodes ORDER BY port`)
 	if err != nil {
 		return nil, err
@@ -519,7 +530,7 @@ func (s *Store) Nodes() ([]Node, error) {
 		if err = rows.Scan(&n.Tag, &n.Machine, &n.Proto, &n.Listen, &n.Port, &n.Remark, &enabled, &n.TLSMode,
 			&n.SNI, &n.CertPath, &n.KeyPath, &n.Dest, &n.PrivKey, &n.PubKey, &n.ShortID,
 			&morph, &n.UpMbps, &n.DownMbps, &n.SSMethod, &n.SSPassword,
-			&n.EntryHost, &n.EntryPort, &n.EntrySNI, &n.Transport, &n.Path, &n.Host, &n.GRPCService, &n.Fingerprint, &n.NowhereCarrier, &egress); err != nil {
+			&n.EntryHost, &n.EntryPort, &n.EntrySNI, &n.Transport, &n.Path, &n.Host, &n.GRPCService, &n.Fingerprint, &n.NowhereCarrier, &egress, &n.ECHKey, &n.ECHConfig); err != nil {
 			return nil, err
 		}
 		n.Enabled = enabled != 0

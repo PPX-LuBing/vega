@@ -26,10 +26,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
@@ -488,6 +490,54 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		}
 		return nil
 
+	case "ech":
+		fs := flag.NewFlagSet("node ech", flag.ContinueOnError)
+		disable := fs.Bool("disable", false, "关闭并清掉该节点的 ECH")
+		if err := fs.Parse(reorderArgs(fs, args[1:])); err != nil {
+			return err
+		}
+		if fs.NArg() < 1 {
+			return fmt.Errorf("用法: node ech <tag> [--disable]")
+		}
+		tag := fs.Arg(0)
+		node, err := st.Node(tag)
+		if err != nil {
+			return err
+		}
+		if *disable {
+			node.ECHKey, node.ECHConfig = "", ""
+			if err = store.PrepareNode(&node); err != nil {
+				return err
+			}
+			if err = st.SaveNode(node); err != nil {
+				return err
+			}
+			fmt.Printf("已关闭 %s 的 ECH，记得 apply\n", tag)
+			return nil
+		}
+		if node.TLSMode != "tls" {
+			return fmt.Errorf("%s 的 TLS 模式是 %s：ECH 只有真 TLS 入站能用"+
+				"（REALITY 的 public name 是伪装目标，我们不可能持有它的 ECH 私钥）", tag, node.TLSMode)
+		}
+		if strings.TrimSpace(node.SNI) == "" {
+			return fmt.Errorf("%s 没有 SNI：ECH 配置是绑在域名上的，先补 SNI", tag)
+		}
+		keyPEM, configPEM, err := generateECH(paths, node.SNI)
+		if err != nil {
+			return err
+		}
+		node.ECHKey, node.ECHConfig = keyPEM, configPEM
+		if err = store.PrepareNode(&node); err != nil {
+			return err
+		}
+		if err = st.SaveNode(node); err != nil {
+			return err
+		}
+		fmt.Printf("已为 %s 生成 ECH（SNI %s）\n", tag, node.SNI)
+		fmt.Println("  记得 apply 才会下发给内核；客户端也要刷新订阅才拿得到 ECH 配置")
+		fmt.Println("  提醒：ECH 握手失败时客户端会静默退回明文 ClientHello，等于没开")
+		return nil
+
 	case "del":
 		if len(args) < 2 {
 			return fmt.Errorf("用法: node del <tag>")
@@ -499,6 +549,44 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		return nil
 	}
 	return fmt.Errorf("未知子命令: node %s", args[0])
+}
+
+// generateECH 调内核的 `generate ech-keypair` 生成一对密钥。
+//
+// 为什么走子进程而不是在面板里自己实现：内核是用 pem.Decode + 写死的块类型
+// （"ECH KEYS" / "ECH CONFIGS"）校验的，格式必须逐字节一致。让内核自己生成，
+// 以后内核换了实现也不会跑偏，代价只是一次 exec。
+func generateECH(paths kernel.Paths, sni string) (keyPEM, configPEM string, err error) {
+	if paths.Bin == "" {
+		return "", "", fmt.Errorf("不知道内核二进制路径（设 SBX_PANEL_KERNEL）")
+	}
+	out, err := exec.Command(paths.Bin, "generate", "ech-keypair", sni).Output()
+	if err != nil {
+		return "", "", fmt.Errorf("生成 ECH 密钥失败: %w", err)
+	}
+	if keyPEM, err = extractPEM(string(out), "ECH KEYS"); err != nil {
+		return "", "", err
+	}
+	configPEM, err = extractPEM(string(out), "ECH CONFIGS")
+	return keyPEM, configPEM, err
+}
+
+// extractPEM 从命令输出里抠出一段指定类型的 PEM。
+//
+// 内核的输出里两段都在（ECH CONFIGS 在前、ECH KEYS 在后），顺序不保证，
+// 所以按块类型找而不是按位置取。
+func extractPEM(out, want string) (string, error) {
+	rest := []byte(out)
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return "", fmt.Errorf("内核输出里没有 %s 块", want)
+		}
+		if block.Type == want {
+			return string(pem.EncodeToMemory(block)), nil
+		}
+	}
 }
 
 // ---------------------------------------------------------------- user

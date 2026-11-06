@@ -430,6 +430,16 @@ func buildTLS(node store.Node, paths Paths) map[string]any {
 			block["certificate_path"] = certPath
 			block["key_path"] = keyPath
 		}
+		if node.ECHKey != "" {
+			// ECH 私钥。内核用 pem.Decode 校验块类型（必须是 "ECH KEYS"），
+			// store 层已经提前验过，这里直接下发。
+			//
+			// 只有 tls 分支会走到这：ValidateNode 拦掉了 reality / none。
+			block["ech"] = map[string]any{
+				"enabled": true,
+				"key":     []any{node.ECHKey},
+			}
+		}
 		return block
 	}
 }

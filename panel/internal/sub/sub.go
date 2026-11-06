@@ -10,7 +10,9 @@
 package sub
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/url"
 	"sort"
@@ -18,6 +20,22 @@ import (
 
 	"github.com/PPX-LuBing/vega/panel/internal/store"
 )
+
+// echConfigB64 从 `ECH CONFIGS` PEM 里取出裸 base64 的 ECHConfigList。
+//
+// 三个客户端要的格式不一样：
+//   - sing-box：整段 PEM（它自己 pem.Decode 并校验块类型）
+//   - mihomo / FlClash：ech-opts.config 要裸 base64
+//   - Anywhere：security.ech 也要裸 base64
+//
+// 所以 PEM 直接发，裸版本在这里剥一层。解不出来返回空串，调用方跳过。
+func echConfigB64(pemText string) string {
+	block, _ := pem.Decode([]byte(pemText))
+	if block == nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(block.Bytes)
+}
 
 // endpoint 是一个节点对某个用户呈现出来的连接信息。
 type endpoint struct {
@@ -316,6 +334,19 @@ func clashProxy(e endpoint) (string, bool) {
 	return b.String(), true
 }
 
+// clashECH 补上 ech-opts。
+//
+// mihomo / FlClash 的 ech-opts.config 要**裸 base64** 的 ECHConfigList，不是整段
+// PEM；留空它才会去查 DNS 的 HTTPS 记录——我们没有 sslip.io 的 DNS 控制权，
+// 所以必须内联。
+func clashECH(b *strings.Builder, n store.Node) {
+	b64 := echConfigB64(n.ECHConfig)
+	if b64 == "" {
+		return
+	}
+	b.WriteString("    ech-opts:\n      enable: true\n      config: " + yamlQuote(b64) + "\n")
+}
+
 // clashForceTLS 给本身就跑 TLS 的协议补字段，不管节点有没有配 tls_mode。
 func clashForceTLS(b *strings.Builder, n store.Node) {
 	b.WriteString("    tls: true\n")
@@ -330,6 +361,7 @@ func clashForceTLS(b *strings.Builder, n store.Node) {
 	if n.Fingerprint != "" && n.Proto != store.ProtoHysteria2 {
 		b.WriteString("    client-fingerprint: " + yamlQuote(n.Fingerprint) + "\n")
 	}
+	clashECH(b, n)
 }
 
 // clashTLS 补上 tls / sni / 跳过校验等公共字段。
@@ -349,6 +381,7 @@ func clashTLS(b *strings.Builder, n store.Node) {
 	if n.Fingerprint != "" {
 		b.WriteString("    client-fingerprint: " + yamlQuote(n.Fingerprint) + "\n")
 	}
+	clashECH(b, n)
 }
 
 // yamlQuote 给 YAML 标量加双引号。
@@ -557,6 +590,16 @@ func singboxOutbound(e endpoint) (map[string]any, bool) {
 	return ob, true
 }
 
+// singboxECH 给 sing-box 的 tls 块补 ECH。
+//
+// 必须**整段 `ECH CONFIGS` PEM**：sing-box 会 pem.Decode 并校验块类型。
+// clash 和 AJSON 那边要的是裸 base64，别混。
+func singboxECH(tls map[string]any, n store.Node) {
+	if n.ECHConfig != "" {
+		tls["ech"] = map[string]any{"enabled": true, "config": []any{n.ECHConfig}}
+	}
+}
+
 // forceTLS 给协议本身就跑在 TLS 上的出站（anytls / hysteria2）生成 tls 块。
 // 这类协议不管节点上有没有显式配 tls_mode 都必须给，否则内核直接拒绝加载。
 func forceTLS(n store.Node) map[string]any {
@@ -564,6 +607,7 @@ func forceTLS(n store.Node) map[string]any {
 	if n.SNI != "" {
 		tls["server_name"] = n.SNI
 	}
+	singboxECH(tls, n)
 	return tls
 }
 
@@ -576,6 +620,7 @@ func singboxTLS(ob map[string]any, n store.Node) {
 	if n.SNI != "" {
 		tls["server_name"] = n.SNI
 	}
+	singboxECH(tls, n)
 	ob["tls"] = tls
 }
 

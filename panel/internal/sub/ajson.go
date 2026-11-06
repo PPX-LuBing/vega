@@ -172,6 +172,11 @@ func ajsonTLS(n store.Node) map[string]any {
 	if n.SNI != "" {
 		security["sni"] = n.SNI
 	}
+	if b64 := echConfigB64(n.ECHConfig); b64 != "" {
+		// AJSON 的 security.ech 收裸 base64；写布尔 true 才是「自己去查 DNS 的
+		// HTTPS 记录」——我们没有 sslip.io 的 DNS 控制权，所以只能内联。
+		security["ech"] = b64
+	}
 	// AJSON 的 fingerprint 只认 uTLS 的家族名或带版本的名字（chrome_133 等），
 	// 面板里存的是 uTLS 原名；只有家族名能直接透传，其余交给默认值，
 	// 免得写一个它不认识的值把整个代理判成无效。

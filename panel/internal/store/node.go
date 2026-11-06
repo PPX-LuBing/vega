@@ -5,11 +5,28 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 )
+
+// checkECHPEM 确认这是一段类型正确的 PEM。
+//
+// 内核和客户端都是用 pem.Decode 并写死块类型来校验的（common/tls/ech.go 里的
+// "ECH KEYS" / "ECH CONFIGS"），类型不对要等内核启动或客户端连接时才炸。这里提前拦住，
+// 顺便挡掉「PEM 后面还粘着别的东西」——pem.Decode 只看第一块，粘着的内容会被静默忽略。
+func checkECHPEM(raw, want string) error {
+	block, rest := pem.Decode([]byte(raw))
+	if block == nil || block.Type != want {
+		return fmt.Errorf("ECH 内容不是 %s 的 PEM", want)
+	}
+	if strings.TrimSpace(string(rest)) != "" {
+		return fmt.Errorf("ECH 的 %s PEM 后面还有多余内容", want)
+	}
+	return nil
+}
 
 // PrepareNode is shared by interactive and command-line writes. Low-level
 // persistence still accepts incomplete legacy records so they can be repaired.
@@ -136,6 +153,27 @@ func ValidateNode(n Node) error {
 		}
 	} else {
 		return fmt.Errorf("TLS mode must be tls/reality/none")
+	}
+	// ECH 只有真 TLS 能开：
+	//   - REALITY 的 public name 是伪装目标，我们不可能持有它的 ECH 私钥；
+	//   - none 根本没有 TLS 握手可加密；
+	//   - ECH 配置本身是绑在域名上的，没有 SNI 客户端不知道该用哪份配置。
+	if n.ECHKey != "" || n.ECHConfig != "" {
+		if n.TLSMode != "tls" {
+			return fmt.Errorf("ECH 只支持 tls 模式；REALITY 的伪装目标不可能有我们的 ECH 私钥")
+		}
+		if strings.TrimSpace(n.SNI) == "" {
+			return fmt.Errorf("ECH 需要 SNI：ECH 配置是绑在域名上的")
+		}
+		if n.ECHKey == "" || n.ECHConfig == "" {
+			return fmt.Errorf("ECH 的私钥和公钥必须成对：只有一半时内核起不来或客户端连不上")
+		}
+		if err := checkECHPEM(n.ECHKey, "ECH KEYS"); err != nil {
+			return err
+		}
+		if err := checkECHPEM(n.ECHConfig, "ECH CONFIGS"); err != nil {
+			return err
+		}
 	}
 	if n.Proto == ProtoShadowsocks {
 		if n.TLSMode != "none" {
