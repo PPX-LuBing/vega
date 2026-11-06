@@ -2,6 +2,7 @@ package sub
 
 import (
 	"encoding/json"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -131,6 +132,38 @@ func TestECHFormatsPerClient(t *testing.T) {
 		// hk-any（a.example.com）没开 ECH，它的块里不该有 ech-opts
 		if strings.Contains(snippet(clash, "a.example.com"), "ech-opts") {
 			t.Fatal("没开 ECH 的节点也发了 ech-opts")
+		}
+	})
+
+	// v2rayN / Xray 系从分享链接的 `ech` 查询参数读 ECH（BaseFmt 系：
+	// vless / trojan / hysteria2），值要裸 base64。
+	t.Run("分享链接带 ech 参数", func(t *testing.T) {
+		body, _, err := Links(st, u, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var target string
+		for _, line := range strings.Split(body, "\n") {
+			if strings.Contains(line, "ech.example.com") {
+				target = line
+			}
+		}
+		if target == "" {
+			t.Fatalf("没找到 hk-ech 的分享链接:\n%s", body)
+		}
+		parsed, err := url.Parse(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parsed.Query().Get("ech"); got != testECHB64 {
+			t.Fatalf("分享链接的 ech = %q，想要裸 base64 %q", got, testECHB64)
+		}
+
+		// 没开 ECH 的节点链接里不该有这个参数
+		for _, line := range strings.Split(body, "\n") {
+			if strings.Contains(line, "a.example.com") && strings.Contains(line, "ech=") {
+				t.Fatalf("没开 ECH 的节点链接带了 ech: %s", line)
+			}
 		}
 	})
 }

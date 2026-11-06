@@ -62,6 +62,18 @@ func shareLink(e endpoint) (string, error) {
 	if n.Fingerprint != "" {
 		q.Set("fp", n.Fingerprint)
 	}
+	if n.TLSMode == "tls" && n.ECHConfig != "" {
+		// v2rayN / Xray 系从分享链接的 `ech` 查询参数读 ECH（见 v2rayN 的
+		// ServiceLib/Handler/Fmt/BaseFmt.cs：GetQueryDecoded(query, "ech")），
+		// 值要**裸 base64**，客户端自己会包成 `ECH CONFIGS` PEM。
+		//
+		// 实测 v2rayN 只在 BaseFmt 系（vless / trojan / hysteria2）实现了这个参数，
+		// vmess 的 JSON 和 anytls / tuic 的链接都没读。多写一个参数不会有害——
+		// 不认识的解析器会忽略它，认识它的客户端才用。
+		if b64 := echConfigB64(n.ECHConfig); b64 != "" {
+			q.Set("ech", b64)
+		}
+	}
 	transport := n.Transport
 	if transport == "" {
 		transport = "tcp"
