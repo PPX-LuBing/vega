@@ -4,10 +4,6 @@ on:
   push:
     branches:
       - main
-      - oldstable
-      - stable
-      - testing
-      - unstable
     paths-ignore:
       - '**.md'
       - '.github/**'
@@ -15,45 +11,18 @@ on:
   pull_request:
     branches:
       - main
-      - oldstable
-      - stable
-      - testing
-      - unstable
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ inputs.build }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Lint ${{ matrix.goos }}/${{ matrix.goarch }}
+  # 上游这里是个 10 个 GOOS/GOARCH 的矩阵（每个 job 一遍 golangci-lint，
+  # 30 分钟超时），那是给 sing-box 的全平台发布用的。这个 fork 只部署
+  # linux/amd64，所以只留这一个目标。
+  lint:
+    name: Lint linux/amd64
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: windows
-            goarch: amd64
-          - goos: windows
-            goarch: '386'
-          - goos: windows
-            goarch: arm64
-          - goos: linux
-            goarch: amd64
-          - goos: linux
-            goarch: arm64
-          - goos: linux
-            goarch: arm
-          - goos: linux
-            goarch: '386'
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
-          - goos: android
-            goarch: arm64
-        #  - goos: freebsd
-        #    goarch: amd64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -72,8 +41,8 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: linux
+          GOARCH: amd64
         with:
           version: latest
           args: --timeout=30m
