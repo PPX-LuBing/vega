@@ -103,6 +103,7 @@ func OutboundRegistry() *outbound.Registry {
 	vless.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
 	nowhere.RegisterOutbound(registry)
+	nowhere.RegisterEgressOutbound(registry)
 
 	registerQUICOutbounds(registry)
 	registerStubForRemovedOutbounds(registry)
@@ -145,6 +146,7 @@ func DNSTransportRegistry() *dns.TransportRegistry {
 
 func ServiceRegistry() *service.Registry {
 	registry := service.NewRegistry()
+	nowhere.RegisterEgressService(registry)
 
 	api.RegisterService(registry)
 	resolved.RegisterService(registry)

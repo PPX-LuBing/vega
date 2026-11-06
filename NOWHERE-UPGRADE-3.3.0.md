@@ -1,5 +1,9 @@
 # Nowhere-Go 3.3.0 update
 
+> Historical baseline-upgrade report. The subsequent QUIC/Egress and PreHello
+> work supersedes the operational limitations below: see [NOWHERE-CAPABILITIES.md](NOWHERE-CAPABILITIES.md).
+
+
 Date: 2026-11-04. Branch: `main`. Previous stable Vega commit: `a1e6f11e`.
 This continues the existing sing-box + nowhere-go route, not the Rust-core
 experiment. No production server was accessed or changed.

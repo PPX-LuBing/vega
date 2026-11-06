@@ -51,9 +51,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 
 	// Nowhere 建立在 TLS 之上，没有 TLS 就没有 Portal。
-	if options.Egress {
-		return nil, E.New("nowhere: egress is not integrated with Vega routing and user accounting")
+	transport, err := carrier(options.Carrier, true)
+	if err != nil {
+		return nil, err
 	}
+	if transport != "tcp" && !quicAvailable {
+		return nil, E.New("nowhere: QUIC requires build tag with_quic")
+	}
+	options.Carrier = transport
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, E.New("nowhere: TLS is required")
 	}
@@ -109,20 +114,50 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if h.options.Morph != nil {
 		morph = *h.options.Morph
 	}
+	overhead := 0
+	if morph {
+		overhead = 12
+	}
 	server, err := portal.New(portal.Config{
-		SharedKey:    sharedKey,
-		Users:        portalUsers,
-		Morph:        morph,
-		TLS:          stdTLS,
-		Upstream:     &upstream{router: h.router, ctx: h.ctx, tag: h.Tag()},
-		Egress:       h.options.Egress,
-		UploadMbps:   h.options.UploadMbps,
-		DownloadMbps: h.options.DownloadMbps,
+		SharedKey:        sharedKey,
+		Users:            portalUsers,
+		Morph:            morph,
+		TLS:              stdTLS,
+		Upstream:         &upstream{router: h.router, ctx: h.ctx, tag: h.Tag()},
+		AcceptEgress:     h.options.Egress,
+		DatagramOverhead: overhead,
+		UploadMbps:       h.options.UploadMbps,
+		DownloadMbps:     h.options.DownloadMbps,
 	})
 	if err != nil {
 		return E.New("nowhere: create portal: ", err)
 	}
 	h.server = server
+	if h.options.Carrier != "tcp" {
+		pc, err := h.listener.ListenUDP()
+		if err != nil {
+			return err
+		}
+		scope.Add(pc.Close)
+		key := h.options.SharedKey
+		if key == "" {
+			key = h.options.Users[0].SharedKey
+		}
+		keys := server.MorphKeys
+		if len(portalUsers) == 0 {
+			keys = nil
+		}
+		ln, err := listenQUIC(pc, stdTLS, key, morph, keys)
+		if err != nil {
+			return err
+		}
+		scope.Add(ln.Close)
+		go func() {
+			if err := server.ServeQUIC(h.ctx, ln); err != nil && h.ctx.Err() == nil {
+				h.logger.Error(err)
+			}
+		}()
+	}
 
 	// 控制端点：让面板不重启就能改用户
 	controlAddr := h.options.ControlAddr
@@ -139,6 +174,9 @@ func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	// 这里**不能**用 listener.Start()：它会连自己的 accept 循环一起启动
 	// （loopTCPIn 直接调用 connHandler，而本入站没有 connHandler，会空指针崩）。
 	// Nowhere 的握手必须由 portal 完成，所以只建监听、把 listener 交出去。
+	if h.options.Carrier == "quic" {
+		return nil
+	}
 	ln, err := h.listener.ListenTCP()
 	if err != nil {
 		return err

@@ -672,7 +672,7 @@ func minimalClientHello() []byte {
 	body = append(body, make([]byte, 32)...)
 	body = append(body, 0)
 	body = append(body, 0x00, 0x02, 0x13, 0x01, 1, 0)
-	ext := []byte{0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04}
+	ext := []byte{0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04, 0, 13, 0, 4, 0, 2, 8, 4}
 	body = append(body, byte(len(ext)>>8), byte(len(ext)))
 	body = append(body, ext...)
 	message := []byte{tlsClientHello, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}

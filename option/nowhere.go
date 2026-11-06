@@ -23,15 +23,18 @@ type NowhereInboundOptions struct {
 	// Users 多用户模式。与 SharedKey 互斥。
 	Users []NowhereUser `json:"users,omitempty"`
 
-	// Morph 是否启用 Morph TCP/UDP prelude 伪装。nw3 默认开启，
-	// 关闭会让 nw3 客户端无法连接（3.2 Portal 强制校验 prelude）。
+	// Carrier selects tcp (default), quic, or both on the same port.
+	Carrier string `json:"carrier,omitempty"`
+
+	// Morph defaults on. Both peers must use the same setting.
 	Morph *bool `json:"morph,omitempty"`
 
 	// 限速（Mbps）。0 表示不限。
 	UploadMbps   int `json:"upload_mbps,omitempty"`
 	DownloadMbps int `json:"download_mbps,omitempty"`
 
-	// Egress 允许一个 Egress 注册（Portal 链式）。
+	// Egress enables remote exit registrations; use a nowhere-egress outbound
+	// referencing this inbound to route traffic through those registrations.
 	Egress bool `json:"egress,omitempty"`
 
 	// ControlAddr 是运行期改用户的控制端点，只允许绑回环。
@@ -54,7 +57,18 @@ type NowhereOutboundOptions struct {
 	OutboundTLSOptionsContainer
 
 	SharedKey    string `json:"shared_key,omitempty"`
+	Carrier      string `json:"carrier,omitempty"`
 	Morph        *bool  `json:"morph,omitempty"`
 	UploadMbps   int    `json:"upload_mbps,omitempty"`
 	DownloadMbps int    `json:"download_mbps,omitempty"`
+}
+
+type NowhereEgressOutboundOptions struct {
+	Portal string `json:"portal"`
+}
+
+// The exit actively connects to Portal and routes received flows locally.
+type NowhereEgressServiceOptions struct {
+	NowhereOutboundOptions
+	User string `json:"user,omitempty"`
 }

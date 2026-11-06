@@ -108,7 +108,7 @@ Authorization: Bearer <control_secret>
 - **回环 + Bearer 鉴权**：只绑回环并不安全，代理用户也能通过代理访问回环。必须配置 `control_secret`；未配置地址和令牌时不开放端点，显式指定地址却没给令牌则拒绝启动。
 - `users` 必须显式传数组；`[]` 表示清空，漏传或 `null` 不会误清空。用户名和密钥都必须唯一。
 - 多个 nowhere 入站**共用一个端点**（第一个启动的负责监听，其余注册进来），不会抢端口
-- Nowhere 的 TCP、UDP 都经过 sing-box 路由和用户流量统计；当前入站不支持 QUIC/Egress。
+- Nowhere 的 TCP、UDP 都经过 sing-box 路由和用户流量统计；支持 TCP/TLS、QUIC 和按用户隔离的 Egress；配置和验收见 [NOWHERE-CAPABILITIES.md](NOWHERE-CAPABILITIES.md)。
 
 升级已有部署时：面板会在数据库里生成管理令牌，并在下一次 `apply` 时写入内核配置；升级内核、面板和 `sb-stats` 后先执行一次 `apply`，再使用 `user sync`。手写配置需要自行添加 `control_secret`，调用方同步添加 Authorization 头。远端运行期同步使用 SSH + 远端 `curl`，远端需要安装 curl。不要把 `show` 输出的配置或数据库发给代理用户，它们包含凭据。
 
@@ -289,5 +289,4 @@ Vega 站在这些项目的肩膀上：
 详细修复范围、回归和未验证事项见 `AUDIT-FIXES-2026-11-04.md`。
 
 后续已在 main 将 nowhere-go 更新到 v3.3.0，并重新核验官方源码锁。
-升级范围与互通验证见 `NOWHERE-UPGRADE-3.3.0.md`；Vega 仍使用 TCP+TLS
-carrier 承载 TCP/UDP，不因库升级自动启用 QUIC carrier 或 Egress。
+基线升级记录见 `NOWHERE-UPGRADE-3.3.0.md`；后续已补齐 QUIC carrier、Egress 和 Silent PreHello 接收检查，详见 `NOWHERE-CAPABILITIES.md`。

@@ -33,7 +33,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.26.x'
-      - run: go test -race -tags with_v2ray_api ./protocol/nowhere/... ./experimental/v2rayapi/... ./common/tls
+      - run: go test -race -tags with_v2ray_api,with_quic ./protocol/nowhere/... ./experimental/v2rayapi/... ./common/tls
       - run: go test -race ./route/rule -run TestVegaQUICPolicy
       - run: go test -race ./... && go vet ./...
         working-directory: panel

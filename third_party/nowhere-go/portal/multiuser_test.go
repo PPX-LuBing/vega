@@ -170,7 +170,7 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatal("用户密钥格式非法，应当报错")
 	}
 
-	// 多用户 + QUIC 目前不支持，必须显式报错而不是崩掉
+	// A missing host QUIC listener must fail instead of panicking.
 	cfg = base()
 	cfg.Users = []User{{Name: "alice", SharedKey: keyAlice}}
 	srv, err := New(cfg)
@@ -178,7 +178,7 @@ func TestConfigValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := srv.ServeQUIC(context.Background(), nil); err == nil {
-		t.Fatal("多用户 QUIC 应当明确报错")
+		t.Fatal("nil QUIC listener must fail")
 	}
 }
 
@@ -335,4 +335,3 @@ func echoThrough(t *testing.T, ln net.Listener, key string, morph bool, echo str
 	}
 	return string(buf) == "ping"
 }
-

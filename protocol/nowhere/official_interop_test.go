@@ -3,6 +3,7 @@
 package nowhere_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -29,6 +30,8 @@ import (
 )
 
 // Opt-in: use an independently built official 3.3.0 binary, not our Go CLI.
+var quicTestAvailable bool
+
 func TestOfficialRustInterop(t *testing.T) {
 	binary := os.Getenv("VEGA_TEST_NOWHERE_RUST")
 	if binary == "" {
@@ -39,81 +42,97 @@ func TestOfficialRustInterop(t *testing.T) {
 		t.Fatalf("official peer version: %q, %v", version, err)
 	}
 	for _, morph := range []bool{false, true} {
-		for _, rustPortal := range []bool{false, true} {
-			name := fmt.Sprintf("rust_portal=%t/morph=%t", rustPortal, morph)
-			t.Run(name, func(t *testing.T) {
-				dir := t.TempDir()
-				key, cert, err := singtls.GenerateCertificate(nil, nil, time.Now, "localhost", time.Now().Add(time.Hour))
-				if err != nil {
-					t.Fatal(err)
-				}
-				pair, err := tls.X509KeyPair(cert, key)
-				if err != nil {
-					t.Fatal(err)
-				}
-				pin := sha256.Sum256(pair.Certificate[0])
-				certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
-				for path, data := range map[string][]byte{certPath: cert, keyPath: key} {
-					if err := os.WriteFile(path, data, 0600); err != nil {
+		for _, transport := range []string{"tcp", "quic"} {
+			if transport == "quic" && !quicTestAvailable {
+				continue
+			}
+			for _, rustPortal := range []bool{false, true} {
+				name := fmt.Sprintf("%s/rust_portal=%t/morph=%t", transport, rustPortal, morph)
+				t.Run(name, func(t *testing.T) {
+					dir := t.TempDir()
+					key, cert, err := singtls.GenerateCertificate(nil, nil, time.Now, "localhost", time.Now().Add(time.Hour))
+					if err != nil {
 						t.Fatal(err)
 					}
-				}
-				portal, socksAddr := freeAddress(t), freeAddress(t)
-				morphValue := "0"
-				if morph {
-					morphValue = "1"
-				}
-				if rustPortal {
-					query := url.Values{"tls": {"2"}, "crt": {certPath}, "key": {keyPath}, "morph": {morphValue}}
-					startOfficialPeer(t, binary, officialURL("portal", portal, query), portal)
-					startInteropBox(t, map[string]any{
-						"inbounds": []any{map[string]any{"type": "socks", "listen": "127.0.0.1", "listen_port": interopPort(socksAddr)}},
-						"outbounds": []any{map[string]any{"type": "nowhere", "tag": "proxy", "server": "127.0.0.1", "server_port": interopPort(portal), "shared_key": integrationAlice, "morph": morph,
-							"tls": map[string]any{"enabled": true, "server_name": "localhost", "certificate": []string{string(cert)}}}},
-						"route": map[string]any{"final": "proxy"},
-					})
-				} else {
-					startInteropBox(t, map[string]any{
-						"inbounds": []any{map[string]any{"type": "nowhere", "listen": "127.0.0.1", "listen_port": interopPort(portal), "morph": morph, "control_addr": "off",
-							"users": []any{map[string]any{"name": "bob", "shared_key": integrationBob}, map[string]any{"name": "alice", "shared_key": integrationAlice}},
-							"tls":   map[string]any{"enabled": true, "certificate_path": certPath, "key_path": keyPath}}},
-						"outbounds": []any{map[string]any{"type": "direct", "tag": "direct"}}, "route": map[string]any{"final": "direct"},
-					})
-					query := url.Values{"in": {socksAddr}, "sni": {"localhost"}, "pin": {hex.EncodeToString(pin[:])}, "morph": {morphValue}}
-					startOfficialPeer(t, binary, officialURL("vector", portal, query), socksAddr)
-				}
-				client := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(socksAddr), socks.Version5, "", "")
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-				defer cancel()
-				echo := tcpEcho(t)
-				for i := 0; i < 2; i++ {
-					if err := echoFlow(client.DialContext(ctx, "tcp", M.ParseSocksaddr(echo.Addr().String()))); err != nil {
-						t.Fatal("TCP/reconnect: ", err)
-					}
-				}
-				first, second := udpEcho(t), udpEcho(t)
-				packet, err := client.ListenPacket(ctx, M.SocksaddrFromNet(first.LocalAddr()))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer packet.Close()
-				if err := packet.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
-					t.Fatal(err)
-				}
-				for _, peer := range []*net.UDPConn{first, second, first} {
-					target := M.SocksaddrFromNet(peer.LocalAddr())
-					if _, err := packet.WriteTo([]byte("udp-echo"), target); err != nil {
+					pair, err := tls.X509KeyPair(cert, key)
+					if err != nil {
 						t.Fatal(err)
 					}
-					buf := make([]byte, 64)
-					n, source, err := packet.ReadFrom(buf)
-					if err != nil || string(buf[:n]) != "udp-echo" || M.SocksaddrFromNet(source) != target {
-						t.Fatalf("UDP source/echo: %q %v %v", buf[:n], source, err)
+					pin := sha256.Sum256(pair.Certificate[0])
+					certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+					for path, data := range map[string][]byte{certPath: cert, keyPath: key} {
+						if err := os.WriteFile(path, data, 0600); err != nil {
+							t.Fatal(err)
+						}
 					}
-				}
-			})
+					portal, socksAddr := freeAddress(t), freeAddress(t)
+					morphValue := "0"
+					if morph {
+						morphValue = "1"
+					}
+					if rustPortal {
+						query := url.Values{"tls": {"2"}, "crt": {certPath}, "key": {keyPath}, "morph": {morphValue}}
+						endpoint, ready := officialURL("portal", portal, query), portal
+						if transport == "quic" {
+							endpoint = strings.Replace(endpoint, "/tcp:", "/udp:", 1)
+							ready = ""
+						}
+						startOfficialPeer(t, binary, endpoint, ready)
+						startInteropBox(t, map[string]any{
+							"inbounds": []any{map[string]any{"type": "socks", "listen": "127.0.0.1", "listen_port": interopPort(socksAddr)}},
+							"outbounds": []any{map[string]any{"type": "nowhere", "carrier": transport, "tag": "proxy", "server": "127.0.0.1", "server_port": interopPort(portal), "shared_key": integrationAlice, "morph": morph,
+								"tls": map[string]any{"enabled": true, "server_name": "localhost", "certificate": []string{string(cert)}}}},
+							"route": map[string]any{"final": "proxy"},
+						})
+					} else {
+						startInteropBox(t, map[string]any{
+							"inbounds": []any{map[string]any{"type": "nowhere", "carrier": transport, "listen": "127.0.0.1", "listen_port": interopPort(portal), "morph": morph, "control_addr": "off",
+								"users": []any{map[string]any{"name": "bob", "shared_key": integrationBob}, map[string]any{"name": "alice", "shared_key": integrationAlice}},
+								"tls":   map[string]any{"enabled": true, "certificate_path": certPath, "key_path": keyPath}}},
+							"outbounds": []any{map[string]any{"type": "direct", "tag": "direct"}}, "route": map[string]any{"final": "direct"},
+						})
+						query := url.Values{"in": {socksAddr}, "sni": {"localhost"}, "pin": {hex.EncodeToString(pin[:])}, "morph": {morphValue}}
+						endpoint := officialURL("vector", portal, query)
+						if transport == "quic" {
+							endpoint = strings.Replace(endpoint, "/tcp:", "/udp:", 1)
+						}
+						startOfficialPeer(t, binary, endpoint, socksAddr)
+					}
+					client := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(socksAddr), socks.Version5, "", "")
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					echo := tcpEcho(t)
+					for i := 0; i < 2; i++ {
+						if err := echoFlow(client.DialContext(ctx, "tcp", M.ParseSocksaddr(echo.Addr().String()))); err != nil {
+							t.Fatal("TCP/reconnect: ", err)
+						}
+					}
+					first, second := udpEcho(t), udpEcho(t)
+					packet, err := client.ListenPacket(ctx, M.SocksaddrFromNet(first.LocalAddr()))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer packet.Close()
+					if err := packet.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+						t.Fatal(err)
+					}
+					for i, peer := range []*net.UDPConn{first, second, first} {
+						target := M.SocksaddrFromNet(peer.LocalAddr())
+						payload := bytes.Repeat([]byte{byte(i)}, []int{0, 8, 8192}[i])
+						if _, err := packet.WriteTo(payload, target); err != nil {
+							t.Fatal(err)
+						}
+						buf := make([]byte, 65535)
+						n, source, err := packet.ReadFrom(buf)
+						if err != nil || !bytes.Equal(buf[:n], payload) || M.SocksaddrFromNet(source) != target {
+							t.Fatalf("UDP source/echo: %q %v %v", buf[:n], source, err)
+						}
+					}
+				})
+			}
 		}
 	}
+
 }
 
 func interopPort(addr string) uint16 { return netip.MustParseAddrPort(addr).Port() }
@@ -123,7 +142,7 @@ func officialURL(role, addr string, query url.Values) string {
 	return fmt.Sprintf("%s://%s@%s/tcp:%d?%s", role, integrationAlice, ap.Addr(), ap.Port(), query.Encode())
 }
 
-func startInteropBox(t *testing.T, config map[string]any) {
+func startInteropBox(t *testing.T, config map[string]any) *box.Box {
 	t.Helper()
 	config["log"] = map[string]any{"level": "error"}
 	data, err := json.Marshal(config)
@@ -143,6 +162,7 @@ func startInteropBox(t *testing.T, config map[string]any) {
 	if err = b.Start(); err != nil {
 		t.Fatal(err)
 	}
+	return b
 }
 
 func startOfficialPeer(t *testing.T, binary, serviceURL, listen string) {
@@ -175,6 +195,10 @@ func startOfficialPeer(t *testing.T, binary, serviceURL, listen string) {
 			t.Logf("official peer: %s", data)
 		}
 	})
+	if listen == "" {
+		time.Sleep(200 * time.Millisecond)
+		return
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", listen, 100*time.Millisecond)

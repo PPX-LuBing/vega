@@ -12,10 +12,12 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
+	"github.com/ohmycggk/nowhere-go/qio"
 	"github.com/ohmycggk/nowhere-go/vector"
 	"github.com/ohmycggk/nowhere-go/wire"
 )
@@ -38,6 +40,13 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger, tag string, options option.NowhereOutboundOptions) (adapter.Outbound, error) {
+	transport, err := carrier(options.Carrier, false)
+	if err != nil {
+		return nil, err
+	}
+	if transport == "quic" && !quicAvailable {
+		return nil, E.New("nowhere: QUIC requires build tag with_quic")
+	}
 	if options.SharedKey == "" {
 		return nil, E.New("nowhere: 出站需要 shared_key")
 	}
@@ -51,7 +60,7 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, E.New("nowhere: 出站需要启用 TLS")
 	}
-	clientConfig, err := tls.NewClient(ctx, logger, options.ServerOptions.Build().String(), common.PtrValueOrDefault(options.TLS))
+	clientConfig, err := tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +70,7 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 	}
 
 	portalAddr := options.ServerOptions.Build().String()
-	client, err := vector.New(vector.Config{
+	cfg := vector.Config{
 		SharedKey:  options.SharedKey,
 		Morph:      options.Morph == nil || *options.Morph,
 		PortalAddr: portalAddr,
@@ -71,7 +80,21 @@ func NewOutbound(ctx context.Context, _ adapter.Router, logger log.ContextLogger
 		},
 		UploadMbps:   options.UploadMbps,
 		DownloadMbps: options.DownloadMbps,
-	})
+	}
+	if transport == "quic" {
+		cfg.DialTCP = nil
+		cfg.DialQUIC = func(dialCtx context.Context) (qio.Conn, error) {
+			conn, err := outboundDialer.DialContext(dialCtx, N.NetworkUDP, options.ServerOptions.Build())
+			if err != nil {
+				return nil, err
+			}
+			return dialQUIC(dialCtx, bufio.NewUnbindPacketConn(conn), conn.RemoteAddr(), tlsConfig, options.SharedKey, cfg.Morph)
+		}
+		if cfg.Morph {
+			cfg.DatagramOverhead = 12
+		}
+	}
+	client, err := vector.New(cfg)
 	if err != nil {
 		return nil, E.Cause(err, "nowhere: 建立 Vector 失败")
 	}

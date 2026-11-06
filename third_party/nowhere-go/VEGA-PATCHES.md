@@ -24,12 +24,14 @@ Official Nowhere has one Shared Key per Portal. Before a multiuser connection
 authenticates, Vega cannot know which key's derived handshake timeout applies.
 It uses the maximum official derived timeout of the current user snapshot;
 hot updates recompute it. An explicit `NOW_HANDSHAKE_TIMEOUT` takes precedence.
-Single-key behavior is unchanged. Multiuser Egress remains explicitly rejected
-to avoid sharing exits across identities without an accounting/routing design.
+Single-key authentication is unchanged. Multiuser Egress uses a distinct registry
+per shared key; Vega routes through its host router before claiming an exit.
+Revoking a key closes its standby registrations (including QUIC connections);
+existing Vector sessions are not reauthenticated by a hot update.
 
 The TCP cleanup patch transfers ownership of a claimed TLS Egress connection
 instead of closing it when registration returns. The upstream TLS Egress test
-is kept intact to catch regressions; this does not expose Egress in Vega.
+is kept intact to catch regressions; Vega now exposes routed Egress.
 
 Upstream v3.3.0 retained a 3.2 protocol-source hash, as its changelog notes.
 Only `UPSTREAM.lock` (nw3) was regenerated using its own tool against the official
@@ -51,11 +53,25 @@ Only `UPSTREAM.lock` (nw3) was regenerated using its own tool against the offici
 Vectors and Go-to-Go loopbacks do not replace official-client interoperability
 tests. Run Vega's opt-in `TestOfficialRustInterop` with `VEGA_TEST_NOWHERE_RUST`
 pointing to an independently built official 3.3.0 binary. It exercises both
-directions, TLS TCP/UDP payloads, multi-target UDP sources, Morph on/off and
-reconnects. QUIC/Egress are not exposed by the Vega adapter; a library update
-does not imply full feature parity. See `../../NOWHERE-UPGRADE-3.3.0.md`.
+directions, TLS/QUIC TCP/UDP payloads, multi-target UDP sources, Morph on/off and
+reconnects. `TestOfficialEgressInterop` adds all four carrier combinations in
+both directions; `TestOfficialSilentPreHello` compares negative admission,
+post-admission TLS responses and replay commit behavior to the Rust executable.
+See `../../NOWHERE-CAPABILITIES.md` for configuration and acceptance scope.
 
-Retain upstream's documented Silent PreHello limitation (`morph/prehello.go`):
-Go crypto/tls may emit alerts on some structurally valid but semantically invalid
-ClientHellos that Rust rejects silently in its Acceptor. Do not describe normal
-wire interoperability as proof of identical anti-probing behavior.
+## Additional host-integration patches
+
+| Files | Change | Regression |
+| --- | --- | --- |
+| `morph/prehello.go` | rustls 0.23.46 configuration-independent ClientHello checks before replay commit; strict record framing | `prehello_validation_test.go`, official differential probes, fuzz |
+| `morph/multi_packet.go` | Dynamic multi-key UDP masking; validate opaque host-generated CIDs instead of guessing short-header keys; bounded reply map | `multi_packet_test.go`, official QUIC multiuser interop |
+| `portal/host_egress.go`, `registry.go`, `packet.go`, `server.go` | Host-routed per-user Egress, cancellation/half-close, bounded registrations, revoked registry cleanup, bounded setup tasks | `host_egress_test.go`, Vega policy/accounting/concurrency tests |
+| `egress/client.go` | TLS Morph, immediate Hydra replenishment on FlowStart, bounded setup/flows, cancel idle/active connections | official Egress matrix, host Egress cancellation test |
+| `vector/client.go` | Session-scoped auth state, cancellation without holding the client lock during dial, old failures cannot close new sessions, half-close | `session_test.go`, Vega concurrent/half-close tests |
+| `dgram/router.go`, Portal/Vector/Egress | Reserve UDP routes before READY; reuse reservations and close readers when router stops | empty/8-byte/8192-byte interop tests |
+
+No local wire fields, authentication algorithms, exporter labels or protocol
+vectors were changed. A host-generated QUIC CID is an opaque QUIC routing value,
+not an additional Nowhere message. Go TLS and rustls are different engines:
+the differential corpus is evidence for covered cases, not a proof of identical
+behavior for every malformed input or identical transport fingerprints.

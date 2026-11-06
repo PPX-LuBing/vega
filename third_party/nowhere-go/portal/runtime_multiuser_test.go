@@ -27,6 +27,9 @@ func TestMultiUserHandshakeBudget(t *testing.T) {
 	if got != want {
 		t.Fatalf("multiuser timeout = %v, want %v", got, want)
 	}
+	if s.registryForUser("alice") == s.registryForUser("bob") {
+		t.Fatal("users share an exit registry")
+	}
 	if err = s.UpdateUsers(users[:1]); err != nil {
 		t.Fatal(err)
 	}
@@ -34,9 +37,7 @@ func TestMultiUserHandshakeBudget(t *testing.T) {
 	if got != runtime.HandshakeTimeout(keyAlice) {
 		t.Fatalf("updated timeout = %v", got)
 	}
-	if _, err = New(Config{Users: users, TLS: &tls.Config{}, Egress: true}); err == nil {
-		t.Fatal("multiuser Egress must not share exits across users")
-	}
+
 }
 
 func TestHandshakeBudgetOverrideAndValidation(t *testing.T) {

@@ -88,4 +88,3 @@ func TestValidateTLS(t *testing.T) {
 		t.Fatalf("有证书不应报错: %v", err)
 	}
 }
-

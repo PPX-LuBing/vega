@@ -16,6 +16,7 @@ import (
 
 	"github.com/ohmycggk/nowhere-go/dgram"
 	"github.com/ohmycggk/nowhere-go/flowio"
+	"github.com/ohmycggk/nowhere-go/morph"
 	"github.com/ohmycggk/nowhere-go/qio"
 	"github.com/ohmycggk/nowhere-go/runtime"
 	"github.com/ohmycggk/nowhere-go/wire"
@@ -85,13 +86,19 @@ type session struct {
 	rt    runtime.Settings
 	up    *flowio.Limiter
 	down  *flowio.Limiter
+	keys  *morph.Keys
 }
 
 func newSession(cfg Config, creds *wire.Credentials, rt runtime.Settings) *session {
-	return &session{
+	s := &session{
 		cfg: cfg, creds: creds, rt: rt,
 		up: flowio.NewMbps(cfg.UploadMbps), down: flowio.NewMbps(cfg.DownloadMbps),
 	}
+	if cfg.Morph {
+		keys := morph.Derive([]byte(cfg.SharedKey))
+		s.keys = &keys
+	}
+	return s
 }
 
 // runTLS is the Hydra supervisor. The budget counts connections being
@@ -115,7 +122,7 @@ func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime
 	launch = func(n int) {
 		mu.Lock()
 		var starts int
-		for ; n > 0 && budget < rt.EgressTLSPoolMax; n-- {
+		for ; n > 0 && ctx.Err() == nil && budget < rt.EgressTLSPoolMax; n-- {
 			budget++
 			starts++
 		}
@@ -124,13 +131,22 @@ func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				replace := s.tlsOnce(ctx)
-				mu.Lock()
-				budget--
-				mu.Unlock()
-				if replace > 0 {
-					launch(replace)
+				released := false
+				release := func(grow bool) {
+					if released {
+						return
+					}
+					released = true
+					mu.Lock()
+					budget--
+					mu.Unlock()
+					if grow {
+						launch(2)
+					}
+					signal()
 				}
+				s.tlsOnce(ctx, func() { release(true) })
+				release(false)
 				signal()
 			}()
 		}
@@ -161,42 +177,33 @@ func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime
 	}
 }
 
-// tlsOnce dials, registers, and serves one flow. It returns how many
-// replacement connections the supervisor should start: two after FlowStart,
-// zero after failure, disconnect, expiry, or BUSY.
-func (s *session) tlsOnce(ctx context.Context) int {
+// tlsOnce replenishes the standby pool on FlowStart, before serving the flow.
+func (s *session) tlsOnce(ctx context.Context, claimed func()) int {
 	if ctx.Err() != nil {
 		return 0
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, s.rt.HandshakeTimeout)
-	type dialResult struct {
-		conn net.Conn
-		err  error
-	}
-	dialed := make(chan dialResult, 1)
-	go func() {
-		conn, err := s.cfg.DialTCP(dialCtx, s.cfg.PortalAddr)
-		dialed <- dialResult{conn, err}
-	}()
-	var raw net.Conn
-	select {
-	case <-dialCtx.Done():
-		cancel()
+	raw, err := s.cfg.DialTCP(dialCtx, s.cfg.PortalAddr)
+	cancel()
+	if err != nil {
 		s.cool(ctx)
 		return 0
-	case got := <-dialed:
-		cancel()
-		if got.err != nil {
-			s.cool(ctx)
+	}
+	defer raw.Close()
+	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stop()
+	_ = raw.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
+	enableKeepalive(raw)
+	var carrier net.Conn = raw
+	if s.keys != nil {
+		carrier, err = morph.WrapTCPClient(raw, *s.keys)
+		if err != nil {
 			return 0
 		}
-		raw = got.conn
 	}
-	enableKeepalive(raw)
-	tlsConn := tls.Client(raw, s.cfg.TLS)
+	tlsConn := tls.Client(carrier, s.cfg.TLS)
 	_ = tlsConn.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
-	err := tlsConn.Handshake()
-	_ = tlsConn.SetDeadline(time.Time{})
+	err = tlsConn.Handshake()
 	if err != nil {
 		_ = tlsConn.Close()
 		s.cool(ctx)
@@ -218,6 +225,7 @@ func (s *session) tlsOnce(ctx context.Context) int {
 		_ = tlsConn.Close()
 		return 0
 	}
+	_ = tlsConn.SetDeadline(time.Time{})
 	// The standby TTL starts only after ACCEPTED. The first read is FlowStart;
 	// its arrival, or the deadline, ends standby. A deadline is expiry and
 	// does not grow the pool.
@@ -232,6 +240,7 @@ func (s *session) tlsOnce(ctx context.Context) int {
 		_ = tlsConn.Close()
 		return 0
 	}
+	claimed()
 	s.serveOne(ctx, &pipe{Reader: br, write: tlsConn, closer: tlsConn}, nil, kind, target, 1, true)
 	return 2
 }
@@ -265,6 +274,12 @@ func (s *session) quicOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.CloseWithError(0, "")
+	ctx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn()
+	stopConn := context.AfterFunc(conn.Context(), cancelConn)
+	defer stopConn()
+	stop := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(0, "shutdown") })
+	defer stop()
 	if conn.ALPN() != wire.ALPN || conn.TLSVersion() != tls.VersionTLS13 {
 		return errors.New("nw3: QUIC handshake rejected")
 	}
@@ -277,6 +292,7 @@ func (s *session) quicOnce(ctx context.Context) error {
 	if st.ID() != 0 {
 		return errors.New("nw3: authentication stream was not stream 0")
 	}
+	_ = st.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
 	exp, err := exporter(conn)
 	if err != nil {
 		return err
@@ -297,10 +313,19 @@ func (s *session) quicOnce(ctx context.Context) error {
 	if res != wire.RegistrationAccepted {
 		return errors.New("nw3: invalid registration result")
 	}
+	_ = st.SetDeadline(time.Time{})
 	router := dgram.NewRouter(conn, s.rt.QUICUDPQueue)
 	router.SetOverhead(s.cfg.DatagramOverhead)
 	go router.Run(ctx)
+	slots := make(chan struct{}, 4096)
+	var flows sync.WaitGroup
+	defer func() { cancelConn(); _ = conn.CloseWithError(0, "shutdown"); flows.Wait() }()
 	for {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		flow, err := conn.AcceptStream(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -312,14 +337,17 @@ func (s *session) quicOnce(ctx context.Context) error {
 			_ = conn.CloseWithError(0, "direction")
 			return errors.New("nw3: invalid business stream direction")
 		}
-		go s.serveStream(ctx, router, flow, true)
+		flows.Add(1)
+		go func() { defer flows.Done(); defer func() { <-slots }(); s.serveStream(ctx, router, flow, true) }()
 	}
 }
 
 func (s *session) serveStream(ctx context.Context, router *dgram.Router, st qio.Stream, server bool) {
 	defer st.Close()
+	_ = st.SetReadDeadline(time.Now().Add(s.rt.FlowSetupTimeout))
 	br := bufio.NewReader(st)
 	kind, target, ok, err := wire.ReadFlowRequest(br)
+	_ = st.SetReadDeadline(time.Time{})
 	if !ok && err == nil {
 		// A clean EOF before FlowStart is an idle close, not a bad request.
 		return
@@ -350,6 +378,8 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 		return
 	}
 	defer peer.Close()
+	stopPeer := context.AfterFunc(ctx, func() { _ = peer.Close(); _ = client.Close() })
+	defer stopPeer()
 	var id uint32
 	if kind == wire.FlowUDP && router != nil {
 		id, err = wire.UDPFlowID(streamID, server)
@@ -357,6 +387,10 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 			_ = wire.WriteSetupResult(client, wire.SetupFlowLimit)
 			return
 		}
+	}
+	if kind == wire.FlowUDP && router != nil {
+		router.Ensure(id)
+		defer router.CloseFlow(id)
 	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
@@ -460,7 +494,7 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Du
 }
 
 func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
-	flow := router.Register(id)
+	flow := router.Ensure(id)
 	defer router.CloseFlow(id)
 	done := make(chan struct{})
 	var once sync.Once

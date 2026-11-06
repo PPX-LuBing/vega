@@ -77,6 +77,18 @@ func (r *Router) Register(id uint32) *Flow {
 	return f
 }
 
+// Ensure returns the route reserved before SetupReady, or installs it.
+func (r *Router) Ensure(id uint32) *Flow {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if f := r.tab[id]; f != nil {
+		return f
+	}
+	f := &Flow{ID: id, C: make(chan []byte, queueLen), closed: make(chan struct{})}
+	r.tab[id] = f
+	return f
+}
+
 // Unregister drops a flow and its partial packets.
 func (r *Router) Unregister(id uint32) {
 	r.mu.Lock()
@@ -127,6 +139,13 @@ func (r *Router) CloseFlow(id uint32) {
 
 // Run reads datagrams until ctx ends or the connection fails.
 func (r *Router) Run(ctx context.Context) {
+	defer func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for _, f := range r.tab {
+			f.Close()
+		}
+	}()
 	for {
 		buf, err := r.conn.ReceiveDatagram(ctx)
 		if err != nil {

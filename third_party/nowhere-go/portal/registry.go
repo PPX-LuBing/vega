@@ -45,6 +45,7 @@ type registry struct {
 	slots    []*egressSlot
 	pending  int
 	pendingN int
+	closed   bool
 }
 
 func newRegistry(pendingMax int) *registry {
@@ -58,7 +59,7 @@ func newRegistry(pendingMax int) *registry {
 func (r *registry) reservePending() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.pending >= r.pendingN {
+	if r.closed || r.pending >= r.pendingN {
 		return false
 	}
 	r.pending++
@@ -77,6 +78,17 @@ func (r *registry) releasePending() {
 // at that instant. Activity does not move the deadline.
 func (r *registry) push(slot *egressSlot) {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		slot.close()
+		if slot.tlsConn != nil {
+			_ = slot.tlsConn.Close()
+		}
+		if slot.conn != nil {
+			_ = slot.conn.CloseWithError(0, "revoked")
+		}
+		return
+	}
 	r.slots = append(r.slots, slot)
 	r.cond.Broadcast()
 	r.mu.Unlock()
@@ -158,10 +170,24 @@ func (r *registry) claim(ctx context.Context, deadline time.Time) (*egressSlot, 
 		r.mu.Unlock()
 	}()
 	for {
+		if r.closed || ctx.Err() != nil || !time.Now().Before(deadline) {
+			return nil, false, false
+		}
 		for len(r.slots) > 0 {
 			slot := r.slots[0]
 			r.slots = r.slots[1:]
 			if !slot.alive() || slot.owned {
+				continue
+			}
+			if slot.tls && !slot.expires.IsZero() && !time.Now().Before(slot.expires) {
+				slot.owned = true
+				if r.pending > 0 {
+					r.pending--
+				}
+				slot.close()
+				if slot.tlsConn != nil {
+					_ = slot.tlsConn.Close()
+				}
 				continue
 			}
 			if slot.tls {
@@ -174,9 +200,27 @@ func (r *registry) claim(ctx context.Context, deadline time.Time) (*egressSlot, 
 			r.slots = append(r.slots, slot)
 			return slot, false, true
 		}
-		if ctx.Err() != nil || !time.Now().Before(deadline) {
+		if r.closed || ctx.Err() != nil || !time.Now().Before(deadline) {
 			return nil, false, false
 		}
 		r.cond.Wait()
+	}
+}
+
+func (r *registry) close() {
+	r.mu.Lock()
+	r.closed = true
+	slots := r.slots
+	r.slots = nil
+	r.cond.Broadcast()
+	r.mu.Unlock()
+	for _, slot := range slots {
+		slot.close()
+		if slot.tlsConn != nil {
+			_ = slot.tlsConn.Close()
+		}
+		if slot.conn != nil {
+			_ = slot.conn.CloseWithError(0, "revoked")
+		}
 	}
 }
