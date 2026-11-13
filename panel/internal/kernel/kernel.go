@@ -141,6 +141,11 @@ func buildConfigFromNodes(st *store.Store, paths Paths, nodes []store.Node) (map
 	// 会把所有域名连接打死——现象是节点全不通，日志里只有
 	// `dial udp 223.5.5.5:53: connect: network is unreachable`，
 	// 很容易误判成协议或链路问题（新加坡那台就这么踩过）。
+	//
+	// ⚠️ 纯 IPv6 机器上要填**服务商的 DNS64 解析器**，不是公共 IPv6 解析器：
+	// 只有 DNS64 会给纯 IPv4 的域名合成 AAAA（如 Cloudflare/Google 不会），
+	// 那些站点才能走 NAT64 出去。填错了会出现「IPv6 站点能通、百度这类
+	// 纯 IPv4 站点全不通」的半残状态，比全不通更难查。
 	dnsLocal := orDefault(st.Setting("dns_local", ""), "223.5.5.5")
 	dnsRemote := orDefault(st.Setting("dns_remote", ""), "1.1.1.1")
 	dnsStrategy := orDefault(st.Setting("dns_strategy", ""), "prefer_ipv4")
