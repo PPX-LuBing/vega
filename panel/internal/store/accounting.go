@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -39,6 +40,21 @@ func validateSetting(key, value string) error {
 		if json.Unmarshal([]byte(value), &object) != nil || object == nil {
 			return fmt.Errorf("extra_config must be a JSON object")
 		}
+	// 内核的 DNS 解析器。纯 IPv6 机器上必须换成 IPv6 解析器，否则所有域名
+	// 连接都会失败（详见 kernel.BuildConfig 里的注释）。
+	case "dns_local", "dns_remote":
+		if value == "" {
+			return nil
+		}
+		if net.ParseIP(value) == nil {
+			return fmt.Errorf("%s must be an IP address, got %q", key, value)
+		}
+	case "dns_strategy":
+		switch value {
+		case "", "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only":
+			return nil
+		}
+		return fmt.Errorf("dns_strategy must be prefer_ipv4, prefer_ipv6, ipv4_only or ipv6_only")
 	case "sub_host", "sub_title":
 		if strings.ContainsAny(value, "\r\n") {
 			return fmt.Errorf("setting cannot contain newlines")

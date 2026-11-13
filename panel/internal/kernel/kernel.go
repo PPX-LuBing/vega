@@ -137,14 +137,27 @@ func buildConfigFromNodes(st *store.Store, paths Paths, nodes []store.Node) (map
 		}
 		managementPorts = append(managementPorts, n)
 	}
+	// DNS 解析器可配置：默认那两个是 IPv4 地址，在**纯 IPv6 机器上根本不可达**，
+	// 会把所有域名连接打死——现象是节点全不通，日志里只有
+	// `dial udp 223.5.5.5:53: connect: network is unreachable`，
+	// 很容易误判成协议或链路问题（新加坡那台就这么踩过）。
+	dnsLocal := orDefault(st.Setting("dns_local", ""), "223.5.5.5")
+	dnsRemote := orDefault(st.Setting("dns_remote", ""), "1.1.1.1")
+	dnsStrategy := orDefault(st.Setting("dns_strategy", ""), "prefer_ipv4")
+	switch dnsStrategy {
+	case "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only":
+	default:
+		// 写错了就退回默认，不要让一个笔误生成内核起不来的配置
+		dnsStrategy = "prefer_ipv4"
+	}
 	config := map[string]any{
 		"log": map[string]any{"level": "warn", "timestamp": true},
 		"dns": map[string]any{
 			"servers": []any{
-				map[string]any{"tag": "local", "type": "udp", "server": "223.5.5.5"},
-				map[string]any{"tag": "remote", "type": "udp", "server": "1.1.1.1"},
+				map[string]any{"tag": "local", "type": "udp", "server": dnsLocal},
+				map[string]any{"tag": "remote", "type": "udp", "server": dnsRemote},
 			},
-			"strategy": "prefer_ipv4",
+			"strategy": dnsStrategy,
 		},
 		"inbounds": inbounds,
 		"outbounds": []any{
@@ -457,6 +470,13 @@ func tagsOf(inbounds []any) []any {
 }
 
 // orDefaultAddr 给空地址兜个默认值。
+func orDefault(value, fallback string) string {
+	if trimmed := strings.TrimSpace(value); trimmed != "" {
+		return trimmed
+	}
+	return fallback
+}
+
 func orDefaultAddr(value, fallback string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallback

@@ -435,3 +435,54 @@ func TestBuildTLSUsesManagedCertDir(t *testing.T) {
 		t.Fatalf("没有 cert_dir 却写了 certificate_path: %#v", block)
 	}
 }
+
+// DNS 解析器必须是可配置的。纯 IPv6 机器上默认的 IPv4 解析器（223.5.5.5 /
+// 1.1.1.1）完全不可达，会把所有域名连接打死——新加坡那台就是这么踩的。
+func TestConfigDNSFromSettings(t *testing.T) {
+	st := testStore(t)
+	st.SaveNode(store.Node{Tag: "nw", Proto: store.ProtoNowhere, Port: 8443, TLSMode: "none", Enabled: true, Morph: true})
+
+	// 默认值：保持向后兼容，别悄悄改掉现网机器的行为
+	config, err := BuildConfig(st, testPaths())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dns := config["dns"].(map[string]any)
+	if got := dns["strategy"]; got != "prefer_ipv4" {
+		t.Fatalf("默认 strategy = %v，想要 prefer_ipv4", got)
+	}
+	if servers := dns["servers"].([]any); len(servers) != 2 {
+		t.Fatalf("默认应当有两个解析器，实际 %d", len(servers))
+	}
+
+	// 配了就用配置的（纯 IPv6 机器会这么配）
+	st.SetSetting("dns_local", "2606:4700:4700::1111")
+	st.SetSetting("dns_remote", "2001:4860:4860::8888")
+	st.SetSetting("dns_strategy", "prefer_ipv6")
+	config, err = BuildConfig(st, testPaths())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dns = config["dns"].(map[string]any)
+	servers := dns["servers"].([]any)
+	local := servers[0].(map[string]any)["server"]
+	remote := servers[1].(map[string]any)["server"]
+	if local != "2606:4700:4700::1111" || remote != "2001:4860:4860::8888" {
+		t.Fatalf("解析器没按设置生效: local=%v remote=%v", local, remote)
+	}
+	if got := dns["strategy"]; got != "prefer_ipv6" {
+		t.Fatalf("strategy = %v，想要 prefer_ipv6", got)
+	}
+
+	// 写错的值在写入时就该被拒（内核侧还有一层回退，防的是历史库里已有的脏值）
+	if err := st.SetSetting("dns_strategy", "prefer-ipv4-typo"); err == nil {
+		t.Fatal("非法 dns_strategy 应当被 SetSetting 拒绝")
+	}
+	config, err = BuildConfig(st, testPaths())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config["dns"].(map[string]any)["strategy"]; got != "prefer_ipv6" {
+		t.Fatalf("被拒的写入不该改动已有值，实际 %v", got)
+	}
+}
