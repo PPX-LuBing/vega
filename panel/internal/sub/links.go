@@ -116,10 +116,29 @@ func shareLink(e endpoint) (string, error) {
 		credential = base64.RawURLEncoding.EncodeToString([]byte(method + ":" + password))
 		return "ss://" + credential + "@" + address + "#" + url.PathEscape(e.Name()), nil
 	case store.ProtoTrojan, store.ProtoHysteria2, store.ProtoAnyTLS:
+	case store.ProtoTUIC:
+		// tuic:// 的 userinfo 是 uuid:password 一对，参数按 v2rayN / NekoBox 的
+		// 事实标准写：congestion_control + alpn + udp_relay_mode。
+		q.Set("congestion_control", "bbr")
+		q.Set("udp_relay_mode", "native")
+		q.Set("alpn", "h3")
 	default:
 		return "", fmt.Errorf("unsupported share protocol %s", n.Proto)
 	}
-	link := url.URL{Scheme: n.Proto, User: url.User(credential), Host: address, RawQuery: q.Encode(), Fragment: e.Name()}
+	// TUIC 和 Hysteria2 都不走传输层，带上 type/path/host/serviceName 会让
+	// 客户端把 network 设成 tcp，反而混乱。
+	if n.Proto == store.ProtoTUIC || n.Proto == store.ProtoHysteria2 {
+		for _, key := range []string{"type", "path", "host", "serviceName"} {
+			q.Del(key)
+		}
+	}
+	var user *url.Userinfo
+	if n.Proto == store.ProtoTUIC {
+		user = url.UserPassword(u.UUID, u.Password)
+	} else {
+		user = url.User(credential)
+	}
+	link := url.URL{Scheme: n.Proto, User: user, Host: address, RawQuery: q.Encode(), Fragment: e.Name()}
 	return link.String(), nil
 }
 
