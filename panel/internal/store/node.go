@@ -116,7 +116,10 @@ func ValidateNode(n Node) error {
 		}
 	}
 	if n.TLSMode == "none" {
-		if n.Proto == ProtoNowhere || n.Proto == ProtoAnyTLS || n.Proto == ProtoHysteria2 {
+		// 这几个协议本身就跑在 TLS 上：TUIC/Hysteria2 是 QUIC（QUIC 自带 TLS 1.3），
+		// AnyTLS/Nowhere 的握手也依赖 TLS。给它们 tls=none 会生成内核拒绝加载的配置，
+		// 所以在保存时就拦住，而不是等 apply 或内核启动时才炸。
+		if n.Proto == ProtoNowhere || n.Proto == ProtoAnyTLS || n.Proto == ProtoHysteria2 || n.Proto == ProtoTUIC {
 			return fmt.Errorf("%s requires TLS in panel-managed configurations", n.Proto)
 		}
 	} else if n.TLSMode == "reality" {

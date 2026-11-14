@@ -141,3 +141,27 @@ func TestSaveNodeKeepsECH(t *testing.T) {
 		t.Fatalf("关掉 ECH 没写回去: %+v %v", got, err)
 	}
 }
+
+// TUIC 和 Hysteria2 都跑在 QUIC 上（QUIC 自带 TLS 1.3），给它俩 tls=none
+// 会生成内核拒绝加载的配置，必须在保存时就拦住。
+func TestValidateNodeTLSRequiredProtocols(t *testing.T) {
+	base := func(proto string) Node {
+		return Node{
+			Tag: "n-" + proto, Proto: proto, Port: 8443, TLSMode: "none", Enabled: true,
+			Listen: "0.0.0.0", SNI: "a.example.com",
+			CertPath: "/c.pem", KeyPath: "/k.pem",
+		}
+	}
+	for _, proto := range []string{ProtoTUIC, ProtoHysteria2, ProtoAnyTLS, ProtoNowhere} {
+		if err := ValidateNode(base(proto)); err == nil {
+			t.Errorf("%s 用 tls=none 应当被拒绝", proto)
+		}
+	}
+	// 对照组：Shadowsocks 没有 TLS 是合法的（要满足它自己的算法要求）
+	ss := base(ProtoShadowsocks)
+	ss.SSMethod = "2022-blake3-aes-128-gcm"
+	ss.SSPassword = "AAAAAAAAAAAAAAAAAAAAAA=="
+	if err := ValidateNode(ss); err != nil {
+		t.Errorf("Shadowsocks 用 tls=none 应当允许，实际: %v", err)
+	}
+}
