@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily Vega managed certificate health check
+Description=每天检查一次 Vega 证书
 
 [Timer]
 OnCalendar=daily

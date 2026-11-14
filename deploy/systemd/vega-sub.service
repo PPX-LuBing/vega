@@ -1,0 +1,29 @@
+[Unit]
+Description=Vega subscription service (HTTPS 订阅 + ACME 证书)
+After=network.target
+
+[Service]
+Type=simple
+Environment=SBX_PANEL_DB=/var/lib/vega/panel.db
+Environment=SBX_PANEL_KERNEL=/opt/vega/bin/vega
+Environment=SBX_PANEL_CONFIG=/opt/vega/etc/config.json
+Environment=SBX_PANEL_SERVICE=vega
+Environment=SBX_PANEL_STATS_BIN=/opt/vega/bin/sb-stats
+Environment=SBX_PANEL_API=127.0.0.1:10085
+Environment=SBX_PANEL_CLASH=127.0.0.1:9090
+Environment=SBX_PANEL_CONTROL=127.0.0.1:10087
+Environment=SBX_PANEL_CERT_DIR=/var/lib/vega/certs
+Environment=SBX_PANEL_SUB_SERVICE=vega-sub
+# __DOMAIN__ / __SUB_PORT__ / __SUB_BASE__ 由 install.sh 按 --domain 替换。
+# 直接手改这个文件也可以，改完 systemctl daemon-reload。
+ExecStart=/opt/vega/bin/vega-panel serve \
+  --listen :__SUB_PORT__ --base __SUB_BASE__ \
+  --acme-domain __DOMAIN__ \
+  --acme-cache /var/lib/vega/acme \
+  --cert-dir /var/lib/vega/certs \
+  --acme-http :80 --acme-tls :__SUB_PORT__
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

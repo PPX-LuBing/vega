@@ -1,0 +1,21 @@
+[Unit]
+Description=Vega 用量采集与配额执行
+After=network-online.target vega.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SBX_PANEL_DB=/var/lib/vega/panel.db
+Environment=SBX_PANEL_KERNEL=/opt/vega/bin/vega
+Environment=SBX_PANEL_CONFIG=/opt/vega/etc/config.json
+Environment=SBX_PANEL_SERVICE=vega
+Environment=SBX_PANEL_STATS_BIN=/opt/vega/bin/sb-stats
+Environment=SBX_PANEL_API=127.0.0.1:10085
+ExecStart=/opt/vega/bin/vega-panel enforce --watch --interval 30s
+WorkingDirectory=/var/lib/vega
+UMask=0077
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -57,7 +57,7 @@ directions, TLS/QUIC TCP/UDP payloads, multi-target UDP sources, Morph on/off an
 reconnects. `TestOfficialEgressInterop` adds all four carrier combinations in
 both directions; `TestOfficialSilentPreHello` compares negative admission,
 post-admission TLS responses and replay commit behavior to the Rust executable.
-See `../../NOWHERE-CAPABILITIES.md` for configuration and acceptance scope.
+See `../../docs-vega/nowhere/CAPABILITIES.md` for configuration and acceptance scope.
 
 ## Additional host-integration patches
 

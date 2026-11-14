@@ -4,18 +4,36 @@
 
 名字取自织女星——与北极星同属亮星，都是「导航」的意象。
 
-最近一次自有模块审核、修复验证与升级注意见 [`AUDIT-2026-11-01.md`](AUDIT-2026-11-01.md)。
-本轮订阅修复、北极星功能对照及隐私边界见 [`AUDIT-2026-11-02.md`](AUDIT-2026-11-02.md)。
+## 目录结构
+
+上游 sing-box 的目录**保持原样**（这样 rebase 到新版本时不会冲突），
+Vega 自有代码集中在下面几个顶层目录：
 
 ```
 vega/
 ├── protocol/nowhere/       ← 自有扩展：Nowhere 入站 + 控制端点
 ├── option/nowhere.go       ← 配置结构
-├── panel/                  ← 终端面板（独立 Go module）
+├── panel/                  ← 控制面板 + 订阅服务（独立 Go module）
 ├── tools/sbstats/          ← 按用户统计工具（独立 Go module）
 ├── third_party/nowhere-go/ ← 打补丁的 nowhere 协议库
+├── deploy/                 ← 部署资产（安装脚本 + systemd 单元）
+├── docs-vega/              ← Vega 自有文档（上游 docs/ 是 sing-box 的，勿混）
 └── include/registry.go     ← 只加了 1 行注册
 ```
+
+**为什么文档单独放 `docs-vega/`**：`docs/` 是上游 sing-box 的 mkdocs 文档树，
+往里塞我们的文档会被上游文档构建拾取，也干扰 rebase。分开就互不干扰。
+
+## 文档
+
+| 想了解 | 看这里 |
+|---|---|
+| 全部文档索引 | [`docs-vega/README.md`](docs-vega/README.md) |
+| 上游基线、改了哪些上游文件 | [`docs-vega/BASELINE.md`](docs-vega/BASELINE.md) |
+| Nowhere 能力与验收 | [`docs-vega/nowhere/CAPABILITIES.md`](docs-vega/nowhere/CAPABILITIES.md) |
+| Nowhere 3.3.0 升级记录 | [`docs-vega/nowhere/UPGRADE-3.3.0.md`](docs-vega/nowhere/UPGRADE-3.3.0.md) |
+| 历次审核与修复 | [`docs-vega/audits/`](docs-vega/audits/) |
+
 
 ## 这是一个 thin fork
 
@@ -29,7 +47,7 @@ vega/
 | | `experimental/v2rayapi/stats.go` | 热用户统计、并发保护、内核实例标识 |
 | | `common/tls/std_server.go` | 证书重载回调与配置发布的竞态保护 |
 | | `release/DEFAULT_BUILD_TAGS*` | 默认编入 `with_v2ray_api` |
-| | `.github/`（**整个目录已删除**） | 上游的 CI、发布构建、issue 模板、FUNDING 全部是死配置或指向上游，详见 `BASELINE.md` |
+| | `.github/`（**整个目录已删除**） | 上游的 CI、发布构建、issue 模板、FUNDING 全部是死配置或指向上游，详见 `docs-vega/BASELINE.md` |
 | **新增文件** | `option/nowhere.go`、`protocol/nowhere/*` | 通常减少冲突，仍需核对上游接口 |
 
 ### 跟随上游
@@ -46,7 +64,7 @@ git rebase v1.15.0        # 换成你要跟的目标版本 tag
 # git rebase upstream/testing
 ```
 
-升级时检查上表的接入点，尤其是统计服务接口与依赖变更，不要只保留注册行就跳过回归。具体基线见 [`BASELINE.md`](BASELINE.md)。
+升级时检查上表的接入点，尤其是统计服务接口与依赖变更，不要只保留注册行就跳过回归。具体基线见 [`docs-vega/BASELINE.md`](docs-vega/BASELINE.md)。
 
 跟完之后重新编译并跑一遍测试：
 
@@ -108,7 +126,7 @@ Authorization: Bearer <control_secret>
 - **回环 + Bearer 鉴权**：只绑回环并不安全，代理用户也能通过代理访问回环。必须配置 `control_secret`；未配置地址和令牌时不开放端点，显式指定地址却没给令牌则拒绝启动。
 - `users` 必须显式传数组；`[]` 表示清空，漏传或 `null` 不会误清空。用户名和密钥都必须唯一。
 - 多个 nowhere 入站**共用一个端点**（第一个启动的负责监听，其余注册进来），不会抢端口
-- Nowhere 的 TCP、UDP 都经过 sing-box 路由和用户流量统计；支持 TCP/TLS、QUIC 和按用户隔离的 Egress；配置和验收见 [NOWHERE-CAPABILITIES.md](NOWHERE-CAPABILITIES.md)。
+- Nowhere 的 TCP、UDP 都经过 sing-box 路由和用户流量统计；支持 TCP/TLS、QUIC 和按用户隔离的 Egress；配置和验收见 [`docs-vega/nowhere/CAPABILITIES.md`](docs-vega/nowhere/CAPABILITIES.md)。
 
 升级已有部署时：面板会在数据库里生成管理令牌，并在下一次 `apply` 时写入内核配置；升级内核、面板和 `sb-stats` 后先执行一次 `apply`，再使用 `user sync`。手写配置需要自行添加 `control_secret`，调用方同步添加 Authorization 头。远端运行期同步使用 SSH + 远端 `curl`，远端需要安装 curl。不要把 `show` 输出的配置或数据库发给代理用户，它们包含凭据。
 
@@ -226,13 +244,32 @@ go build -trimpath -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_ut
 ### Linux 安装（显式执行，不自动启动）
 
 ```sh
-# 在目标系统上准备好三个二进制，再运行：
-sudo sh deploy/install.sh ./vega ./panel/vega-panel ./tools/sbstats/sb-stats
+# 在目标系统上准备好三个二进制，再运行（--domain 必填，订阅要靠它签证书）：
+sudo sh deploy/install.sh ./vega ./panel/vega-panel ./tools/sbstats/sb-stats \
+     --domain sub.example.com --sub-port 8443
 ```
 
-配套安装路径使用面板默认的 `/usr/local/bin/sbx`、`sbx-panel`、`sb-stats` 与 `/usr/local/etc/sbx/config.json`；安装 `sbx.service`、`sbx-sub.service`、`sbx-enforce.service`，不覆盖数据库和配置，不启动或启用服务。升级已有部署时先采集、备份并停止相应服务，再替换二进制。
+安装布局（与现网生产环境一致）：
 
-创建节点/用户/授权和订阅设置，完成 `sbx-panel doctor`、`sbx-panel apply` 后，再按需显式执行 `sudo systemctl enable --now sbx sbx-sub sbx-enforce`。默认订阅仅监听回环 HTTP，公网使用前须配置 HTTPS 反代或覆盖订阅服务的 ExecStart 使用证书。安装器支持 `DESTDIR` 暂存打包；`sh deploy/install_test.sh` 验证不会覆盖现有配置/数据库或自动启用服务。继承上游的 `release/local/install.sh` 仍是 sing-box 原路径安装器，不是面板全组件安装器。
+```
+/opt/vega/bin/{vega,vega-panel,sb-stats}
+/opt/vega/etc/config.json          ← 由 vega-panel apply 生成，安装器不写
+/var/lib/vega/{panel.db,acme,certs}
+/etc/systemd/system/vega*.{service,timer}
+```
+
+安装 **`vega.service` / `vega-sub.service` / `vega-enforce.service` /
+`vega-cert-check.{service,timer}`**，不覆盖已有数据库和配置，**不启动、不启用任何服务**。
+单元文件是模板，安装时把 `__DOMAIN__` 等占位符换成实际值。
+升级已有部署时先 `collect` 采集、备份并停止服务，再替换二进制。
+
+装完流程：`vega-panel doctor` → `vega-panel apply` → 按需
+`sudo systemctl enable --now vega vega-sub vega-cert-check.timer`。
+`vega-sub` 自带 ACME（`--acme-domain` + `--acme-http :80`），
+不需要额外的 certbot 或反向代理。安装器支持 `DESTDIR` 暂存打包；
+`sh deploy/install_test.sh` 验证路径、权限、占位符替换且不会自动启用服务。
+继承上游的 `release/local/install.sh` 仍是 sing-box 原路径安装器，不是面板全组件安装器。
+详见 [`deploy/README.md`](deploy/README.md)。
 
 面板首次运行会创建数据库父目录，数据库权限设为 `0600`。本机和远端下发都先校验临时配置，再替换；重启失败时恢复旧配置并尝试重启旧服务。流量按稳定机器名及内核实例的累计计数计算差额，流量与采样点一起事务提交，失败重试不会重复计费。重启前请先执行 `collect`，避免丢失尚未采集的内存计数；断电或崩溃仍可能丢失末次采样后尚未入库的流量。不要另用 `sb-stats -reset` 清零正在由面板采集的内核，也不要随意删除重建机器记录来更换计费来源名。
 
@@ -284,9 +321,9 @@ Vega 站在这些项目的肩膀上：
 - Anywhere AJSON 不会用 SNI 替换客户端接入地址。Nowhere 入口与 SNI 不同时明确跳过并说明原因；请配置证书匹配的接入域名，或使用支持独立 SNI 的客户端格式。
 - 统一证书文件由运行中的 sing-box 热加载，续期不再自动重启整个内核。首次安装仍需证书准备好后执行 doctor/apply 并启用服务。文件更新日志不代表已确认内核加载成功；请检查内核的 reload certificate 日志。
 - `sbx-panel cert status --check` 在证书缺失、证钥不匹配或 14 天内到期时返回失败。安装器提供但不自动启用 `sbx-cert-check.timer`，配置好托管证书后可显式启用每日检查；它只检查，不重启、不直接发送通知。自定义证书目录/域名需用 systemd override 配置 ExecStart 与环境变量。
-- `cert renew` 的默认订阅服务名与安装器一致为 sbx-sub；手工安装使用其他名称时设置 `SBX_PANEL_SUB_SERVICE`。
+- `cert renew` 的默认订阅服务名与安装器一致为 `vega-sub`；手工安装使用其他名称时设置 `SBX_PANEL_SUB_SERVICE`。
 
-详细修复范围、回归和未验证事项见 `AUDIT-FIXES-2026-11-04.md`。
+详细修复范围、回归和未验证事项见 `docs-vega/audits/2026-11-04-fixes.md`。
 
 后续已在 main 将 nowhere-go 更新到 v3.3.0，并重新核验官方源码锁。
-基线升级记录见 `NOWHERE-UPGRADE-3.3.0.md`；后续已补齐 QUIC carrier、Egress 和 Silent PreHello 接收检查，详见 `NOWHERE-CAPABILITIES.md`。
+基线升级记录见 `docs-vega/nowhere/UPGRADE-3.3.0.md`；后续已补齐 QUIC carrier、Egress 和 Silent PreHello 接收检查，详见 `docs-vega/nowhere/CAPABILITIES.md`。

@@ -1,0 +1,11 @@
+[Unit]
+Description=Vega 证书健康检查（只检查，不重启服务）
+
+[Service]
+Type=oneshot
+Environment=SBX_PANEL_CERT_DIR=/var/lib/vega/certs
+Environment=SBX_PANEL_SUB_SERVICE=vega-sub
+ExecStart=/opt/vega/bin/vega-panel cert renew
+WorkingDirectory=/var/lib/vega
+UMask=0077
+NoNewPrivileges=true

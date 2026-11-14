@@ -84,7 +84,7 @@ go build -tags "with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_ac
 
 同步方式：合并新版与清单中各文件的本地改动，保留对应测试（`portal/multiuser_test.go`、`portal/replay_update_test.go`、`vector/cancel_test.go`），并运行整个独立 module 的竞态回归。不要因修复适配层而修改官方 wire/auth/Morph 算法。
 
-v3.3.0 的 `UPSTREAM.lock` 另有一处元数据修正：按官方固定提交重算协议源码哈希，未改动 nw2 锁。此次升级与官方 Rust 双向互通记录见 `NOWHERE-UPGRADE-3.3.0.md`。
+v3.3.0 的 `UPSTREAM.lock` 另有一处元数据修正：按官方固定提交重算协议源码哈希，未改动 nw2 锁。此次升级与官方 Rust 双向互通记录见 `nowhere/UPGRADE-3.3.0.md`。
 
 ## 判断改动是否完整
 

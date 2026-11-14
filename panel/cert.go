@@ -13,7 +13,7 @@ import (
 )
 
 // defaultSubService 是订阅服务名。cert renew 靠重启它来触发续期。
-const defaultSubService = "sbx-sub"
+const defaultSubService = "vega-sub"
 
 // runCert 管理面板统一签发的证书。
 //
