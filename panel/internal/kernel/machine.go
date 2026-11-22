@@ -385,7 +385,7 @@ var (
 // 计数不再增长（在反复重启说明它在崩溃循环里）。
 func restartLocalContext(ctx context.Context, service string) error {
 	if service == "" {
-		service = "sbx"
+		service = "vega"
 	}
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

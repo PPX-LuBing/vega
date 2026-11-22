@@ -242,11 +242,11 @@ CREATE TABLE IF NOT EXISTS machines (
     host        TEXT NOT NULL DEFAULT '',
     ssh_port    INTEGER NOT NULL DEFAULT 22,
     ssh_user    TEXT NOT NULL DEFAULT 'root',
-    kernel_path TEXT NOT NULL DEFAULT '/usr/local/bin/sbx',
-    config_path TEXT NOT NULL DEFAULT '/usr/local/etc/sbx/config.json',
+    kernel_path TEXT NOT NULL DEFAULT '/opt/vega/bin/vega',
+    config_path TEXT NOT NULL DEFAULT '/opt/vega/etc/config.json',
     service     TEXT NOT NULL DEFAULT 'sbx',
     api_addr    TEXT NOT NULL DEFAULT '127.0.0.1:10085',
-    stats_bin   TEXT NOT NULL DEFAULT '/usr/local/bin/sb-stats',
+    stats_bin   TEXT NOT NULL DEFAULT '/opt/vega/bin/sb-stats',
     clash_addr  TEXT NOT NULL DEFAULT '127.0.0.1:9090',
     control_addr TEXT NOT NULL DEFAULT '127.0.0.1:10087',
     remark      TEXT NOT NULL DEFAULT ''
@@ -364,19 +364,19 @@ func (s *Store) SaveMachine(m Machine) error {
 		m.SSHUser = "root"
 	}
 	if m.KernelPath == "" {
-		m.KernelPath = "/usr/local/bin/sbx"
+		m.KernelPath = "/opt/vega/bin/vega"
 	}
 	if m.ConfigPath == "" {
-		m.ConfigPath = "/usr/local/etc/sbx/config.json"
+		m.ConfigPath = "/opt/vega/etc/config.json"
 	}
 	if m.Service == "" {
-		m.Service = "sbx"
+		m.Service = "vega"
 	}
 	if m.APIAddr == "" {
 		m.APIAddr = "127.0.0.1:10085"
 	}
 	if m.StatsBin == "" {
-		m.StatsBin = "/usr/local/bin/sb-stats"
+		m.StatsBin = "/opt/vega/bin/sb-stats"
 	}
 	if m.ClashAddr == "" {
 		m.ClashAddr = "127.0.0.1:9090"
@@ -434,7 +434,7 @@ func (s *Store) Machine(name string) (Machine, error) {
 	}
 	if name == LocalMachine {
 		return Machine{Name: LocalMachine, Service: "sbx",
-			KernelPath: "/usr/local/bin/sbx", ConfigPath: "/usr/local/etc/sbx/config.json",
+			KernelPath: "/opt/vega/bin/vega", ConfigPath: "/opt/vega/etc/config.json",
 			APIAddr: "127.0.0.1:10085", StatsBin: "/usr/local/bin/sb-stats",
 			ClashAddr: "127.0.0.1:9090", ControlAddr: "127.0.0.1:10087"}, nil
 	}

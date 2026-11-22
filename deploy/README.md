@@ -27,7 +27,16 @@ sh deploy/install.sh ./vega ./vega-panel ./sb-stats \
 - 已存在的 `config.json` / `panel.db` 不会被覆盖
 - `DESTDIR=/tmp/stage` 可只铺到临时目录，打包或跑测试用
 
-装完按提示走：`vega-panel doctor` → `vega-panel apply` → `systemctl enable --now ...`。
+装完按提示走：`vega-panel doctor` → `vega-panel apply` → 启用服务。
+
+```sh
+systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce
+```
+
+⚠️ **`vega-enforce` 不能漏**：它是唯一持续采集流量的组件，不启用则面板
+流量统计恒为 0（只有手动 `vega-panel collect` 才有数据）。
+
+也可以一步到位：`sh deploy/install.sh ... --enable`（装完自动 apply + 启用全部服务）。
 
 ## 单元文件
 

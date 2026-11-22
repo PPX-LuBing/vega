@@ -95,3 +95,40 @@ v3.3.0 的 `UPSTREAM.lock` 另有一处元数据修正：按官方固定提交�
 3. **热加用户有统计**：`POST /users` 加人后，新用户能连且能查到流量（验证 `RegisterUsers`）
 4. **控制端点鉴权**：无令牌返回 401（验证 `control.go`）
 5. **默认构建带统计标签**：`go version -m vega | grep with_v2ray_api`
+
+## 上游现状（2026-11-17 核查）
+
+| 项 | 值 |
+|---|---|
+| 最新**稳定版** | `v1.14.4`（2026-10-24）—— **就是我们的基线，无需升级** |
+| 最新预发布 | `v1.15.0-alpha.13`（同为 2026-10-24）|
+| `testing` 领先基线 | **126 个提交**，涉及 300 个文件，其中 83 个提交集中在 11 月 |
+| 提交主题分布 | fix×78、dns×14、tun×10、tls×8、reality×5 |
+
+### ⚠️ 我们的补丁点全部被上游改动过
+
+| 我们改的文件 | 上游变动 |
+|---|---|
+| `constant/proxy.go` | +9 |
+| `include/registry.go` | +4 |
+| `common/tls/std_server.go` | +8/-3 |
+| `go.mod` | +51/-51 |
+| `release/DEFAULT_BUILD_TAGS*` | 各 +1/-1 |
+
+也就是说将来 rebase 到 1.15 **一定会在这 5 处冲突**，需要按上面的补丁表逐项手工合并，
+然后再跑一遍回归（统计 API、证书热加载、注册表、构建标签）。
+
+### 值得关注的 REALITY 客户端修复（尚未进稳定版）
+
+2026-11-14 有一组 REALITY 客户端修复，全部集中在 `common/tls/reality_client.go`：
+
+- `Stop removing X25519MLKEM768 from reality ClientHello`（-17/+2）
+- `Remove ineffective ALPN override from reality client`（-9）
+- `Send reality client version 1.8.2`（±1）
+- `Use configured time and root pool in reality client`（+18/-14）
+- `Send reality fallback request before returning`（+3/-11）
+
+这些是**客户端侧**改动，体积很小、可以单独 cherry-pick 回 v1.14.4。
+它们可能影响「REALITY 偶发认证失败」——不过我们在第二十六节定位到的主因是
+dest 只有 IPv4（走 NAT64 慢），换双栈 dest 后已 10/10，所以这组补丁是否必要
+还没验证。

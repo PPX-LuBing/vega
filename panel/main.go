@@ -50,7 +50,7 @@ import (
 
 const version = "0.1.0"
 
-const defaultDB = "/var/lib/sbx-panel/panel.db"
+const defaultDB = "/var/lib/vega/panel.db"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -327,7 +327,7 @@ func runMachine(dbPath string, args []string) error {
 		sshPort := fs.Int("ssh-port", 22, "SSH 端口")
 		sshUser := fs.String("ssh-user", "root", "SSH 用户")
 		kernelPath := fs.String("kernel-path", "/usr/local/bin/sbx", "内核路径")
-		configPath := fs.String("config-path", "/usr/local/etc/sbx/config.json", "配置路径")
+		configPath := fs.String("config-path", "/opt/vega/etc/config.json", "配置路径")
 		service := fs.String("service", "sbx", "systemd 服务名")
 		apiAddr := fs.String("api", "127.0.0.1:10085", "v2ray_api 地址")
 		statsBin := fs.String("stats-bin", "/usr/local/bin/sb-stats", "统计工具路径")

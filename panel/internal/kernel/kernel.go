@@ -42,10 +42,10 @@ type Paths struct {
 // 而把路径写死在代码里就得重新编译。
 func DefaultPaths() Paths {
 	paths := Paths{
-		Bin:         "/usr/local/bin/sbx",
-		Config:      "/usr/local/etc/sbx/config.json",
-		Service:     "sbx",
-		StatsBin:    "/usr/local/bin/sb-stats",
+		Bin:         "/opt/vega/bin/vega",
+		Config:      "/opt/vega/etc/config.json",
+		Service:     "vega",
+		StatsBin:    "/opt/vega/bin/sb-stats",
 		APIAddr:     "127.0.0.1:10085",
 		ClashAddr:   "127.0.0.1:9090",
 		ControlAddr: "127.0.0.1:10087",

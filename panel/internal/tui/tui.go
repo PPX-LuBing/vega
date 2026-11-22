@@ -932,7 +932,7 @@ func (m *Model) viewOverview() string {
 	// 补齐到最宽行的宽度，把换行符塞进去会让后续内容被空格推开。
 	b.WriteString(styleDim.Render("  提示：c 只采集；x 采集后执行配额，配置变化时重启对应机器并断开旧会话。"))
 	b.WriteString("\n")
-	b.WriteString(styleDim.Render("        自动轮询：sbx-panel enforce --watch；s 热同步仅影响 Nowhere 新连接。"))
+	b.WriteString(styleDim.Render("        自动轮询：vega-panel enforce --watch；s 热同步仅影响 Nowhere 新连接。"))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -1028,7 +1028,7 @@ func (m *Model) viewTraffic() string {
 
 func (m *Model) viewMachines() string {
 	if len(m.machines) == 0 {
-		return styleDim.Render("  只管理本机。用 `sbx-panel machine add` 登记其它机器。") + "\n"
+		return styleDim.Render("  只管理本机。用 `vega-panel machine add` 登记其它机器。") + "\n"
 	}
 	var b strings.Builder
 	narrow := m.width > 0 && m.width < 100

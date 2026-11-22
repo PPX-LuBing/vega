@@ -1,5 +1,6 @@
 #!/bin/sh
-# Vega 安装脚本：只铺文件和 systemd 单元，**不启动、不启用任何服务**。
+# Vega 安装脚本：默认只铺文件和 systemd 单元，**不启动、不启用任何服务**。
+# 加 --enable 则装完直接启用并启动服务（含 vega-enforce，否则流量统计不工作）。
 #
 # 布局与生产环境一致：
 #   /opt/vega/bin/{vega,vega-panel,sb-stats}
@@ -19,6 +20,8 @@ Usage: install.sh CORE_BINARY PANEL_BINARY STATS_BINARY --domain <domain> [--sub
 
   --domain   订阅服务对外域名，用于 ACME 证书和订阅链接（必填）
   --sub-port 订阅服务端口，默认 8443
+  --enable   装完立即 enable + start 全部服务（含 vega-enforce）。
+             不加则只铺文件，需要按提示手动启用。
 EOF
     exit 2
 }
@@ -31,6 +34,7 @@ shift 3
 
 domain=''
 sub_port=8443
+enable_services=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --domain)
@@ -42,6 +46,10 @@ while [ "$#" -gt 0 ]; do
         [ "$#" -ge 2 ] || usage
         sub_port=$2
         shift 2
+        ;;
+    --enable)
+        enable_services=1
+        shift
         ;;
     -h | --help) usage ;;
     *)
@@ -108,15 +116,37 @@ if [ -z "$root" ]; then
     systemctl daemon-reload
 fi
 
+if [ "$enable_services" = 1 ] && [ -z "$root" ]; then
+    # vega 需要 config.json，所以先 doctor/apply 再启动
+    echo "==> 生成配置"
+    SBX_PANEL_DB=/var/lib/vega/panel.db \
+    SBX_PANEL_KERNEL=/opt/vega/bin/vega \
+    SBX_PANEL_CONFIG=/opt/vega/etc/config.json \
+    SBX_PANEL_SERVICE=vega \
+    SBX_PANEL_CERT_DIR=/var/lib/vega/certs \
+    SBX_PANEL_STATS_BIN=/opt/vega/bin/sb-stats \
+    SBX_PANEL_API=127.0.0.1:10085 \
+        /opt/vega/bin/vega-panel apply || echo "警告：apply 失败，配置可能还不完整"
+    echo "==> 启用服务"
+    systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce
+    echo "==> 服务状态"
+    for s in vega vega-sub vega-enforce vega-cert-check.timer; do
+        printf '  %-24s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo unknown)"
+    done
+fi
+
 cat <<EOF
 已安装到 ${root:+$root}/opt/vega/bin（vega / vega-panel / sb-stats）。
 订阅域名: $domain:$sub_port
-已存在的配置和数据库不会被覆盖，也没有服务被启动。
+已存在的配置和数据库不会被覆盖。
 
 下一步：
   export SBX_PANEL_DB=/var/lib/vega/panel.db SBX_PANEL_KERNEL=/opt/vega/bin/vega
   export SBX_PANEL_CONFIG=/opt/vega/etc/config.json SBX_PANEL_SERVICE=vega
   vega-panel doctor          # 先做体检
   vega-panel apply           # 生成 /opt/vega/etc/config.json
-  systemctl enable --now vega vega-sub vega-cert-check.timer
+  systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce
+
+注意 vega-enforce 不能漏：它是**唯一**会持续采集流量的组件。
+不启用它，面板上的流量统计会一直是 0（手动 collect 才有数据）。
 EOF

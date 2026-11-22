@@ -321,7 +321,7 @@ func TestSaveMachineFillsDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.SSHPort != 22 || m.SSHUser != "root" || m.Service != "sbx" ||
+	if m.SSHPort != 22 || m.SSHUser != "root" || m.Service != "vega" ||
 		m.KernelPath == "" || m.ConfigPath == "" || m.APIAddr == "" || m.ClashAddr == "" {
 		t.Fatalf("默认值没补全: %+v", m)
 	}

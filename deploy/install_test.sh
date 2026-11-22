@@ -62,3 +62,43 @@ if DESTDIR="$root" sh "$here/install.sh" "$stage/binary" "$stage/binary" "$stage
 fi
 
 echo "Staged installation passed."
+
+# --enable 在 DESTDIR 模式下必须什么都不做（不能碰宿主服务）
+DESTDIR="$root" sh "$here/install.sh" "$stage/binary" "$stage/binary" "$stage/binary" \
+    --domain sub.example.com --enable >/dev/null 2>&1
+test ! -e "$root/etc/systemd/system/multi-user.target.wants"
+
+# 单元清单必须与实际文件一一对应：漏一个单元等于漏一个功能。
+# （vega-enforce 就曾经这样被漏掉，导致流量统计从来不工作）
+for unit in vega.service vega-sub.service vega-enforce.service \
+    vega-cert-check.service vega-cert-check.timer; do
+    test -f "$here/systemd/$unit" || {
+        echo "缺少单元文件: $unit" >&2
+        exit 1
+    }
+    test -f "$root/etc/systemd/system/$unit" || {
+        echo "install.sh 没有铺 $unit" >&2
+        exit 1
+    }
+done
+
+# 没人引用的单元文件说明 install.sh 清单漏了它
+for file in "$here"/systemd/*; do
+    name=$(basename "$file")
+    grep -q "$name" "$here/install.sh" || {
+        echo "install.sh 的单元清单漏了 $name" >&2
+        exit 1
+    }
+done
+
+# 每个 ExecStart 指向的二进制都必须由 install.sh 铺出来
+for unit in "$here"/systemd/*.service; do
+    for bin in $(grep -oE '/opt/vega/bin/[a-z-]+' "$unit" | sort -u); do
+        test -x "$root$bin" || {
+            echo "$(basename "$unit") 引用了不存在的 $bin" >&2
+            exit 1
+        }
+    done
+done
+
+echo "Unit inventory passed."

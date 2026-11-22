@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/PPX-LuBing/vega/panel/internal/kernel"
@@ -131,5 +133,32 @@ func doctor(st *store.Store, paths kernel.Paths) error {
 		}
 		fmt.Println("OK local: kernel check passed; service was not changed")
 	}
+	checkEnforceCollector()
 	return nil
+}
+
+// checkEnforceCollector 提醒 vega-enforce 是否在跑。
+//
+// 它不参与配置生成，所以以前完全不在体检范围里——结果就是「配置全对、
+// 服务也 active，但流量统计恒为 0」这种问题能拖两周没被发现。
+// 这里只提示，不让 doctor 失败：没有 systemd 的环境（容器、开发机）本来就没有它。
+func checkEnforceCollector() {
+	if _, err := os.Stat("/run/systemd/system"); err != nil {
+		return // 不是 systemd 环境，跳过
+	}
+	out, err := exec.Command("systemctl", "is-active", "vega-enforce").Output()
+	state := strings.TrimSpace(string(out))
+	if err == nil && state == "active" {
+		fmt.Println("OK enforce: 流量采集服务在跑")
+		return
+	}
+	fmt.Printf("WARN enforce: vega-enforce 当前 %q —— 流量统计不会更新\n", orUnknown(state))
+	fmt.Println("     修法: systemctl enable --now vega-enforce")
+}
+
+func orUnknown(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "未安装或未启动"
+	}
+	return s
 }

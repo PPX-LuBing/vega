@@ -264,7 +264,7 @@ sudo sh deploy/install.sh ./vega ./panel/vega-panel ./tools/sbstats/sb-stats \
 升级已有部署时先 `collect` 采集、备份并停止服务，再替换二进制。
 
 装完流程：`vega-panel doctor` → `vega-panel apply` → 按需
-`sudo systemctl enable --now vega vega-sub vega-cert-check.timer`。
+`sudo systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce`（`vega-enforce` 负责持续采集流量，漏了它统计恒为 0）。
 `vega-sub` 自带 ACME（`--acme-domain` + `--acme-http :80`），
 不需要额外的 certbot 或反向代理。安装器支持 `DESTDIR` 暂存打包；
 `sh deploy/install_test.sh` 验证路径、权限、占位符替换且不会自动启用服务。
