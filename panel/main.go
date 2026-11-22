@@ -860,7 +860,13 @@ func runSetting(dbPath string, args []string) error {
 
 	switch args[0] {
 	case "get":
-		fmt.Println(st.Setting(args[1], ""))
+		// quota_reset_day 有代码默认值（1 号），没显式设置过时也要显示出来，
+		// 否则用户看到空串会以为功能没开。
+		fallback := ""
+		if args[1] == "quota_reset_day" {
+			fallback = strconv.Itoa(store.DefaultQuotaResetDay)
+		}
+		fmt.Println(st.Setting(args[1], fallback))
 		return nil
 	case "set":
 		if len(args) < 3 {

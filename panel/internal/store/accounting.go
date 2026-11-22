@@ -22,7 +22,7 @@ func validateSetting(key, value string) error {
 	case "quota_reset_day":
 		d, err := strconv.Atoi(value)
 		if err != nil || d < 0 || d > 28 {
-			return fmt.Errorf("quota_reset_day must be 0..28")
+			return fmt.Errorf("quota_reset_day must be 0..28 (0 disables the reset, default is 1)")
 		}
 	case "alert_webhook", "sub_base":
 		if value == "" {
@@ -75,10 +75,15 @@ CREATE TABLE IF NOT EXISTS usage_state (user_name TEXT PRIMARY KEY,state TEXT NO
 	return err
 }
 
+// DefaultQuotaResetDay 是未显式设置时的月度重置日：每月 1 号。
+//
+// 设成 0 可以显式关闭重置（老行为），只是不再是默认值。
+const DefaultQuotaResetDay = 1
+
 // Reset only the billed cycle, never the raw cumulative checkpoints or history.
 // First activation records a baseline instead of wiping existing usage.
 func (s *Store) ResetMonthly(now time.Time) (bool, error) {
-	day, err := strconv.Atoi(s.Setting("quota_reset_day", "0"))
+	day, err := strconv.Atoi(s.Setting("quota_reset_day", strconv.Itoa(DefaultQuotaResetDay)))
 	if err != nil || day < 0 || day > 28 {
 		return false, fmt.Errorf("invalid quota reset day")
 	}

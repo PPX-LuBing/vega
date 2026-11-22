@@ -221,3 +221,56 @@ func TestHourlyOverflowRollsBackCheckpoints(t *testing.T) {
 		t.Fatal("checkpoint committed on failure")
 	}
 }
+
+// 未设置 quota_reset_day 时默认每月 1 号重置；设 0 仍是显式关闭。
+func TestMonthlyResetDefaultIsFirstOfMonth(t *testing.T) {
+	s := accountingStore(t)
+	if err := s.SaveUser(User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 从未设置过 quota_reset_day
+	if got := s.Setting("quota_reset_day", "?"); got != "?" {
+		t.Fatalf("测试前提不成立：库里已经有 quota_reset_day=%q", got)
+	}
+
+	// 1 月 20 号首次跑：只记基线，不清数据
+	if reset, err := s.ResetMonthly(time.Date(2026, 1, 20, 0, 0, 0, 0, time.UTC)); err != nil || reset {
+		t.Fatalf("首次激活不应重置: reset=%v err=%v", reset, err)
+	}
+	if got := s.Setting("quota_last_reset", ""); got != "2026-01-01" {
+		t.Fatalf("默认基线应当是当月 1 号，实际 %q", got)
+	}
+
+	// 2 月 1 号：默认应当触发重置
+	if _, _, err := s.RecordTraffic("local", "boot", []TrafficSample{{Name: "alice", Up: 500}}); err != nil {
+		t.Fatal(err)
+	}
+	reset, err := s.ResetMonthly(time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC))
+	if err != nil || !reset {
+		t.Fatalf("默认配置下 2 月 1 号应当重置: reset=%v err=%v", reset, err)
+	}
+	if up, _, _ := s.Usage("alice"); up != 0 {
+		t.Fatal("重置后用量应当为 0")
+	}
+}
+
+// 显式设 0 仍然可以关闭重置（保留老行为）。
+func TestMonthlyResetCanStillBeDisabled(t *testing.T) {
+	s := accountingStore(t)
+	if err := s.SaveUser(User{Name: "alice", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetSetting("quota_reset_day", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.RecordTraffic("local", "boot", []TrafficSample{{Name: "alice", Up: 500}}); err != nil {
+		t.Fatal(err)
+	}
+	if reset, err := s.ResetMonthly(time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)); err != nil || reset {
+		t.Fatalf("0 应当关闭重置: reset=%v err=%v", reset, err)
+	}
+	if up, _, _ := s.Usage("alice"); up != 500 {
+		t.Fatal("关闭重置后用量不该变")
+	}
+}
