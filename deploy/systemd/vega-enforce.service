@@ -11,6 +11,8 @@ Environment=SBX_PANEL_CONFIG=/opt/vega/etc/config.json
 Environment=SBX_PANEL_SERVICE=vega
 Environment=SBX_PANEL_STATS_BIN=/opt/vega/bin/sb-stats
 Environment=SBX_PANEL_API=127.0.0.1:10085
+# 缺这一行会让 enforce 去 /var/lib/sbx-panel/certs 找证书（旧默认值），校验必然失败
+Environment=SBX_PANEL_CERT_DIR=/var/lib/vega/certs
 ExecStart=/opt/vega/bin/vega-panel enforce --watch --interval 30s
 WorkingDirectory=/var/lib/vega
 UMask=0077

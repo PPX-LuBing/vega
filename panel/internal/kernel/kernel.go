@@ -49,7 +49,7 @@ func DefaultPaths() Paths {
 		APIAddr:     "127.0.0.1:10085",
 		ClashAddr:   "127.0.0.1:9090",
 		ControlAddr: "127.0.0.1:10087",
-		CertDir:     "/var/lib/sbx-panel/certs",
+		CertDir:     "/var/lib/vega/certs",
 	}
 	override(&paths.ControlAddr, "SBX_PANEL_CONTROL")
 	override(&paths.ClashAddr, "SBX_PANEL_CLASH")
