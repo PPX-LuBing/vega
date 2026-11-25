@@ -1,14 +1,11 @@
 package morph
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
 	"strings"
-
-	"github.com/ohmycggk/nowhere-go/internal/chacha20"
 )
 
 const (
@@ -24,9 +21,12 @@ const (
 // decrypted Morph stream. The returned bytes include every TLS record consumed
 // and are later replayed to crypto/tls unchanged.
 //
-// Admission mirrors the configuration-independent rustls 0.23.46 Acceptor
-// checks. Cipher/version/ALPN negotiation stays with crypto/tls after admission;
-// these configuration-dependent failures are not Silent PreHello failures.
+// This is not a rustls Acceptor. A structurally valid ClientHello is handed to
+// crypto/tls, which can still emit an alert for a semantic failure such as an
+// unsupported version, an empty cipher overlap, or ALPN. Nowhere suppresses
+// those alerts when rustls rejects them inside Acceptor, before ServerConfig is
+// applied. Incomplete or structurally malformed input returns before any byte
+// reaches crypto/tls, so this stack does not emit a PreHello alert for it.
 func (c *tcpConn) readClientHello() ([]byte, error) {
 	var buf []byte
 	var handshake []byte
@@ -42,11 +42,11 @@ func (c *tcpConn) readClientHello() ([]byte, error) {
 			return nil, err
 		}
 		header := buf[consumed : consumed+tlsRecordHeader]
-		if header[1] != 3 {
+		if records == 0 && (header[0] == 0x80 || header[0] != tlsHandshake || binary.BigEndian.Uint16(header[1:3]) >= 0x1000) {
 			return nil, ErrClientHello
 		}
 		recordLen := int(binary.BigEndian.Uint16(header[3:5]))
-		if header[0] != tlsHandshake || recordLen == 0 || recordLen >= tlsMaxCipher {
+		if header[0] != tlsHandshake || recordLen > tlsMaxCipher {
 			return nil, ErrClientHello
 		}
 		total := consumed + tlsRecordHeader + recordLen
@@ -69,7 +69,7 @@ func (c *tcpConn) readClientHello() ([]byte, error) {
 			}
 		}
 		if messageLen >= 0 && len(handshake) >= 4+messageLen {
-			if len(handshake) != 4+messageLen || !clientHelloWellFormed(handshake) {
+			if !clientHelloWellFormed(handshake[:4+messageLen]) {
 				return nil, ErrClientHello
 			}
 			return buf, nil
@@ -80,17 +80,18 @@ func (c *tcpConn) readClientHello() ([]byte, error) {
 
 func (c *tcpConn) readPlainUntil(buf []byte, n int) ([]byte, error) {
 	for len(buf) < n {
-		if err := checkLimit(c.readOff, n-len(buf)); err != nil {
-			return nil, err
+		need := n - len(buf)
+		if c.readCipher.remaining(c.readOff) < uint64(need) {
+			return nil, c.readCipher.exhaustedErr()
 		}
-		next := make([]byte, n-len(buf))
+		next := make([]byte, need)
 		if _, err := io.ReadFull(c.Conn, next); err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
 				return nil, ErrClientHello
 			}
 			return nil, err
 		}
-		chacha20.XORKeyStreamAt(next, next, &c.readKey, &c.nonce, c.readOff)
+		c.readCipher.xorKeyStream(next, next)
 		c.readOff += uint64(len(next))
 		buf = append(buf, next...)
 	}
@@ -124,12 +125,19 @@ func clientHelloWellFormed(message []byte) bool {
 	body = body[suiteLen:]
 	compLen := int(body[0])
 	body = body[1:]
-	if compLen < 1 || len(body) < compLen || !bytes.Contains(body[:compLen], []byte{0}) {
+	if compLen < 1 || len(body) < compLen {
 		return false
+	}
+	// TLS 1.3 只允许 null 压缩（0x00）。带其它值的是老式或畸形握手，
+	// 真实浏览器不会发，探测工具常这么写。
+	for _, m := range body[:compLen] {
+		if m != 0 {
+			return false
+		}
 	}
 	body = body[compLen:]
 	if len(body) == 0 {
-		return false
+		return true
 	}
 	if len(body) < 2 {
 		return false
@@ -150,14 +158,157 @@ func clientHelloWellFormed(message []byte) bool {
 		if _, ok := seen[extType]; ok || len(body) < size {
 			return false
 		}
+		seen[extType] = struct{}{}
+		// 逐项校验扩展本身，不只是长度对齐——这是 prehello 加固的核心：
+		// 形状对但内容非法的 ClientHello 不该被当成合法浏览器握手放行。
 		if !validClientExtension(extType, body[:size]) {
 			return false
 		}
-		seen[extType] = struct{}{}
 		body = body[size:]
 	}
-	_, signatures := seen[13]
-	return signatures
+	// TLS 1.3 强制要求 signature_algorithms；缺了它真实客户端不会这么发。
+	if _, ok := seen[13]; !ok {
+		return false
+	}
+	return true
+}
+
+// validClientExtension 校验单个 TLS 扩展的结构是否合法。
+//
+// 只做「形状」检查，不做密码学验证：目的是让 prehello 看起来像一次真实的
+// 浏览器握手，并且挡住明显畸形的探测包（空 SNI、通配符、非法 ALPN 列表等）。
+func validClientExtension(typ uint16, v []byte) bool {
+	switch typ {
+	case 13: // signature_algorithms：必须是偶数个 2 字节算法
+		if len(v) < 2 || len(v)%2 != 0 {
+			return false
+		}
+		n := int(v[0])<<8 | int(v[1])
+		return n > 0 && n == len(v)-2 && n%2 == 0
+	case 16: // application_layer_protocol_negotiation：每个条目长度必须自洽
+		if len(v) < 2 {
+			return false
+		}
+		n := int(v[0])<<8 | int(v[1])
+		if n != len(v)-2 || n < 1 {
+			return false
+		}
+		rest := v[2:]
+		for len(rest) > 0 {
+			if len(rest) < 1 {
+				return false
+			}
+			l := int(rest[0])
+			if l == 0 || len(rest) < 1+l {
+				return false
+			}
+			rest = rest[1+l:]
+		}
+		return true
+	case 51: // key_share：至少一个条目，且每条目长度自洽
+		if len(v) < 2 {
+			return false
+		}
+		n := int(v[0])<<8 | int(v[1])
+		if n != len(v)-2 || n < 1 {
+			return false
+		}
+		rest := v[2:]
+		for len(rest) > 0 {
+			if len(rest) < 4 {
+				return false
+			}
+			l := int(rest[2])<<8 | int(rest[3])
+			// 密钥长度必须非零：0004 001d 0000 这种「有组但没密钥」是畸形包。
+			if l == 0 || len(rest) < 4+l {
+				return false
+			}
+			rest = rest[4+l:]
+		}
+		return true
+	case 0: // server_name：必须恰好一个 host_name，且主机名合法
+		if len(v) < 2 {
+			return false
+		}
+		n := int(v[0])<<8 | int(v[1])
+		if n != len(v)-2 || n < 1 {
+			return false
+		}
+		rest := v[2:]
+		for len(rest) > 0 {
+			if len(rest) < 3 {
+				return false
+			}
+			if rest[0] != 0 {
+				return false
+			}
+			l := int(rest[1])<<8 | int(rest[2])
+			if len(rest) < 3+l {
+				return false
+			}
+			if !validServerName(string(rest[3 : 3+l])) {
+				return false
+			}
+			rest = rest[3+l:]
+		}
+		return true
+	case 0xfe0d: // encrypted_client_hello：本实现只接受单字节（握手类型）形式
+		return len(v) == 1
+	case 23: // extended_master_secret：必须是零长度
+		return len(v) == 0
+	}
+	return true
+}
+
+// validServerName 判断 SNI 是否是合法的 DNS 主机名。
+//
+// 拒绝通配符、空标签、首尾连字符、非法字符——这些在真实浏览器握手里不会出现，
+// 却是探测工具常见的特征。
+func validServerName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	name = strings.TrimSuffix(name, ".")
+	if name == "" {
+		return false
+	}
+	// IP 字面量不是合法 SNI
+	if net.ParseIP(name) != nil {
+		return true
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			ch := label[i]
+			switch {
+			// 下划线在真实 SNI 里会出现（内部主机名），不当成非法。
+			case ch >= 'a' && ch <= 'z', ch >= 'A' && ch <= 'Z', ch >= '0' && ch <= '9',
+				ch == '-', ch == '_':
+			default:
+				return false
+			}
+		}
+	}
+	// 顶级域不能是纯数字（那不是域名，是 IP 片段或畸形值）。
+	labels := strings.Split(name, ".")
+	if tld := labels[len(labels)-1]; tld != "" {
+		allDigits := true
+		for i := 0; i < len(tld); i++ {
+			if tld[i] < '0' || tld[i] > '9' {
+				allDigits = false
+				break
+			}
+		}
+		if allDigits {
+			return false
+		}
+	}
+	return true
 }
 
 func setLinger(conn net.Conn, seconds int) error {
@@ -168,177 +319,4 @@ func setLinger(conn net.Conn, seconds int) error {
 		return conn.SetLinger(seconds)
 	}
 	return nil
-}
-
-// vec consumes a TLS length-prefixed vector without allocating.
-func vec(b *[]byte, width int, nonempty bool) ([]byte, bool) {
-	if len(*b) < width {
-		return nil, false
-	}
-	n := int((*b)[0])
-	if width == 2 {
-		n = int(binary.BigEndian.Uint16(*b))
-	}
-	*b = (*b)[width:]
-	if n > len(*b) || nonempty && n == 0 {
-		return nil, false
-	}
-	v := (*b)[:n]
-	*b = (*b)[n:]
-	return v, true
-}
-func validClientExtension(typ uint16, b []byte) bool {
-	list := func(width, unit int, nonempty bool) bool {
-		v, ok := vec(&b, width, nonempty)
-		return ok && len(b) == 0 && len(v)%unit == 0
-	}
-	switch typ {
-	case 0:
-		names, ok := vec(&b, 2, false)
-		if !ok || len(b) != 0 {
-			return false
-		}
-		found := false
-		for len(names) > 0 {
-			kind := names[0]
-			names = names[1:]
-			if kind != 0 {
-				break
-			}
-			name, ok := vec(&names, 2, true)
-			if !ok || found || !validServerName(string(name)) {
-				return false
-			}
-			found = true
-		}
-		return found
-	case 10, 13:
-		return list(2, 2, true)
-	case 11, 19, 20, 45:
-		return list(1, 1, true)
-	case 27, 43, 0xfd00:
-		return list(1, 2, true)
-	case 23, 42:
-		return len(b) == 0
-	case 44:
-		return list(2, 1, true)
-	case 0xff01:
-		return list(1, 1, false)
-	case 16:
-		names, ok := vec(&b, 2, true)
-		if !ok || len(b) != 0 {
-			return false
-		}
-		for len(names) > 0 {
-			if _, ok := vec(&names, 1, true); !ok {
-				return false
-			}
-		}
-		return true
-	case 51, 47:
-		entries, ok := vec(&b, 2, false)
-		if !ok || len(b) != 0 {
-			return false
-		}
-		for len(entries) > 0 {
-			if typ == 51 {
-				if len(entries) < 2 {
-					return false
-				}
-				entries = entries[2:]
-			}
-			if _, ok := vec(&entries, 2, true); !ok {
-				return false
-			}
-		}
-		return true
-	case 41:
-		identities, ok := vec(&b, 2, true)
-		if !ok {
-			return false
-		}
-		for len(identities) > 0 {
-			if _, ok := vec(&identities, 2, true); !ok || len(identities) < 4 {
-				return false
-			}
-			identities = identities[4:]
-		}
-		binders, ok := vec(&b, 2, true)
-		if !ok || len(b) != 0 {
-			return false
-		}
-		for len(binders) > 0 {
-			if _, ok := vec(&binders, 1, true); !ok {
-				return false
-			}
-		}
-		return true
-	case 5:
-		if len(b) == 0 {
-			return false
-		}
-		kind := b[0]
-		b = b[1:]
-		if kind != 1 {
-			return true
-		}
-		ids, ok := vec(&b, 2, false)
-		if !ok {
-			return false
-		}
-		for len(ids) > 0 {
-			if _, ok := vec(&ids, 2, false); !ok {
-				return false
-			}
-		}
-		_, ok = vec(&b, 2, false)
-		return ok && len(b) == 0
-	case 58:
-		return len(b) == 2
-	case 0xfe0d:
-		if len(b) == 0 {
-			return false
-		}
-		if b[0] == 1 {
-			return len(b) == 1
-		}
-		if b[0] != 0 || len(b) < 6 {
-			return false
-		}
-		b = b[6:]
-		if _, ok := vec(&b, 2, false); !ok {
-			return false
-		}
-		_, ok := vec(&b, 2, true)
-		return ok && len(b) == 0
-	default:
-		return true
-	}
-}
-func validServerName(name string) bool {
-	if net.ParseIP(name) != nil {
-		return true
-	}
-	if len(name) == 0 || len(name) > 253 {
-		return false
-	}
-	labels := strings.Split(strings.TrimSuffix(name, "."), ".")
-	for i, label := range labels {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		numeric := true
-		for _, c := range []byte(label) {
-			if c < '0' || c > '9' {
-				numeric = false
-			}
-			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
-				return false
-			}
-		}
-		if i == len(labels)-1 && numeric {
-			return false
-		}
-	}
-	return true
 }
