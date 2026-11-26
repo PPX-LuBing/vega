@@ -42,11 +42,21 @@ func (c *tcpConn) readClientHello() ([]byte, error) {
 			return nil, err
 		}
 		header := buf[consumed : consumed+tlsRecordHeader]
-		if records == 0 && (header[0] == 0x80 || header[0] != tlsHandshake || binary.BigEndian.Uint16(header[1:3]) >= 0x1000) {
+		if header[0] == 0x80 || header[0] != tlsHandshake {
+			return nil, ErrClientHello
+		}
+		// TLS 记录层版本：主版本必须是 3（SSL 3.0 / TLS 1.x）。真实浏览器
+		// 首条记录用 0x0301，后续可能用 0x0303；其它值一律不是 TLS。
+		if header[1] != 3 {
+			return nil, ErrClientHello
+		}
+		if records == 0 && binary.BigEndian.Uint16(header[1:3]) >= 0x1000 {
 			return nil, ErrClientHello
 		}
 		recordLen := int(binary.BigEndian.Uint16(header[3:5]))
-		if header[0] != tlsHandshake || recordLen > tlsMaxCipher {
+		// 空记录是合法的 TLS 心跳/占位，但作为 ClientHello 的首条或中间记录
+		// 出现就不是浏览器行为（官方实现对空记录静默丢弃）。
+		if recordLen == 0 || recordLen > tlsMaxCipher {
 			return nil, ErrClientHello
 		}
 		total := consumed + tlsRecordHeader + recordLen
@@ -69,6 +79,11 @@ func (c *tcpConn) readClientHello() ([]byte, error) {
 			}
 		}
 		if messageLen >= 0 && len(handshake) >= 4+messageLen {
+			// 记录边界必须和握手长度严格对齐：多出来的字节说明这条记录里
+			// 塞了 ClientHello 之外的东西，真实客户端不会这么发。
+			if len(handshake) != 4+messageLen {
+				return nil, ErrClientHello
+			}
 			if !clientHelloWellFormed(handshake[:4+messageLen]) {
 				return nil, ErrClientHello
 			}
