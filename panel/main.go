@@ -488,6 +488,12 @@ func runNode(dbPath string, paths kernel.Paths, args []string) error {
 		if node.PubKey != "" {
 			fmt.Printf("  REALITY 公钥: %s\n", node.PubKey)
 		}
+		// 名称规范只提示不阻止：订阅里节点名混着 `🇺🇸US2-00 Reality` 和
+		// `🇯🇵JP01` 这种不一致，看起来乱，但拦下来会挡住正常部署。
+		if !store.ConventionalRemark(node.Remark) {
+			fmt.Printf("提示：名称 %q 不符合惯例，建议用 <国旗><站点码><两位编号>，"+
+				"例如 🇯🇵JP01、🇺🇸US201（不加协议名、不用连字符）\n", node.Remark)
+		}
 		return nil
 
 	case "ech":
