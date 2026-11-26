@@ -16,6 +16,7 @@ import (
 
 	"github.com/ohmycggk/nowhere-go/dgram"
 	"github.com/ohmycggk/nowhere-go/flowio"
+	"github.com/ohmycggk/nowhere-go/internal/bufpool"
 	"github.com/ohmycggk/nowhere-go/morph"
 	"github.com/ohmycggk/nowhere-go/qio"
 	"github.com/ohmycggk/nowhere-go/runtime"
@@ -26,13 +27,14 @@ const keepalive = 15 * time.Second
 
 // Config is one Egress process. Set DialQUIC or DialTCP, not both.
 type Config struct {
-	SharedKey  string
-	Morph      bool
-	PortalAddr string
-	TLS        *tls.Config
-	DialTCP    func(ctx context.Context, addr string) (net.Conn, error)
-	DialQUIC   func(ctx context.Context) (qio.Conn, error)
-	Upstream   interface {
+	SharedKey   string
+	Morph       bool
+	MorphCipher morph.Cipher
+	PortalAddr  string
+	TLS         *tls.Config
+	DialTCP     func(ctx context.Context, addr string) (net.Conn, error)
+	DialQUIC    func(ctx context.Context) (qio.Conn, error)
+	Upstream    interface {
 		DialTCP(ctx context.Context, target wire.Target) (net.Conn, error)
 		DialUDP(ctx context.Context, target wire.Target) (net.Conn, error)
 	}
@@ -52,6 +54,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if err := wire.ValidateServiceKey(cfg.SharedKey); err != nil {
 		return err
 	}
+	if !cfg.MorphCipher.Valid() {
+		return errors.New("cipher must be chacha or aes")
+	}
 	if cfg.Upstream == nil {
 		return errors.New("nw3: egress requires an upstream")
 	}
@@ -70,12 +75,20 @@ func Run(ctx context.Context, cfg Config) error {
 		if cfg.TLS == nil {
 			return errors.New("nw3: egress TLS carrier requires a TLS config")
 		}
+		var keys *morph.Keys
+		if cfg.Morph {
+			k, err := morph.DeriveWithCipher([]byte(cfg.SharedKey), cfg.MorphCipher)
+			if err != nil {
+				return err
+			}
+			keys = &k
+		}
 		tlsCfg := cfg.TLS.Clone()
 		tlsCfg.MinVersion = tls.VersionTLS13
 		tlsCfg.MaxVersion = tls.VersionTLS13
 		tlsCfg.NextProtos = []string{wire.ALPN}
 		cfg.TLS = tlsCfg
-		return runTLS(ctx, cfg, creds, rt)
+		return runTLS(ctx, cfg, creds, rt, keys)
 	}
 	return runQUIC(ctx, cfg, creds, rt)
 }
@@ -83,22 +96,17 @@ func Run(ctx context.Context, cfg Config) error {
 type session struct {
 	cfg   Config
 	creds *wire.Credentials
+	keys  *morph.Keys
 	rt    runtime.Settings
 	up    *flowio.Limiter
 	down  *flowio.Limiter
-	keys  *morph.Keys
 }
 
 func newSession(cfg Config, creds *wire.Credentials, rt runtime.Settings) *session {
-	s := &session{
+	return &session{
 		cfg: cfg, creds: creds, rt: rt,
 		up: flowio.NewMbps(cfg.UploadMbps), down: flowio.NewMbps(cfg.DownloadMbps),
 	}
-	if cfg.Morph {
-		keys := morph.Derive([]byte(cfg.SharedKey))
-		s.keys = &keys
-	}
-	return s
 }
 
 // runTLS is the Hydra supervisor. The budget counts connections being
@@ -106,8 +114,9 @@ func newSession(cfg Config, creds *wire.Credentials, rt runtime.Settings) *sessi
 // with one seed and adds up to two replacements when a standby connection
 // receives FlowStart. Failures do not grow the pool. At zero it restores one
 // seed after the service cooldown.
-func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime.Settings) error {
+func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime.Settings, keys *morph.Keys) error {
 	s := newSession(cfg, creds, rt)
+	s.keys = keys
 	var mu sync.Mutex
 	budget := 0
 	wake := make(chan struct{}, 1)
@@ -122,7 +131,7 @@ func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime
 	launch = func(n int) {
 		mu.Lock()
 		var starts int
-		for ; n > 0 && ctx.Err() == nil && budget < rt.EgressTLSPoolMax; n-- {
+		for ; n > 0 && budget < rt.EgressTLSPoolMax; n-- {
 			budget++
 			starts++
 		}
@@ -131,22 +140,13 @@ func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				released := false
-				release := func(grow bool) {
-					if released {
-						return
-					}
-					released = true
-					mu.Lock()
-					budget--
-					mu.Unlock()
-					if grow {
-						launch(2)
-					}
-					signal()
+				replace := s.tlsOnce(ctx)
+				mu.Lock()
+				budget--
+				mu.Unlock()
+				if replace > 0 {
+					launch(replace)
 				}
-				s.tlsOnce(ctx, func() { release(true) })
-				release(false)
 				signal()
 			}()
 		}
@@ -177,33 +177,76 @@ func runTLS(ctx context.Context, cfg Config, creds *wire.Credentials, rt runtime
 	}
 }
 
-// tlsOnce replenishes the standby pool on FlowStart, before serving the flow.
-func (s *session) tlsOnce(ctx context.Context, claimed func()) int {
+// tlsOnce dials, registers, and serves one flow. It returns how many
+// replacement connections the supervisor should start: two after FlowStart,
+// zero after failure, disconnect, expiry, or BUSY.
+func (s *session) tlsOnce(ctx context.Context) int {
 	if ctx.Err() != nil {
 		return 0
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, s.rt.HandshakeTimeout)
-	raw, err := s.cfg.DialTCP(dialCtx, s.cfg.PortalAddr)
-	cancel()
-	if err != nil {
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	var dialMu sync.Mutex
+	var dialAbandoned bool
+	dialed := make(chan dialResult, 1)
+	go func() {
+		conn, err := s.cfg.DialTCP(dialCtx, s.cfg.PortalAddr)
+		dialMu.Lock()
+		if dialAbandoned {
+			dialMu.Unlock()
+			if conn != nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		dialed <- dialResult{conn, err}
+		dialMu.Unlock()
+	}()
+	var raw net.Conn
+	select {
+	case <-dialCtx.Done():
+		cancel()
+		dialMu.Lock()
+		dialAbandoned = true
+		select {
+		case got := <-dialed:
+			dialMu.Unlock()
+			if got.conn != nil {
+				_ = got.conn.Close()
+			}
+		default:
+			dialMu.Unlock()
+		}
 		s.cool(ctx)
 		return 0
-	}
-	defer raw.Close()
-	stop := context.AfterFunc(ctx, func() { _ = raw.Close() })
-	defer stop()
-	_ = raw.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
-	enableKeepalive(raw)
-	var carrier net.Conn = raw
-	if s.keys != nil {
-		carrier, err = morph.WrapTCPClient(raw, *s.keys)
-		if err != nil {
+	case got := <-dialed:
+		cancel()
+		if got.err != nil {
+			if got.conn != nil {
+				_ = got.conn.Close()
+			}
+			s.cool(ctx)
 			return 0
 		}
+		raw = got.conn
 	}
-	tlsConn := tls.Client(carrier, s.cfg.TLS)
+	enableKeepalive(raw)
+	if s.keys != nil {
+		wrapped, wrapErr := morph.WrapTCPClient(raw, *s.keys)
+		if wrapErr != nil {
+			_ = raw.Close()
+			s.cool(ctx)
+			return 0
+		}
+		raw = wrapped
+	}
+	tlsConn := tls.Client(raw, s.cfg.TLS)
 	_ = tlsConn.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
-	err = tlsConn.Handshake()
+	err := tlsConn.Handshake()
+	_ = tlsConn.SetDeadline(time.Time{})
 	if err != nil {
 		_ = tlsConn.Close()
 		s.cool(ctx)
@@ -225,7 +268,6 @@ func (s *session) tlsOnce(ctx context.Context, claimed func()) int {
 		_ = tlsConn.Close()
 		return 0
 	}
-	_ = tlsConn.SetDeadline(time.Time{})
 	// The standby TTL starts only after ACCEPTED. The first read is FlowStart;
 	// its arrival, or the deadline, ends standby. A deadline is expiry and
 	// does not grow the pool.
@@ -240,7 +282,7 @@ func (s *session) tlsOnce(ctx context.Context, claimed func()) int {
 		_ = tlsConn.Close()
 		return 0
 	}
-	claimed()
+	defer tlsConn.Close()
 	s.serveOne(ctx, &pipe{Reader: br, write: tlsConn, closer: tlsConn}, nil, kind, target, 1, true)
 	return 2
 }
@@ -274,12 +316,6 @@ func (s *session) quicOnce(ctx context.Context) error {
 		return err
 	}
 	defer conn.CloseWithError(0, "")
-	ctx, cancelConn := context.WithCancel(ctx)
-	defer cancelConn()
-	stopConn := context.AfterFunc(conn.Context(), cancelConn)
-	defer stopConn()
-	stop := context.AfterFunc(ctx, func() { _ = conn.CloseWithError(0, "shutdown") })
-	defer stop()
 	if conn.ALPN() != wire.ALPN || conn.TLSVersion() != tls.VersionTLS13 {
 		return errors.New("nw3: QUIC handshake rejected")
 	}
@@ -292,7 +328,6 @@ func (s *session) quicOnce(ctx context.Context) error {
 	if st.ID() != 0 {
 		return errors.New("nw3: authentication stream was not stream 0")
 	}
-	_ = st.SetDeadline(time.Now().Add(s.rt.HandshakeTimeout))
 	exp, err := exporter(conn)
 	if err != nil {
 		return err
@@ -313,19 +348,10 @@ func (s *session) quicOnce(ctx context.Context) error {
 	if res != wire.RegistrationAccepted {
 		return errors.New("nw3: invalid registration result")
 	}
-	_ = st.SetDeadline(time.Time{})
 	router := dgram.NewRouter(conn, s.rt.QUICUDPQueue)
 	router.SetOverhead(s.cfg.DatagramOverhead)
 	go router.Run(ctx)
-	slots := make(chan struct{}, 4096)
-	var flows sync.WaitGroup
-	defer func() { cancelConn(); _ = conn.CloseWithError(0, "shutdown"); flows.Wait() }()
 	for {
-		select {
-		case slots <- struct{}{}:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
 		flow, err := conn.AcceptStream(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -337,17 +363,14 @@ func (s *session) quicOnce(ctx context.Context) error {
 			_ = conn.CloseWithError(0, "direction")
 			return errors.New("nw3: invalid business stream direction")
 		}
-		flows.Add(1)
-		go func() { defer flows.Done(); defer func() { <-slots }(); s.serveStream(ctx, router, flow, true) }()
+		go s.serveStream(ctx, router, flow, true)
 	}
 }
 
 func (s *session) serveStream(ctx context.Context, router *dgram.Router, st qio.Stream, server bool) {
 	defer st.Close()
-	_ = st.SetReadDeadline(time.Now().Add(s.rt.FlowSetupTimeout))
 	br := bufio.NewReader(st)
 	kind, target, ok, err := wire.ReadFlowRequest(br)
-	_ = st.SetReadDeadline(time.Time{})
 	if !ok && err == nil {
 		// A clean EOF before FlowStart is an idle close, not a bad request.
 		return
@@ -360,6 +383,13 @@ func (s *session) serveStream(ctx context.Context, router *dgram.Router, st qio.
 }
 
 func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Router, kind wire.FlowKind, target wire.Target, streamID uint64, server bool) {
+	defer client.Close()
+	// A UDP flow over this QUIC carrier needs DATAGRAM support. Reject it
+	// before the target dial and before READY; Core forbids a fallback.
+	if kind == wire.FlowUDP && router != nil && router.MaxDatagramSize() <= 0 {
+		_ = wire.WriteSetupResult(client, wire.SetupInternalError)
+		return
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, s.rt.UDPDialTimeout)
 	if kind == wire.FlowTCP {
 		cancel()
@@ -378,8 +408,6 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 		return
 	}
 	defer peer.Close()
-	stopPeer := context.AfterFunc(ctx, func() { _ = peer.Close(); _ = client.Close() })
-	defer stopPeer()
 	var id uint32
 	if kind == wire.FlowUDP && router != nil {
 		id, err = wire.UDPFlowID(streamID, server)
@@ -388,15 +416,11 @@ func (s *session) serveOne(ctx context.Context, client *pipe, router *dgram.Rout
 			return
 		}
 	}
-	if kind == wire.FlowUDP && router != nil {
-		router.Ensure(id)
-		defer router.CloseFlow(id)
-	}
 	if err := wire.WriteSetupResult(client, wire.SetupReady); err != nil {
 		return
 	}
 	if kind == wire.FlowTCP {
-		flowio.Relay(client, peer, s.up, s.down)
+		flowio.RelaySize(client, peer, s.up, s.down, s.rt.TCPDataBuf)
 		return
 	}
 	if router == nil {
@@ -449,7 +473,12 @@ type pipe struct {
 
 func (p *pipe) Read(b []byte) (int, error)  { return p.Reader.Read(b) }
 func (p *pipe) Write(b []byte) (int, error) { return p.write.Write(b) }
-func (p *pipe) Close() error                { return p.closer.Close() }
+func (p *pipe) Close() error {
+	if p.closer != nil {
+		return p.closer.Close()
+	}
+	return nil
+}
 func (p *pipe) CloseWrite() error {
 	if cw, ok := p.write.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
@@ -462,8 +491,10 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Du
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
 		for {
-			pkt, err := wire.ReadUoT(client)
+			pkt, err := wire.ReadUoTInto(client, *bp)
 			if err != nil {
 				break
 			}
@@ -476,7 +507,9 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Du
 	}()
 	go func() {
 		defer wg.Done()
-		buf := make([]byte, 65535)
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		buf := *bp
 		for {
 			_ = udp.SetReadDeadline(time.Now().Add(idle))
 			n, err := udp.Read(buf)
@@ -494,7 +527,7 @@ func relayUoT(client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Du
 }
 
 func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, down *flowio.Limiter, idle time.Duration) {
-	flow := router.Ensure(id)
+	flow := router.Register(id)
 	defer router.CloseFlow(id)
 	done := make(chan struct{})
 	var once sync.Once
@@ -504,8 +537,13 @@ func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, 
 		_, _ = client.Read(b[:])
 		finish()
 	}()
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		buf := make([]byte, 65535)
+		defer wg.Done()
+		bp := bufpool.GetUDP()
+		defer bufpool.PutUDP(bp)
+		buf := *bp
 		for {
 			_ = udp.SetReadDeadline(time.Now().Add(idle))
 			n, err := udp.Read(buf)
@@ -523,16 +561,28 @@ func relayQUIC(router *dgram.Router, id uint32, client *pipe, udp net.Conn, up, 
 	for {
 		select {
 		case <-done:
+			_ = udp.Close()
+			wg.Wait()
+			_ = client.CloseWrite()
+			return
+		case <-flow.Done():
+			_ = udp.Close()
+			wg.Wait()
 			_ = client.CloseWrite()
 			return
 		case pkt, ok := <-flow.C:
 			if !ok {
+				_ = udp.Close()
+				wg.Wait()
 				_ = client.CloseWrite()
 				return
 			}
 			_ = up.WaitN(context.Background(), len(pkt))
+			_ = udp.SetWriteDeadline(time.Now().Add(idle))
 			if _, err := udp.Write(pkt); err != nil {
 				finish()
+				_ = udp.Close()
+				wg.Wait()
 				_ = client.CloseWrite()
 				return
 			}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/ohmycggk/nowhere-go/dgram"
 	"github.com/ohmycggk/nowhere-go/flowio"
+	"github.com/ohmycggk/nowhere-go/internal/bufpool"
 	"github.com/ohmycggk/nowhere-go/morph"
 	"github.com/ohmycggk/nowhere-go/qio"
 	"github.com/ohmycggk/nowhere-go/runtime"
@@ -25,6 +26,7 @@ import (
 type Config struct {
 	SharedKey    string
 	Morph        bool
+	MorphCipher  morph.Cipher
 	PortalAddr   string
 	TLS          *tls.Config
 	DialTCP      func(ctx context.Context, addr string) (net.Conn, error)
@@ -38,27 +40,20 @@ type Config struct {
 
 // Client opens TCP and UDP flows.
 type Client struct {
-	creds        *wire.Credentials
-	keys         *morph.Keys
-	cfg          Config
-	up           *flowio.Limiter
-	down         *flowio.Limiter
-	mu           sync.Mutex
-	sessionState *quicSession
-	dialing      chan struct{}
-	dialCancel   context.CancelFunc
-	closed       bool
-}
-
-type quicSession struct {
-	conn     qio.Conn
-	router   *dgram.Router
-	cancel   context.CancelFunc
+	creds    *wire.Credentials
+	keys     *morph.Keys
+	cfg      Config
+	rt       runtime.Settings
+	up       *flowio.Limiter
+	down     *flowio.Limiter
 	mu       sync.Mutex
-	started  bool
-	ready    chan struct{}
-	authErr  error
+	auth     sync.Cond
+	quic     qio.Conn
+	router   *dgram.Router
+	used0    bool
+	opening  bool
 	draining bool
+	cancel   context.CancelFunc
 }
 
 // New validates the shared key and carrier selection.
@@ -66,7 +61,14 @@ func New(cfg Config) (*Client, error) {
 	if err := wire.ValidateServiceKey(cfg.SharedKey); err != nil {
 		return nil, err
 	}
+	if !cfg.MorphCipher.Valid() {
+		return nil, errors.New("cipher must be chacha or aes")
+	}
 	creds, err := wire.NewCredentials(cfg.SharedKey)
+	if err != nil {
+		return nil, err
+	}
+	rt, err := runtime.Load(cfg.SharedKey, false)
 	if err != nil {
 		return nil, err
 	}
@@ -77,9 +79,12 @@ func New(cfg Config) (*Client, error) {
 	} else if cfg.DialTCP == nil || cfg.TLS == nil {
 		return nil, errors.New("nw3: vector requires exactly one carrier")
 	}
-	c := &Client{creds: creds, cfg: cfg, up: flowio.NewMbps(cfg.UploadMbps), down: flowio.NewMbps(cfg.DownloadMbps)}
+	c := &Client{creds: creds, cfg: cfg, rt: rt, up: flowio.NewMbps(cfg.UploadMbps), down: flowio.NewMbps(cfg.DownloadMbps)}
 	if cfg.Morph {
-		keys := morph.Derive([]byte(cfg.SharedKey))
+		keys, err := morph.DeriveWithCipher([]byte(cfg.SharedKey), cfg.MorphCipher)
+		if err != nil {
+			return nil, err
+		}
 		c.keys = &keys
 	}
 	if cfg.TLS != nil {
@@ -106,28 +111,20 @@ func (c *Client) OpenUDP(ctx context.Context, target wire.Target) (net.Conn, err
 // Close releases the QUIC connection, if any.
 func (c *Client) Close() error {
 	c.mu.Lock()
-	c.closed = true
-	sess := c.sessionState
-	c.sessionState = nil
-	cancel := c.dialCancel
+	conn := c.quic
+	cancel := c.cancel
+	c.quic = nil
 	c.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
-	if sess != nil {
-		sess.cancel()
-		return sess.conn.CloseWithError(0, "")
+	if conn != nil {
+		return conn.CloseWithError(0, "")
 	}
 	return nil
 }
 
 func (c *Client) open(ctx context.Context, kind wire.FlowKind, target wire.Target) (net.Conn, error) {
-	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-	if closed {
-		return nil, net.ErrClosed
-	}
 	if c.cfg.DialQUIC != nil {
 		return c.openQUIC(ctx, kind, target)
 	}
@@ -139,20 +136,6 @@ func (c *Client) openTLS(ctx context.Context, kind wire.FlowKind, target wire.Ta
 	if err != nil {
 		return nil, err
 	}
-	// HandshakeContext only covers TLS, not Morph or the auth/setup exchange.
-	// Keep cancellation active until ownership passes to the caller.
-	setupConn := raw
-	setupCtx, finishSetup := context.WithCancel(ctx)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		<-setupCtx.Done()
-		if ctx.Err() != nil {
-			_ = setupConn.Close()
-		}
-	}()
-	stop := func() { finishSetup(); <-stopped }
-	defer stop()
 	if c.keys != nil {
 		wrapped, wrapErr := morph.WrapTCPClient(raw, *c.keys)
 		if wrapErr != nil {
@@ -192,213 +175,186 @@ func (c *Client) openTLS(ctx context.Context, kind wire.FlowKind, target wire.Ta
 		_ = tlsConn.Close()
 		return nil, wire.SetupError{Result: result}
 	}
-	stop()
-	if err := ctx.Err(); err != nil {
-		_ = tlsConn.Close()
-		return nil, err
-	}
 	var conn net.Conn = tlsConn
 	if kind == wire.FlowUDP {
 		conn = &uotConn{Conn: tlsConn}
 	}
-	return newLimitedConn(conn, c.up, c.down), nil
+	return &limitedConn{Conn: conn, up: c.up, down: c.down}, nil
 }
 
 func (c *Client) openQUIC(ctx context.Context, kind wire.FlowKind, target wire.Target) (net.Conn, error) {
-	sess, err := c.session(ctx)
+	conn, router, err := c.session(ctx)
 	if err != nil {
 		return nil, err
 	}
-	conn, router := sess.conn, sess.router
-	sess.mu.Lock()
-	first := !sess.started
-	sess.started = true
-	sess.mu.Unlock()
-	if !first {
-		select {
-		case <-sess.ready:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-conn.Context().Done():
-			return nil, conn.Context().Err()
-		}
-		if sess.authErr != nil {
-			return nil, sess.authErr
-		}
+	// A UDP flow needs DATAGRAM support; fail before opening a stream rather
+	// than falling back to another carrier. Core forbids that fallback.
+	if kind == wire.FlowUDP && conn.MaxDatagramSize() <= 0 {
+		return nil, errors.New("nw3: portal does not support UDP DATAGRAMs")
 	}
-	rt, err := runtime.Load(c.cfg.SharedKey, false)
-	if err != nil {
-		return nil, err
+	// The first OpenStream is the authentication stream and must be stream 0.
+	// Later flows wait until that open has an id, so AuthFrame cannot land on
+	// another stream. A failed open does not consume the flag. The wait also
+	// ends when the caller's context does, so a cancelled opener cannot pin
+	// every later flow.
+	c.mu.Lock()
+	if c.auth.L == nil {
+		c.auth.L = &c.mu
 	}
-	setupCtx, cancel := context.WithTimeout(ctx, rt.FlowSetupTimeout)
-	defer cancel()
-	st, err := conn.OpenStream(setupCtx)
-	finishAuth := func(e error) {
-		if first {
-			sess.authErr = e
-			close(sess.ready)
-			first = false
-			if e != nil {
-				c.failSession(sess)
-			}
-		}
-	}
-	if err != nil {
-		finishAuth(err)
-		return nil, err
-	}
-	deadline, _ := setupCtx.Deadline()
-	_ = st.SetDeadline(deadline)
-	stop := context.AfterFunc(setupCtx, func() { _ = st.Close() })
+	stop := context.AfterFunc(ctx, func() {
+		c.mu.Lock()
+		c.auth.Broadcast()
+		c.mu.Unlock()
+	})
 	defer stop()
+	for c.opening && ctx.Err() == nil {
+		c.auth.Wait()
+	}
+	if ctx.Err() != nil {
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	first := !c.used0
 	if first {
-		if st.ID() != 0 {
-			err = errors.New("nw3: authentication stream was not stream 0")
-		} else {
-			var exp wire.Exporter
-			exp, err = connExporter(conn)
-			if err == nil {
-				err = wire.WriteAuthFrame(st, c.creds, wire.RoleVector, wire.AuthQUIC, exp)
-			}
+		c.opening = true
+	}
+	c.mu.Unlock()
+	st, err := conn.OpenStream(ctx)
+	if first {
+		c.mu.Lock()
+		c.opening = false
+		if err == nil && st.ID() == 0 {
+			c.used0 = true
 		}
-		finishAuth(err)
+		c.auth.Broadcast()
+		c.mu.Unlock()
+	}
+	if err != nil {
+		return nil, err
+	}
+	if first && st.ID() != 0 {
+		_ = st.Close()
+		c.failSession()
+		return nil, errors.New("nw3: authentication stream was not stream 0")
+	}
+	if first {
+		exp, err := connExporter(conn)
 		if err != nil {
 			_ = st.Close()
 			return nil, err
 		}
-	}
-	var flow *dgram.Flow
-	if kind == wire.FlowUDP {
-		id, e := wire.UDPFlowID(st.ID(), false)
-		if e != nil {
+		if err := wire.WriteAuthFrame(st, c.creds, wire.RoleVector, wire.AuthQUIC, exp); err != nil {
 			_ = st.Close()
-			go c.drainAndDrop(sess, rt.ShutdownTimeout)
-			return nil, e
+			return nil, err
 		}
-		flow = router.Register(id)
 	}
-	owned := false
-	defer func() {
-		if !owned {
-			_ = st.Close()
-			if flow != nil {
-				router.CloseFlow(flow.ID)
-			}
-		}
-	}()
-	if err = wire.WriteFlowRequest(st, kind, target); err != nil {
+	if err := wire.WriteFlowRequest(st, kind, target); err != nil {
+		_ = st.Close()
 		return nil, err
 	}
 	br := bufio.NewReader(st)
 	result, err := wire.ReadSetupResult(br)
 	if err != nil {
-		if conn.Context().Err() != nil {
-			c.failSession(sess)
-		}
+		_ = st.Close()
+		c.failSession()
 		return nil, err
 	}
 	if result != wire.SetupReady {
+		_ = st.Close()
 		return nil, wire.SetupError{Result: result}
 	}
-	if !stop() || setupCtx.Err() != nil {
-		return nil, context.Canceled
-	}
-	_ = st.SetDeadline(time.Time{})
-	owned = true
 	rw := &streamConn{Reader: br, Stream: st, local: addr("quic-local"), remote: conn.RemoteAddr()}
 	if kind == wire.FlowTCP {
-		return newLimitedConn(rw, c.up, c.down), nil
+		return &limitedConn{Conn: rw, up: c.up, down: c.down}, nil
 	}
-	pc := &udpConn{PacketConn: &dgram.PacketConn{Router: router, Flow: flow, Done: make(chan struct{})}, st: st}
-	go func() { var b [1]byte; _, _ = br.Read(b[:]); _ = pc.Close() }()
-	return newLimitedConn(pc, c.up, c.down), nil
+	id, err := wire.UDPFlowID(st.ID(), false)
+	if err != nil {
+		_ = st.Close()
+		// Derived ids are exhausted. Stop this session after a bounded drain
+		// and let the next open dial a new one. There is no exhaustion frame.
+		go c.drainAndDrop(runtime.DefaultShutdownTimeout)
+		return nil, err
+	}
+	flow := router.Register(id)
+	done := make(chan struct{})
+	pc := &udpConn{PacketConn: &dgram.PacketConn{Router: router, Flow: flow, Done: done}, st: st}
+	go func() {
+		var b [1]byte
+		_, _ = br.Read(b[:])
+		_ = pc.Close()
+	}()
+	return &limitedConn{Conn: pc, up: c.up, down: c.down}, nil
 }
 
-func (c *Client) drainAndDrop(sess *quicSession, bound time.Duration) {
+// drainAndDrop stops admitting on this session, waits out a bounded drain,
+// then closes it. A later open dials again and starts new flows only.
+func (c *Client) drainAndDrop(bound time.Duration) {
 	c.mu.Lock()
-	sess.draining = true
+	c.draining = true
 	c.mu.Unlock()
 	timer := time.NewTimer(bound)
 	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-sess.conn.Context().Done():
-	}
-	c.failSession(sess)
+	<-timer.C
+	c.failSession()
 }
 
-// A failed old flow must never close its replacement session.
-func (c *Client) failSession(sess *quicSession) {
+// failSession drops a broken QUIC session so the next open dials again.
+func (c *Client) failSession() {
 	c.mu.Lock()
-	if c.sessionState == sess {
-		c.sessionState = nil
-	}
+	conn := c.quic
+	cancel := c.cancel
+	c.quic = nil
+	c.router = nil
+	c.cancel = nil
+	c.used0 = false
+	c.draining = false
 	c.mu.Unlock()
-	sess.cancel()
-	_ = sess.conn.CloseWithError(0, "session")
+	if cancel != nil {
+		cancel()
+	}
+	if conn != nil {
+		_ = conn.CloseWithError(0, "session")
+	}
 }
 
-func (c *Client) session(ctx context.Context) (*quicSession, error) {
-	for {
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			return nil, net.ErrClosed
-		}
-		if sess := c.sessionState; sess != nil {
-			if sess.draining && sess.conn.Context().Err() == nil {
-				c.mu.Unlock()
-				return nil, errors.New("nw3: session draining")
-			}
-			if sess.conn.Context().Err() == nil && !sess.draining {
-				c.mu.Unlock()
-				return sess, nil
-			}
-			c.sessionState = nil
-			sess.cancel()
-			_ = sess.conn.CloseWithError(0, "idle")
-		}
-		if wait := c.dialing; wait != nil {
-			c.mu.Unlock()
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-		wait := make(chan struct{})
-		c.dialing = wait
-		dialCtx, cancel := context.WithCancel(ctx)
-		c.dialCancel = cancel
-		c.mu.Unlock()
-		conn, err := c.cfg.DialQUIC(dialCtx)
-		cancel()
-		if err == nil && (conn.ALPN() != wire.ALPN || conn.TLSVersion() != tls.VersionTLS13) {
-			_ = conn.CloseWithError(0, "alpn")
-			err = errors.New("nw3: QUIC handshake rejected")
-		}
-		c.mu.Lock()
-		c.dialing = nil
-		c.dialCancel = nil
-		close(wait)
-		if c.closed && err == nil {
-			_ = conn.CloseWithError(0, "closed")
-			err = net.ErrClosed
-		}
-		if err != nil {
-			c.mu.Unlock()
-			return nil, err
-		}
-		runCtx, cancelRun := context.WithCancel(conn.Context())
-		router := dgram.NewRouter(conn, 0)
-		router.SetOverhead(c.cfg.DatagramOverhead)
-		sess := &quicSession{conn: conn, router: router, cancel: cancelRun, ready: make(chan struct{})}
-		c.sessionState = sess
-		c.mu.Unlock()
-		go router.Run(runCtx)
-		return sess, nil
+func (c *Client) session(ctx context.Context) (qio.Conn, *dgram.Router, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.quic != nil && c.draining {
+		return nil, nil, errors.New("nw3: session draining")
 	}
+	if c.quic != nil {
+		select {
+		case <-c.quic.Context().Done():
+			if c.cancel != nil {
+				c.cancel()
+			}
+			_ = c.quic.CloseWithError(0, "idle")
+			c.quic = nil
+			c.router = nil
+			c.cancel = nil
+			c.used0 = false
+			c.draining = false
+		default:
+			return c.quic, c.router, nil
+		}
+	}
+	conn, err := c.cfg.DialQUIC(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	if conn.ALPN() != wire.ALPN || conn.TLSVersion() != tls.VersionTLS13 {
+		_ = conn.CloseWithError(0, "alpn")
+		return nil, nil, errors.New("nw3: QUIC handshake rejected")
+	}
+	runCtx, cancel := context.WithCancel(context.Background())
+	router := dgram.NewRouter(conn, c.rt.QUICUDPQueue)
+	router.SetOverhead(c.cfg.DatagramOverhead)
+	go router.Run(runCtx)
+	c.quic = conn
+	c.router = router
+	c.cancel = cancel
+	return conn, router, nil
 }
 
 func exportTLS(state tls.ConnectionState) (wire.Exporter, error) {
@@ -443,39 +399,18 @@ func (c *streamConn) RemoteAddr() net.Addr       { return c.remote }
 type limitedConn struct {
 	net.Conn
 	up, down *flowio.Limiter
-	ctx      context.Context
-	cancel   context.CancelFunc
-}
-
-func newLimitedConn(conn net.Conn, up, down *flowio.Limiter) *limitedConn {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &limitedConn{Conn: conn, up: up, down: down, ctx: ctx, cancel: cancel}
-}
-
-func (c *limitedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
-		return cw.CloseWrite()
-	}
-	return c.Conn.Close()
-}
-
-func (c *limitedConn) Close() error {
-	c.cancel()
-	return c.Conn.Close()
 }
 
 func (c *limitedConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
-		if waitErr := c.down.WaitN(c.ctx, n); waitErr != nil {
-			return n, waitErr
-		}
+		_ = c.down.WaitN(context.Background(), n)
 	}
 	return n, err
 }
 
 func (c *limitedConn) Write(p []byte) (int, error) {
-	if err := c.up.WaitN(c.ctx, len(p)); err != nil {
+	if err := c.up.WaitN(context.Background(), len(p)); err != nil {
 		return 0, err
 	}
 	return c.Conn.Write(p)
@@ -484,7 +419,9 @@ func (c *limitedConn) Write(p []byte) (int, error) {
 type uotConn struct{ net.Conn }
 
 func (c *uotConn) Read(p []byte) (int, error) {
-	pkt, err := wire.ReadUoT(c.Conn)
+	bp := bufpool.GetUDP()
+	defer bufpool.PutUDP(bp)
+	pkt, err := wire.ReadUoTInto(c.Conn, *bp)
 	if err != nil {
 		return 0, err
 	}
@@ -509,6 +446,7 @@ func (c *udpConn) Write(p []byte) (int, error) {
 	n, err := c.PacketConn.Write(p)
 	return n, err
 }
+
 func (c *udpConn) Close() error {
 	_ = c.PacketConn.Close()
 	// FIN the control stream before cancelling its read. CLOSE is only a hint.

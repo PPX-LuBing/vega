@@ -1,77 +1,46 @@
 # Vega downstream patches
 
-Go implementation baseline: `ohmycggk/nowhere-go v3.3.0`, commit
-`6b9ec0879e54d1ee52fe28f4cbffa8631333bc4d` (Go 1.21 minimum).
-Official wire baseline: `NodePassProject/Nowhere 3.3.0`, commit
-`000007b2482b8acf3a609888921fd847cad56c33` (see `UPSTREAM.lock`).
+Go implementation baseline: `ohmycggk/nowhere-go v3.4.0`, commit
+`b73c5dea85`（3.4.0 tag）(Go 1.21 minimum).
+Official wire baseline: `NodePassProject/Nowhere 3.4.0`, commit
+`000001c866b0c9fada350c84bdc11702473564a6` (see `UPSTREAM.lock`).
 
 Keep the original copyright/license notices. This is a vendored third-party
 implementation, not an independently authored protocol or an official Rust port.
 
-| File | Local change | Required regression |
+## 相对上游 v3.4.0 的本地改动
+
+| 文件 | 本地改动 | 必需回归 |
 | --- | --- | --- |
-| `morph/morph.go` | Multi-key prelude admission, without a new wire format | Morph vectors/admission tests, Portal multiuser tests |
-| `portal/server.go` | User identity, source metadata, user updates, replay-state preservation, multiuser handshake budget and cleanup/ownership transfer | `portal/multiuser_test.go`, `portal/replay_update_test.go`, `portal/runtime_multiuser_test.go`, upstream `TestTLSEgressEcho` |
-| `vector/client.go` | Cancel TCP during Morph/auth/setup, then transfer ownership; Close also releases rate-limiter waits | `vector/cancel_test.go`, Vega outbound integration tests |
-| `UPSTREAM.lock` | Recompute the stale upstream protocol source hash against the exact official 3.3.0 commit | Upstream lock generator; upstream vectors compared modulo their four provenance keys |
+| `morph/multi_packet.go` | 多密钥 UDP 准入（无新 wire 格式）。3.4.0 起 UDP 带 cipher 分支，写路径改为复用上游 `packetConn.WriteTo`，读路径按 key 现算 AES block | `morph` 全量 + iptables interop |
+| `morph/prehello.go` | 扩展级校验：`validClientExtension` / `validServerName`，并把它接进 `clientHelloWellFormed` 的扩展遍历；要求 signature_algorithms 必选、压缩必须为 null | `prehello_validation_test.go`、`FuzzAcceptorAdmission` |
+| `portal/server.go` | 多用户（`Users`）、按 key 隔离的 registries、`AcceptEgress`、Egress 按 key 路由 | `portal/multiuser_test.go`、`runtime_multiuser_test.go` |
+| `portal/registry.go` | `closed` 状态 + `close()`；`claim` **先查 ctx/deadline 再取 slot**（取消的调用不得消耗 FIFO） | `host_egress_test.go` 的 `TestRegistryCanceledClaimDoesNotConsume` |
+| `portal/host_egress.go`、`portal/packet.go` | 主机侧 Egress 与分组工具 | `host_egress_test.go` |
+| `vector/client.go` | **无本地改动** —— 3.4.0 的 `auth.Cond` + `used0` 方案已取代我们的 `sessionState` 机制 | `vector/session_test.go`（按新 API 重写） |
 
-Vega adds no local changes to `wire/`, key derivation, ALPN, authentication,
-Morph bytes or protocol vectors beyond the upstream v3.3.0 update. UDP source addresses,
-multi-target reply queues and deadlines belong to Vega's `protocol/nowhere/`
-adapter, not the Nowhere wire protocol.
+## 3.4.0 迁移时删掉的本地机制
 
-Official Nowhere has one Shared Key per Portal. Before a multiuser connection
-authenticates, Vega cannot know which key's derived handshake timeout applies.
-It uses the maximum official derived timeout of the current user snapshot;
-hot updates recompute it. An explicit `NOW_HANDSHAKE_TIMEOUT` takes precedence.
-Single-key authentication is unchanged. Multiuser Egress uses a distinct registry
-per shared key; Vega routes through its host router before claiming an exit.
-Revoking a key closes its standby registrations (including QUIC connections);
-existing Vector sessions are not reauthenticated by a hot update.
+- `vector/client.go` 的 `sessionState` / `dialing` / `dialCancel` / `quicSession`：
+  换成上游的 `auth sync.Cond` + `opening` + `used0`。语义等价（首个 OpenStream
+  必须是 stream 0、取消能广播唤醒），且上游有 `e2e_test.go` 覆盖，代码更简单。
+- `vector/cancel_test.go`（依赖已删除的 `newLimitedConn`）：删除，
+  改为 `session_test.go` 里按新 API 覆盖同样的失败路径。
 
-The TCP cleanup patch transfers ownership of a claimed TLS Egress connection
-instead of closing it when registration returns. The upstream TLS Egress test
-is kept intact to catch regressions; Vega now exposes routed Egress.
+## 3.4.0 带来的东西（我们直接受益）
 
-Upstream v3.3.0 retained a 3.2 protocol-source hash, as its changelog notes.
-Only `UPSTREAM.lock` (nw3) was regenerated using its own tool against the official
-3.3.0 checkout; the nw2 lock is untouched. The corrected source hash is
-`fdd1b17df596d529edee3705246be6aed005083b4792ed71a051cb746feb6b4f`.
+- Morph Cipher 扩展（`CipherChaCha` 默认 / `CipherAES`），协议向量从 28 增到 34
+- QUIC 传输内存档位对齐（`memory` 4/16/8 MiB、`balanced` 4/16/16、`throughput` 4/32/32）
+- `NOW_QUIC_UDP_QUEUE_BYTES` 字节预算强制、`wire.Reassembler` 并发保护
+- egress 拨号超时的孤儿 TCP、SOCKS5 UDP associate 的 map/goroutine 泄漏修复
+- `flowio.RelaySize` 缓冲可调、热路径缓冲池化
 
 ## Updating
 
-1. Select and record exact Go and official Rust upstream commits. Review protocol
-   changes explicitly; do not silently claim compatibility with a newer release.
-2. Merge upstream and reapply only still-needed patches above. Drop a local fix
-   once upstream provides equivalent behavior and its regression passes.
-3. Run `go test -race -count=1 ./...` and `go run ./cmd/nowhere-check -vectors`
-   here; run Vega's Nowhere/v2rayapi and panel tests separately.
-4. For a protocol-version upgrade, run both official Rust Vector -> Vega Portal
-   and Vega Vector -> official Rust Portal. Include TCP, UDP, Morph on/off,
-   invalid keys, replay rejection, cancellation and reconnects.
-
-Vectors and Go-to-Go loopbacks do not replace official-client interoperability
-tests. Run Vega's opt-in `TestOfficialRustInterop` with `VEGA_TEST_NOWHERE_RUST`
-pointing to an independently built official 3.3.0 binary. It exercises both
-directions, TLS/QUIC TCP/UDP payloads, multi-target UDP sources, Morph on/off and
-reconnects. `TestOfficialEgressInterop` adds all four carrier combinations in
-both directions; `TestOfficialSilentPreHello` compares negative admission,
-post-admission TLS responses and replay commit behavior to the Rust executable.
-See `../../docs-vega/nowhere/CAPABILITIES.md` for configuration and acceptance scope.
-
-## Additional host-integration patches
-
-| Files | Change | Regression |
-| --- | --- | --- |
-| `morph/prehello.go` | rustls 0.23.46 configuration-independent ClientHello checks before replay commit; strict record framing | `prehello_validation_test.go`, official differential probes, fuzz |
-| `morph/multi_packet.go` | Dynamic multi-key UDP masking; validate opaque host-generated CIDs instead of guessing short-header keys; bounded reply map | `multi_packet_test.go`, official QUIC multiuser interop |
-| `portal/host_egress.go`, `registry.go`, `packet.go`, `server.go` | Host-routed per-user Egress, cancellation/half-close, bounded registrations, revoked registry cleanup, bounded setup tasks | `host_egress_test.go`, Vega policy/accounting/concurrency tests |
-| `egress/client.go` | TLS Morph, immediate Hydra replenishment on FlowStart, bounded setup/flows, cancel idle/active connections | official Egress matrix, host Egress cancellation test |
-| `vector/client.go` | Session-scoped auth state, cancellation without holding the client lock during dial, old failures cannot close new sessions, half-close | `session_test.go`, Vega concurrent/half-close tests |
-| `dgram/router.go`, Portal/Vector/Egress | Reserve UDP routes before READY; reuse reservations and close readers when router stops | empty/8-byte/8192-byte interop tests |
-
-No local wire fields, authentication algorithms, exporter labels or protocol
-vectors were changed. A host-generated QUIC CID is an opaque QUIC routing value,
-not an additional Nowhere message. Go TLS and rustls are different engines:
-the differential corpus is evidence for covered cases, not a proof of identical
-behavior for every malformed input or identical transport fingerprints.
+1. 记录确切的 Go 与官方 Rust 上游 commit。协议变更必须显式复核，
+   不要凭默认值相同的假设宣称兼容。
+2. 合并上游后只重新应用上表里仍然需要的补丁。上游提供了等价实现就删掉本地补丁。
+3. 跑 `go test -race -count=1 ./...` 和 `go run ./cmd/nowhere-check -vectors`；
+   再单独跑 Vega 的 Nowhere / v2rayapi / 面板测试。
+4. 协议版本升级时，两个方向都要跑官方 Rust 互操作（见
+   `../../docs-vega/nowhere/CAPABILITIES.md` 的验收范围）。

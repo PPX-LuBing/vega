@@ -7,7 +7,7 @@ This is a library, not a standalone proxy. Hosts such as [sing-box](https://gith
 Protocol behavior follows the official Rust project:
 
 - Core: [Nowhere Protocol](https://github.com/NodePassProject/Nowhere-Protocol/blob/main/PROTOCOL.md)
-- Extensions: [Prelude](https://github.com/NodePassProject/Nowhere/blob/v3.3.0/docs/prelude.md) and [Egress](https://github.com/NodePassProject/Nowhere/blob/v3.3.0/docs/egress.md)
+- Extensions: [Cipher](https://github.com/NodePassProject/Nowhere/blob/v3.4.0/docs/cipher.md), [Prelude](https://github.com/NodePassProject/Nowhere/blob/v3.4.0/docs/prelude.md), and [Egress](https://github.com/NodePassProject/Nowhere/blob/v3.4.0/docs/egress.md)
 
 ```text
 module github.com/ohmycggk/nowhere-go
@@ -19,7 +19,7 @@ License: **GPL-3.0** (same family as upstream Nowhere).
 Project policies: [changelog](CHANGELOG.md) · [contributing](CONTRIBUTING.md) ·
 [security](SECURITY.md)
 
-> **Compatibility:** The pinned nw3 baseline is Nowhere 3.3. NW3 Core framing is unchanged. Morph TCP, Morph UDP Prelude, and Egress are Nowhere extensions that supersede the corresponding Core text: a peer that implements PROTOCOL.md literally, with an unauthenticated random prelude, cannot complete a Morph TCP handshake with this Portal. A Portal requires an authenticated Morph TCP prelude: a tag mismatch, counter 0, a replay, or a counter outside the window is rejected before ClientHello parsing. There is no 3.0 fallback. Morph-enabled QUIC clients send one independent 12-byte UDP Prelude per socket before the first QUIC datagram; receivers discard datagrams of 12 bytes or fewer and do not require the Prelude to arrive. Egress registers over TLS or QUIC. One Portal FIFO shares every registration: a claimed QUIC connection returns to the tail, and a claimed TLS connection carries one flow and leaves. No URL, Shared Key, or ALPN migration is required. Replay is in-memory, FIFO-bounded, and lost on restart. Morph UDP on the server drops QUIC long headers whose version quinn 0.11.19 does not support; `morph=0` and clients do not. The nw2 stack is unchanged. The default CLI URL is Nowhere 3 (`nw3` only). Nowhere 2 stays available when the URL uses `up`, `down`, `mux`, `next`, or `socks`, and that process speaks `nw2` only. The two versions do not handshake. Optional nw2 `morph=1` sits below TLS/QUIC with no negotiation; the 2.1 Morph wire contract is incompatible with Nowhere 2.0.x peers. nw3 Morph defaults on and uses a different key schedule (`nowhere/nw3/morph`). Dedicated `mux=0` and marked Mux still share one TLS listener via the `0xff` marker on nw2 only; nw3 has no Mux.
+> **Compatibility:** The pinned nw3 baseline is Nowhere 3.4. NW3 Core framing is unchanged. Morph Cipher, Morph TCP Prelude, Morph UDP Prelude, and Egress are Nowhere extensions that supersede the corresponding Core text: a peer that implements PROTOCOL.md literally, with an unauthenticated random prelude, cannot complete a Morph TCP handshake with this Portal. A Portal requires an authenticated Morph TCP prelude: a tag mismatch, counter 0, a replay, or a counter outside the window is rejected before ClientHello parsing. There is no 3.0 fallback. Morph supports ChaCha20-IETF (`cipher=chacha`, default, 2^38-64 bytes per TCP direction) and AES-128-CTR (`cipher=aes`, 2^48 bytes per TCP direction); peers select the same cipher out of band with no wire negotiation. Morph-enabled QUIC clients send one independent 12-byte UDP Prelude per socket before the first QUIC datagram; receivers discard datagrams of 12 bytes or fewer and do not require the Prelude to arrive. Egress registers over TLS or QUIC. One Portal FIFO shares every registration: a claimed QUIC connection returns to the tail, and a claimed TLS connection carries one flow and leaves. No URL, Shared Key, or ALPN migration is required. Replay is in-memory, FIFO-bounded, and lost on restart. Morph UDP on the server drops QUIC long headers whose version quinn 0.11.19 does not support; `morph=0` and clients do not. The nw2 stack is unchanged. The default CLI URL is Nowhere 3 (`nw3` only). Nowhere 2 stays available when the URL uses `up`, `down`, `mux`, `next`, or `socks`, and that process speaks `nw2` only. The two versions do not handshake. Optional nw2 `morph=1` sits below TLS/QUIC with no negotiation; the 2.1 Morph wire contract is incompatible with Nowhere 2.0.x peers. nw3 Morph defaults on and uses a different key schedule (`nowhere/nw3/morph`). Dedicated `mux=0` and marked Mux still share one TLS listener via the `0xff` marker on nw2 only; nw3 has no Mux.
 
 ---
 
@@ -294,7 +294,7 @@ go run ./cmd/nowhere-check            # wire vectors + self-check
 go run ./cmd/nowhere-check -version
 ```
 
-这个 vendored 副本里**删掉了嵌套的 `.github/`**（包括 `workflows/ci.yml`、`workflows/release.yml` 和 `CODEOWNERS`）：GitHub 只执行**仓库根**的 workflow，也只读根、`docs/`、`.github/` 下的 `CODEOWNERS`，嵌套的永远不会生效。上游那份 CI 的内容（Go 1.21.x / 1.26.x / stable、FreeBSD 交叉构建、race/fuzz/benchmark）可以在上游仓库查到；在 vega 里这些检查靠本地跑上面的 `go test` / `go vet`。
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) validates Go **1.21.x / 1.26.x / stable** on push (`main`/`test`/tags), PR, and `workflow_dispatch`. The Portal CLI (`cmd/nowhere`) needs Go 1.26 because it vendors [quic-go](https://github.com/quic-go/quic-go) v0.62.0; the 1.21.x job tests the library only. A FreeBSD 15.1 amd64 job runs the same single-version test, vet, and CLI checks, and cross-builds `freebsd/arm64`. Race, fuzz, and benchmark jobs stay on Linux.
 
 The standalone **Portal / Vector** binary lives in [`cmd/nowhere`](cmd/nowhere). It accepts the same `portal://` and `vector://` URLs as the Rust `nowhere` CLI, plus the `generate-key`, `fingerprint`, and `probe` toolbox subcommands (the TUI and `status` are not included).
 
@@ -311,7 +311,7 @@ verify the Portal certificate against the system roots and the endpoint host
 name unless `pin=<sha256>` is set — `fingerprint` prints the leaf certificate
 SHA-256 of a `nowhere://` share link to obtain one.
 
-上游在推送 `v*.*.*` tag 时会跑 `release.yml`（测试，然后出 Linux/Windows/macOS/FreeBSD 的 `nowhere` 二进制和 `SHA256SUMS`）。这个 vendored 副本里该文件已删除，需要发布产物就本地 `make dist` 复现。`nowhere-check` 一致性工具不参与发布，用 `make nowhere-check` 本地构建。库本身用 `go get` 引入。
+Pushing a `v*.*.*` tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml): tests, then `nowhere` binaries for Linux, Windows, macOS, and FreeBSD (`amd64` and `arm64`) plus `SHA256SUMS`. The `nowhere-check` conformance tool is not released; build it locally with `make nowhere-check` when needed. Reproduce the release locally with `make dist`. Consume the library with `go get`.
 
 ```bash
 go get github.com/ohmycggk/nowhere-go@v2.0.0

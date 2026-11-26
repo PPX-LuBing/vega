@@ -269,10 +269,10 @@ func TestReplayWindowAndFIFO(t *testing.T) {
 	if !filled.commit(replayCapacity+1, 1) {
 		t.Fatal("fifo insert failed")
 	}
-	if _, ok := filled.entries[1]; ok {
+	if _, ok := filled.index[1]; ok {
 		t.Fatal("oldest identity survived an update")
 	}
-	if _, ok := filled.entries[2]; !ok {
+	if _, ok := filled.index[2]; !ok {
 		t.Fatal("second identity was evicted")
 	}
 	if !filled.commit(1, 1) {
@@ -667,12 +667,30 @@ func oneRecord(fragment []byte) []byte {
 	return append(record, fragment...)
 }
 
+// minimalClientHello 造一个「形状上像真实 TLS 1.3 浏览器握手」的最小样本。
+//
+// 必须带 signature_algorithms：TLS 1.3 强制要求，缺失就不是合法握手
+// （clientHelloWellFormed 会拒绝）。其余扩展按浏览器常见集合给最小合法值。
 func minimalClientHello() []byte {
 	body := []byte{0x03, 0x03}
 	body = append(body, make([]byte, 32)...)
-	body = append(body, 0)
-	body = append(body, 0x00, 0x02, 0x13, 0x01, 1, 0)
-	ext := []byte{0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04, 0, 13, 0, 4, 0, 2, 8, 4}
+	body = append(body, 0)                            // session_id
+	body = append(body, 0x00, 0x02, 0x13, 0x01, 1, 0) // cipher_suites + null 压缩
+	var ext []byte
+	// server_name: example.com（0x0000 扩展，内容是 server_name_list）
+	sniValue := []byte{0x00, 0x0e, 0x00, 0x00, 0x0b, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm'}
+	ext = append(ext, 0x00, 0x00, 0x00, byte(len(sniValue)))
+	ext = append(ext, sniValue...)
+	// signature_algorithms: ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256
+	ext = append(ext, 0x00, 0x0d, 0x00, 0x06, 0x00, 0x04, 0x04, 0x03, 0x08, 0x04)
+	// supported_versions: TLS 1.3
+	ext = append(ext, 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04)
+	// key_share: x25519 + 32 字节占位
+	ext = append(ext, 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20)
+	ext = append(ext, make([]byte, 32)...)
+	// ALPN: h2, http/1.1
+	ext = append(ext, 0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c,
+		0x02, 'h', '2', 0x08, 'h', 't', 't', 'p', '/', '1', '.', '1')
 	body = append(body, byte(len(ext)>>8), byte(len(ext)))
 	body = append(body, ext...)
 	message := []byte{tlsClientHello, byte(len(body) >> 16), byte(len(body) >> 8), byte(len(body))}

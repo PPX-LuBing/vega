@@ -1,6 +1,8 @@
 package morph
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -57,7 +59,17 @@ func (c *multiPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		}
 		for _, key := range keys {
 			copyBuf := append([]byte(nil), buf[:n]...)
-			size, ok := unmaskDatagram(p, copyBuf, &key.UDPC2S, true)
+			// 3.4.0 起 UDP 支持 AES-128-CTR，所以要带 cipher 和对应 block。
+			// 多密钥准入时每个 key 的 cipher 可能不同，按 key 现算 block。
+			var block cipher.Block
+			if key.Cipher == CipherAES {
+				var bErr error
+				block, bErr = aes.NewCipher(key.UDPC2S[:16])
+				if bErr != nil {
+					continue
+				}
+			}
+			size, ok := unmaskDatagram(p, copyBuf, key.Cipher, &key.UDPC2S, block, true)
 			if !ok || !c.validPacket(p[:size]) {
 				continue
 			}
@@ -84,7 +96,17 @@ func (c *multiPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if !ok {
 		return 0, &net.AddrError{Err: "unknown Morph peer", Addr: addr.String()}
 	}
-	return writeMasked(c.PacketConn, p, addr, &peer.key.UDPS2C)
+	// 3.4.0 起 UDP 封装带 cipher 分支，直接复用它自己的写路径，
+	// 避免在这里重复实现 ChaCha/AES 两种 nonce 与计数器逻辑。
+	pc := &packetConn{PacketConn: c.PacketConn, cipher: peer.key.Cipher, txKey: peer.key.UDPS2C}
+	if peer.key.Cipher == CipherAES {
+		block, err := aes.NewCipher(peer.key.UDPS2C[:16])
+		if err != nil {
+			return 0, err
+		}
+		pc.txBlock = block
+	}
+	return pc.WriteTo(p, addr)
 }
 
 // CIDs are opaque QUIC routing identifiers, not a Nowhere wire extension.

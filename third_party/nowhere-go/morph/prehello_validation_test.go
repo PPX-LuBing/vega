@@ -12,8 +12,9 @@ func TestAcceptorAdmission(t *testing.T) {
 	if clientHelloWellFormed(badCompression) {
 		t.Fatal("non-null compression admitted")
 	}
-	missingSignature := append([]byte{}, valid...)
-	missingSignature[len(missingSignature)-7] = 99
+	// 显式构造「没有 signature_algorithms」的握手：把它那个扩展整段删掉，
+	// 而不是靠改末尾字节碰运气（样本里扩展顺序变了测试就会失真）。
+	missingSignature := dropExtension(valid, 13)
 	if clientHelloWellFormed(missingSignature) {
 		t.Fatal("missing signature algorithms admitted")
 	}
@@ -26,7 +27,14 @@ func TestAcceptorAdmission(t *testing.T) {
 		{16, []byte{0, 2, 1, 'x'}, true}, {16, []byte{0, 1, 0}, false}, {16, []byte{0, 0}, false},
 		{51, []byte{0, 5, 0, 29, 0, 1, 1}, true}, {51, []byte{0, 4, 0, 29, 0, 0}, false},
 		{0, []byte{0, 6, 0, 0, 3, 'a', '.', 'b'}, true}, {0, []byte{0, 4, 0, 0, 1, '*'}, false},
+		// inner（type=1）必须为空
 		{0xfe0d, []byte{1}, true}, {0xfe0d, []byte{1, 1}, false}, {0xfe0d, nil, false},
+		// outer（type=0）：真实 ECH 扩展有上百字节，不能只接受 1 字节。
+		// 这条曾经写成 `len==1`，导致开启 ECH 的合法客户端被静默拒绝。
+		{0xfe0d, realOuterECH(), true},
+		{0xfe0d, []byte{0}, false},                         // outer 太短
+		{0xfe0d, []byte{0, 0, 1, 0, 1, 0, 0, 0, 0}, false}, // payload 长度为 0
+		{0xfe0d, []byte{2}, false},                         // 未知 type
 		{23, nil, true}, {23, []byte{0}, false}, {65534, []byte{1, 2, 3}, true},
 	} {
 		if got := validClientExtension(tc.typ, tc.value); got != tc.want {
@@ -54,4 +62,51 @@ func FuzzAcceptorAdmission(f *testing.F) {
 			_ = validClientExtension(uint16(b[0])<<8|uint16(b[1]), b[2:])
 		}
 	})
+}
+
+// dropExtension 从 ClientHello 消息体里摘掉指定类型的扩展，并修正各层长度。
+func dropExtension(message []byte, drop uint16) []byte {
+	body := append([]byte{}, message[4:]...)
+	pos := 34 // legacy_version + random
+	sessionLen := int(body[pos])
+	pos += 1 + sessionLen
+	suiteLen := int(body[pos])<<8 | int(body[pos+1])
+	pos += 2 + suiteLen
+	compLen := int(body[pos])
+	pos += 1 + compLen
+	if pos+2 > len(body) {
+		return message
+	}
+	extStart := pos + 2
+	var kept []byte
+	rest := body[extStart:]
+	for len(rest) >= 4 {
+		typ := uint16(rest[0])<<8 | uint16(rest[1])
+		size := int(rest[2])<<8 | int(rest[3])
+		if len(rest) < 4+size {
+			break
+		}
+		if typ != drop {
+			kept = append(kept, rest[:4+size]...)
+		}
+		rest = rest[4+size:]
+	}
+	out := append([]byte{}, body[:pos]...)
+	out = append(out, byte(len(kept)>>8), byte(len(kept)))
+	out = append(out, kept...)
+	msg := []byte{tlsClientHello, byte(len(out) >> 16), byte(len(out) >> 8), byte(len(out))}
+	return append(msg, out...)
+}
+
+// realOuterECH 造一个形状正确的 outer ECHClientHello（type=0）：
+// cipher_suite(4) + config_id(1) + enc(2+32) + payload(2+64)。
+func realOuterECH() []byte {
+	out := []byte{0}                          // type = outer
+	out = append(out, 0x00, 0x01, 0x00, 0x01) // HPKE suite: KDF 0x0001, AEAD 0x0001
+	out = append(out, 0x2a)                   // config_id
+	out = append(out, 0x00, 0x20)             // enc length = 32
+	out = append(out, make([]byte, 32)...)
+	out = append(out, 0x00, 0x40) // payload length = 64
+	out = append(out, make([]byte, 64)...)
+	return out
 }
