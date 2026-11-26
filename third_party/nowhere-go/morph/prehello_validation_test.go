@@ -27,7 +27,14 @@ func TestAcceptorAdmission(t *testing.T) {
 		{16, []byte{0, 2, 1, 'x'}, true}, {16, []byte{0, 1, 0}, false}, {16, []byte{0, 0}, false},
 		{51, []byte{0, 5, 0, 29, 0, 1, 1}, true}, {51, []byte{0, 4, 0, 29, 0, 0}, false},
 		{0, []byte{0, 6, 0, 0, 3, 'a', '.', 'b'}, true}, {0, []byte{0, 4, 0, 0, 1, '*'}, false},
+		// inner（type=1）必须为空
 		{0xfe0d, []byte{1}, true}, {0xfe0d, []byte{1, 1}, false}, {0xfe0d, nil, false},
+		// outer（type=0）：真实 ECH 扩展有上百字节，不能只接受 1 字节。
+		// 这条曾经写成 `len==1`，导致开启 ECH 的合法客户端被静默拒绝。
+		{0xfe0d, realOuterECH(), true},
+		{0xfe0d, []byte{0}, false},                          // outer 太短
+		{0xfe0d, []byte{0, 0, 1, 0, 1, 0, 0, 0, 0}, false},   // payload 长度为 0
+		{0xfe0d, []byte{2}, false},                           // 未知 type
 		{23, nil, true}, {23, []byte{0}, false}, {65534, []byte{1, 2, 3}, true},
 	} {
 		if got := validClientExtension(tc.typ, tc.value); got != tc.want {
@@ -89,4 +96,17 @@ func dropExtension(message []byte, drop uint16) []byte {
 	out = append(out, kept...)
 	msg := []byte{tlsClientHello, byte(len(out) >> 16), byte(len(out) >> 8), byte(len(out))}
 	return append(msg, out...)
+}
+
+// realOuterECH 造一个形状正确的 outer ECHClientHello（type=0）：
+// cipher_suite(4) + config_id(1) + enc(2+32) + payload(2+64)。
+func realOuterECH() []byte {
+	out := []byte{0}                      // type = outer
+	out = append(out, 0x00, 0x01, 0x00, 0x01) // HPKE suite: KDF 0x0001, AEAD 0x0001
+	out = append(out, 0x2a)               // config_id
+	out = append(out, 0x00, 0x20)         // enc length = 32
+	out = append(out, make([]byte, 32)...)
+	out = append(out, 0x00, 0x40)         // payload length = 64
+	out = append(out, make([]byte, 64)...)
+	return out
 }

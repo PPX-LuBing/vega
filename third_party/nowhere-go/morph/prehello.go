@@ -79,8 +79,12 @@ func (c *tcpConn) readClientHello() ([]byte, error) {
 			}
 		}
 		if messageLen >= 0 && len(handshake) >= 4+messageLen {
-			// 记录边界必须和握手长度严格对齐：多出来的字节说明这条记录里
-			// 塞了 ClientHello 之外的东西，真实客户端不会这么发。
+			// ClientHello 可以跨多条记录，但**拼起来必须恰好等于握手长度**。
+			// 多出来的字节说明这条记录里塞了 ClientHello 之外的东西——官方
+			// 实现对此静默丢弃（TestOfficialSilentPreHello/trailing-handshake）。
+			//
+			// 注意：不能要求「每条记录都对齐」，那会把分片发送的合法客户端拒掉；
+			// 只能要求「累加总量对齐」。
 			if len(handshake) != 4+messageLen {
 				return nil, ErrClientHello
 			}
@@ -267,8 +271,48 @@ func validClientExtension(typ uint16, v []byte) bool {
 			rest = rest[3+l:]
 		}
 		return true
-	case 0xfe0d: // encrypted_client_hello：本实现只接受单字节（握手类型）形式
-		return len(v) == 1
+	case 0xfe0d: // encrypted_client_hello
+		// 按 draft-ietf-tls-esni 的 ECHClientHello 结构校验：
+		//
+		//   struct {
+		//       ECHClientHelloType type;   // 1 字节
+		//       select (type) {
+		//           case outer:
+		//               HpkeSymmetricCipherSuite cipher_suite;  // 4 字节
+		//               uint8 config_id;                        // 1 字节
+		//               opaque enc<0..2^16-1>;                  // 2+N
+		//               opaque payload<1..2^16-1>;              // 2+N
+		//           case inner: Empty;
+		//       }
+		//   } ECHClientHello;
+		//
+		// 只验形状，不做密码学校验。**不能要求恰好 1 字节** —— 真实 ECH
+		// 扩展有上百字节（enc + payload），那样会把开启 ECH 的合法客户端全部拒掉。
+		if len(v) < 1 {
+			return false
+		}
+		switch v[0] {
+		case 0: // outer：cipher_suite(4) + config_id(1) + enc + payload
+			if len(v) < 1+4+1+2+2 {
+				return false
+			}
+			// 布局：[0]=type [1..4]=cipher_suite [5]=config_id
+			//       [6..7]=enc_len [8..]=enc [..]=payload_len [..]=payload
+			encLen := int(v[6])<<8 | int(v[7])
+			encEnd := 8 + encLen
+			if encEnd+2 > len(v) {
+				return false
+			}
+			payLen := int(v[encEnd])<<8 | int(v[encEnd+1])
+			if payLen < 1 || encEnd+2+payLen != len(v) {
+				return false
+			}
+			return true
+		case 1: // inner：必须为空
+			return len(v) == 1
+		default:
+			return false
+		}
 	case 23: // extended_master_secret：必须是零长度
 		return len(v) == 0
 	}
