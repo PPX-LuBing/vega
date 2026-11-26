@@ -29,17 +29,22 @@ import (
 	"github.com/sagernet/sing/protocol/socks"
 )
 
-// Opt-in: use an independently built official 3.3.0 binary, not our Go CLI.
+// Opt-in: use an independently built official binary (3.3.0+), not our Go CLI.
+// 协议基线在 3.4.0 从 3.3.0 升上来了，但默认 Morph Cipher 仍是 ChaCha，
+// 所以 3.3.0 和 3.4.0 的官方二进制都应当能与我们互通；这里两个版本都接受。
 var quicTestAvailable bool
 
 func TestOfficialRustInterop(t *testing.T) {
 	binary := os.Getenv("VEGA_TEST_NOWHERE_RUST")
 	if binary == "" {
-		t.Skip("set VEGA_TEST_NOWHERE_RUST to official Nowhere 3.3.0")
+		t.Skip("set VEGA_TEST_NOWHERE_RUST to the official Nowhere binary (3.3.0+)")
 	}
 	version, err := exec.Command(binary, "--version").CombinedOutput()
-	if err != nil || !strings.Contains(string(version), "3.3.0") {
-		t.Fatalf("official peer version: %q, %v", version, err)
+	if err != nil {
+		t.Fatalf("official peer --version failed: %q, %v", version, err)
+	}
+	if !strings.Contains(string(version), "3.3.0") && !strings.Contains(string(version), "3.4.0") {
+		t.Fatalf("official peer must be 3.3.0 or 3.4.0, got %q", version)
 	}
 	for _, morph := range []bool{false, true} {
 		for _, transport := range []string{"tcp", "quic"} {
