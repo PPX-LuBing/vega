@@ -119,6 +119,7 @@ fi
 if [ "$enable_services" = 1 ] && [ -z "$root" ]; then
     # vega 需要 config.json，所以先 doctor/apply 再启动
     echo "==> 生成配置"
+    apply_ok=0
     SBX_PANEL_DB=/var/lib/vega/panel.db \
     SBX_PANEL_KERNEL=/opt/vega/bin/vega \
     SBX_PANEL_CONFIG=/opt/vega/etc/config.json \
@@ -126,13 +127,27 @@ if [ "$enable_services" = 1 ] && [ -z "$root" ]; then
     SBX_PANEL_CERT_DIR=/var/lib/vega/certs \
     SBX_PANEL_STATS_BIN=/opt/vega/bin/sb-stats \
     SBX_PANEL_API=127.0.0.1:10085 \
-        /opt/vega/bin/vega-panel apply || echo "警告：apply 失败，配置可能还不完整"
-    echo "==> 启用服务"
-    systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce
+        /opt/vega/bin/vega-panel apply && apply_ok=1
+
+    if [ "$apply_ok" != 1 ]; then
+        # apply 失败通常是「还没有节点/用户」。这时候**不能**启用 vega：
+        # 配置不完整会被 systemd 反复重启，变成崩溃循环。
+        # 订阅服务和采集服务不依赖节点，可以照常启用。
+        echo "警告：apply 失败（常见原因是还没建节点），本次只启用订阅与采集服务。"
+        echo "      建好节点后执行：vega-panel apply && systemctl enable --now vega"
+        systemctl enable --now vega-sub vega-cert-check.timer vega-enforce
+    else
+        echo "==> 启用服务"
+        systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce
+    fi
+
     echo "==> 服务状态"
     for s in vega vega-sub vega-enforce vega-cert-check.timer; do
         printf '  %-24s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo unknown)"
     done
+    if [ "$apply_ok" != 1 ]; then
+        printf '  %-24s %s\n' "（下一歩）" "建节点 → vega-panel apply → systemctl enable --now vega"
+    fi
 fi
 
 cat <<EOF
