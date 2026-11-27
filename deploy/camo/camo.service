@@ -1,0 +1,17 @@
+[Unit]
+Description=Camouflage HTTPS site (REALITY dest)
+After=network-online.target vega.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=CAMO_PORT=9443
+ExecStart=/usr/bin/python3 /opt/camo/serve.py
+Restart=on-failure
+RestartSec=5
+# 限制资源，别让它抢内核的内存
+MemoryMax=64M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target

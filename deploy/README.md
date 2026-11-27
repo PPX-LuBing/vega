@@ -50,6 +50,61 @@ systemctl enable --now vega vega-sub vega-cert-check.timer vega-enforce
 | `vega-cert-check.timer` | 每天检查证书并续期 | 建议启用 |
 | `vega-enforce.service` | 用量采集 + 配额执行 | 可选 |
 
+## `camo/`：REALITY 的伪装站
+
+`camo/` 是给 REALITY 当 `dest` 用的极简 HTTPS 静态站，**不是必需组件** ——
+只有想让 REALITY 的回落目标更像真网站时才装（目前只有 CN2 那台用）。
+
+```
+/opt/camo/serve.py            Python 标准库实现，零依赖
+/opt/camo/site/               静态站点根目录（自己放，不随仓库分发）
+/etc/systemd/system/camo.service
+```
+
+REALITY 对 `dest` 有两条硬性要求，**换站点时必须先验，否则节点直接连不上**：
+
+1. **只允许 TLS 1.3**（`minimum_version = maximum_version = TLSv1_3`）
+2. **支持 X25519**（`set_ecdh_curve("X25519")`）
+
+### ⚠️ 2026-11-27 修掉的致命 bug（`serve.py` 必须用本仓库这份）
+
+旧版把**监听 socket** 直接包上 TLS：
+
+```python
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)   # 错的
+```
+
+这样握手发生在 `accept()` 内部、在单线程主循环里同步执行。**只要有人建立一条
+TCP 连接但一个字节都不发**（端口扫描器、探针、`curl` 超时前的半开连接都算），
+`accept()` 就停在握手上，整个进程不再接受任何新连接。
+
+而 REALITY 每次握手都要先 `DialContext` 到 dest 才能比对 ClientHello：
+
+```
+ERROR inbound/vless[us2-reality]: TLS handshake: REALITY: failed to dial dest:
+      dial tcp 127.0.0.1:9443: i/o timeout
+```
+
+→ 表现成「**节点连不上**」，极易误判成 SNI 配错。当时从 4 个外部探测点看
+443 端口是 `Connection reset by peer`，而 8443 订阅正常，就是 dest 卡死。
+
+修法：**监听 socket 保持明文，`wrap_socket` 挪到 `finish_request`（工作线程）里**，
+同时加 `CONN_TIMEOUT=10` 和并发上限 `MAX_CONNS=64`（`MemoryMax=64M`）。
+
+> **教训**：伪装站是 REALITY 的**数据面依赖**，不是装饰。它挂掉的症状是
+> 「协议连不上」，排查时会一路往 SNI / 密钥 / 防火墙方向走，全是岔路。
+> 先看内核日志有没有 `failed to dial dest`，两秒定位。
+
+### 装法
+
+```sh
+install -D -m 644 deploy/camo/serve.py /opt/camo/serve.py
+install -D -m 644 deploy/camo/camo.service /etc/systemd/system/camo.service
+systemctl daemon-reload && systemctl enable --now camo
+```
+
+`serve.py` 里 `ROOT` / `CERT` / `KEY` 三个路径写死了，换机器要改。
+
 ## 环境变量前缀为什么还叫 `SBX_PANEL_*`
 
 历史遗留（项目早期叫 sbx）。**线上单元文件里就是这些名字**，改名要同步改
