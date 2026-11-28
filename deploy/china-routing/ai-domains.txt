@@ -1,0 +1,58 @@
+# 非 Google 的 AI 站点 —— 一律走台湾（chain-tw）
+#
+# 这些站点对香港 IP 有风控或直接拒服务，走台湾家宽更稳。
+# 一行一个裸域名（不要写 . 前缀，生成脚本会自动展开成「裸域 + .裸域」）。
+# # 开头是注释，空行忽略。
+#
+# ⚠️ 顺序有讲究：生成脚本按「本文件在前、google-domains.txt 在后」拼接，
+#    新增域名请追加到对应分组的末尾，别插到中间（会让 diff 变吵）。
+
+# --- OpenAI ---
+openai.com
+chatgpt.com
+oaistatic.com
+oaiusercontent.com
+sora.com
+
+# --- Anthropic ---
+anthropic.com
+claude.ai
+
+# --- 其它大模型 / 聚合 ---
+perplexity.ai
+huggingface.co
+mistral.ai
+
+# --- 微软 Copilot ---
+copilot.microsoft.com
+
+# --- xAI / Grok ---
+grok.com
+x.ai
+
+# --- 社区 / 角色 ---
+poe.com
+character.ai
+
+# --- 生成式媒体 ---
+midjourney.com
+runwayml.com
+elevenlabs.io
+
+# --- 国内可访问的推理服务（走台湾是为了统一出口）---
+deepseek.com
+groq.com
+
+# --- 聚合 / 托管 ---
+openrouter.ai
+together.ai
+cohere.com
+stability.ai
+
+# --- 编程助手 ---
+cursor.com
+codeium.com
+windsurf.com
+githubcopilot.com
+you.com
+phind.com

@@ -1,0 +1,75 @@
+# Google 系 —— 走台湾（chain-tw）
+#
+# 背景：香港那台被「送中」—— gstatic / gvt1 解析到 203.208.40.x（北京 AS24424，
+# Google 中国专用段），台湾同一域名解析到 142.251.x 正常国际段。详见 README。
+#
+# 一行一个裸域名，生成脚本自动展开成「裸域 + .裸域」。
+# 顺序跟线上一致：Gemini 专项在前，Google 通用在后。
+#
+# ⚠️ 刻意不收录（保持香港直连）：
+#   youtube.com / googlevideo.com / ytimg.com —— 视频流，台湾家宽扛不住
+#   google-analytics.com / googletagmanager.com —— 纯统计，没必要绕
+
+# ============ Gemini / Vertex 专项 ============
+
+# Gemini API 与 SDK（客户端报 location 错的通常就是这条）
+generativelanguage.googleapis.com
+
+# Gemini CLI / Code Assist 后端
+cloudcode-pa.googleapis.com
+daily-cloudcode-pa.googleapis.com
+
+# Vertex AI
+aiplatform.googleapis.com
+aiplatform.us.rep.googleapis.com
+
+# 生成式 AI 老端点
+generativeai.googleapis.com
+
+# Gemini 网页与入口
+gemini.google.com
+aistudio.google.com
+bard.google.com
+makersuite.google.com
+
+# Google 的 AI 产品
+notebooklm.google.com
+jules.google.com
+labs.google.com
+antigravity.google
+deepmind.google
+ai.google.dev
+google-gemini.com
+
+# Colab / ML / 语音
+colab.research.google.com
+ml.googleapis.com
+texttospeech.googleapis.com
+
+# ============ Google 通用 ============
+
+# 送中受损的 CDN / 更新分发
+gstatic.com
+gvt1.com
+gvt2.com
+ggpht.com
+
+# API 与内容（全量：Gemini/Cloud/Drive/oauth/fcm… 都在这条通配下）
+googleapis.com
+googleusercontent.com
+recaptcha.net
+
+# 应用商店 / 账号
+chromewebstore.google.com
+play.google.com
+android.com
+gmail.com
+googlemail.com
+
+# 网页与地区域名
+google.com
+google.com.hk
+google.com.tw
+google.co.jp
+google.dev
+google.org

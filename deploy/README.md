@@ -105,6 +105,25 @@ systemctl daemon-reload && systemctl enable --now camo
 
 `serve.py` 里 `ROOT` / `CERT` / `KEY` 三个路径写死了，换机器要改。
 
+## `china-routing/`：AI / Google 走台湾落地
+
+给香港那台机器用的分流配置：**AI 与 Google 域名走台湾家宽落地，其余走香港直出。**
+
+```sh
+sh deploy/china-routing/gen-config.sh /root/vega-tw-landing.env > /root/ai-tw.json
+. /root/vega-env.sh
+/opt/vega/bin/vega-panel setting set extra_config "$(cat /root/ai-tw.json)"
+/opt/vega/bin/vega-panel apply
+```
+
+- 清单在 `ai-domains.txt`（30 个 AI 站点）+ `google-domains.txt`（38 个 Google 系），
+  生成 136 条 `domain_suffix`
+- **密码不进仓库**，从 `/root/vega-tw-landing.env` 读
+- 自测：`sh deploy/china-routing/gen-config_test.sh`（21 项，不需要网络）
+
+背景（为什么香港需要这个、`gstatic` 被送中到 `203.208.40.x`、为什么排除 YouTube
+视频流）见 [`china-routing/README.md`](china-routing/README.md)。
+
 ## 环境变量前缀为什么还叫 `SBX_PANEL_*`
 
 历史遗留（项目早期叫 sbx）。**线上单元文件里就是这些名字**，改名要同步改
